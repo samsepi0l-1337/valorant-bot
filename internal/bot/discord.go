@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/dosfsociety/valorant-bot/internal/i18n"
@@ -20,8 +21,8 @@ func Commands() []*discordgo.ApplicationCommand {
 	return []*discordgo.ApplicationCommand{
 		{
 			Name:                     "auth",
-			Description:              "Link your Riot account via browser login",
-			DescriptionLocalizations: loc(map[discordgo.Locale]string{discordgo.Korean: "브라우저로 Riot 계정 연동"}),
+			Description:              "Link your Riot account by scanning a QR code in Riot Mobile",
+			DescriptionLocalizations: loc(map[discordgo.Locale]string{discordgo.Korean: "Riot Mobile QR 스캔으로 계정 연동"}),
 		},
 		{
 			Name:                     "accounts",
@@ -255,9 +256,10 @@ func (h *Handlers) onAppCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	)
 	ctx := context.Background()
 
+	var qrState string
 	switch data.Name {
 	case "auth":
-		resp, err = h.HandleAuth(userID, lang)
+		resp, qrState, err = h.HandleAuth(ctx, userID, lang)
 	case "accounts":
 		resp, err = h.HandleAccounts(userID, lang)
 	case "unlink":
@@ -307,6 +309,28 @@ func (h *Handlers) onAppCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	if rerr := editInteraction(s, i, resp); rerr != nil {
 		log.Printf("interaction: edit /%s failed: %v", data.Name, rerr)
 	}
+	if qrState != "" {
+		go h.watchQRLogin(s, i, qrState, lang)
+	}
+}
+
+// qrLoginTimeout bounds how long the bot waits for a Riot Mobile approval.
+// Riot expires the QR session on its own side at a similar horizon.
+const qrLoginTimeout = 3 * time.Minute
+
+// watchQRLogin polls until the user approves the QR login, then rewrites the
+// ephemeral /auth message with the outcome.
+func (h *Handlers) watchQRLogin(s *discordgo.Session, i *discordgo.InteractionCreate, state string, lang i18n.Lang) {
+	ctx, cancel := context.WithTimeout(context.Background(), qrLoginTimeout)
+	defer cancel()
+
+	display, err := h.Auth.WaitQRLogin(ctx, state)
+	if err != nil {
+		log.Printf("interaction: qr login state=%s: %v", state, err)
+	}
+	if rerr := editInteraction(s, i, h.HandleAuthComplete(display, err, lang)); rerr != nil {
+		log.Printf("interaction: qr login edit failed: %v", rerr)
+	}
 }
 
 func commandEphemeral(name string) bool {
@@ -339,10 +363,14 @@ func editInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, resp 
 		components = &resp.Components
 	}
 	content := resp.Content
+	// Always reset attachments: uploads in resp.Files are appended by Discord,
+	// and the completion edit must drop the QR image left by /auth.
 	_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
-		Content:    &content,
-		Embeds:     embeds,
-		Components: components,
+		Content:     &content,
+		Embeds:      embeds,
+		Components:  components,
+		Files:       resp.Files,
+		Attachments: &[]*discordgo.MessageAttachment{},
 	})
 	return err
 }

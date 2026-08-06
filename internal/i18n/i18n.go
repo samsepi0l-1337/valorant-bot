@@ -37,8 +37,11 @@ func T(lang Lang, key string) string {
 }
 
 var ko = map[string]string{
-	"auth.prompt":                "Riot 계정을 연결하려면 아래 **로그인** 버튼을 누르세요.\n다른 PC에서는 연동 페이지가 안내하는 **자동 연동 도우미**(포트 80)를 한 번 실행하면 됩니다.\n(`AUTH_BASE_URL`은 봇 PC의 LAN IP여야 합니다.)",
-	"auth.button":                "로그인",
+	"auth.prompt":                "**Riot Mobile** 앱으로 아래 QR 코드를 스캔한 뒤 **로그인 승인**을 눌러주세요.\n휴대폰에서 Discord를 보고 있다면 아래 버튼을 눌러 바로 승인할 수 있습니다.\n승인하면 자동으로 연동됩니다. (약 3분 후 만료)",
+	"auth.button":                "Riot Mobile로 열기",
+	"auth.qr.done":               "연동 완료: **%s**\n`/shop` 으로 오늘 상점을 확인하세요.",
+	"auth.qr.timeout":            "QR 로그인 시간이 만료되었습니다. `/auth` 를 다시 실행해 주세요.",
+	"auth.qr.failed":             "연동에 실패했습니다: %v\n`/auth` 를 다시 실행해 주세요.",
 	"accounts.empty":       "연결된 계정이 없습니다. `/auth` 로 Riot 계정을 연결하세요.",
 	"accounts.header":      "**연결된 계정**",
 	"unlink.done":          "계정 연결 해제가 완료되었습니다.",
@@ -70,8 +73,11 @@ var ko = map[string]string{
 }
 
 var en = map[string]string{
-	"auth.prompt":                "Press **Login** below to link your Riot account.\nOn another PC, run the **auth catcher** (port 80) shown on the login page once — no URL paste needed.\n(`AUTH_BASE_URL` must be this machine's LAN IP.)",
-	"auth.button":                "Login",
+	"auth.prompt":                "Scan the QR code below with the **Riot Mobile** app and approve the login.\nOn a phone, tap the button below to approve directly.\nLinking happens automatically once approved. (expires in ~3 minutes)",
+	"auth.button":                "Open in Riot Mobile",
+	"auth.qr.done":               "Linked: **%s**\nUse `/shop` to see today's store.",
+	"auth.qr.timeout":            "The QR login expired. Run `/auth` again.",
+	"auth.qr.failed":             "Linking failed: %v\nRun `/auth` again.",
 	"accounts.empty":       "No linked accounts. Use `/auth` to connect a Riot account.",
 	"accounts.header":      "**Linked accounts**",
 	"unlink.done":          "Account unlinked.",

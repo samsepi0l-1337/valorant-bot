@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -96,6 +98,181 @@ func jwtIDToken(game, tag string) string {
 		"acct": map[string]string{"game_name": game, "tag_line": tag},
 	})
 	return "hdr." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
+}
+
+type mockQRAuth struct {
+	mu             sync.Mutex
+	started        int
+	polls          int
+	pollsUntilDone int
+	pollErr        error
+	tokens         riot.QRTokens
+}
+
+func (m *mockQRAuth) StartQRSession(ctx context.Context) (*riot.QRSession, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.started++
+	return &riot.QRSession{LoginURL: "https://qrlogin.riotgames.com/riotmobile?suuid=s1", SUUID: "s1"}, nil
+}
+
+func (m *mockQRAuth) PollQRSession(ctx context.Context, sess *riot.QRSession) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pollErr != nil {
+		return "", m.pollErr
+	}
+	m.polls++
+	if m.polls < m.pollsUntilDone {
+		return "", riot.ErrQRPending
+	}
+	return "LOGIN_TOKEN", nil
+}
+
+func (m *mockQRAuth) ExchangeLoginToken(ctx context.Context, loginToken string) (riot.QRTokens, error) {
+	return m.tokens, nil
+}
+
+func TestBeginQRAuth_ReturnsScanURL(t *testing.T) {
+	st := newMockStore()
+	qr := &mockQRAuth{pollsUntilDone: 1}
+	d := testDeps(st, &mockRiot{}, &mockBoxer{})
+	d.QRAuth = qr
+	s := New(d)
+
+	loginURL, state, err := s.BeginQRAuth(context.Background(), "d1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(loginURL, "qrlogin.riotgames.com") {
+		t.Fatalf("login URL = %q", loginURL)
+	}
+	if state == "" {
+		t.Fatal("expected state")
+	}
+	if st.pending[state] != "d1" {
+		t.Fatalf("pending = %v", st.pending)
+	}
+}
+
+func TestWaitQRLogin_LinksAccount(t *testing.T) {
+	st := newMockStore()
+	box := &mockBoxer{}
+	ri := &mockRiot{
+		entitlements: "ent",
+		puuid:        "puuid-1",
+		names:        []riot.PlayerName{{GameName: "Ace", TagLine: "KR1"}},
+	}
+	qr := &mockQRAuth{
+		pollsUntilDone: 2,
+		tokens: riot.QRTokens{
+			AccessToken:   jwtAccessToken("kr"),
+			IDToken:       jwtIDToken("Ace", "KR1"),
+			SessionCookie: "ssid=SSID_VALUE",
+		},
+	}
+	var linkedUser, linkedName string
+	s := New(Deps{
+		AuthBaseURL:    "http://127.0.0.1:8787",
+		Store:          st,
+		Riot:           ri,
+		Boxer:          box,
+		QRAuth:         qr,
+		QRPollInterval: time.Millisecond,
+		OnLinked: func(uid, name string) {
+			linkedUser, linkedName = uid, name
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, state, err := s.BeginQRAuth(ctx, "discord-9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	display, err := s.WaitQRLogin(ctx, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if display != "Ace#KR1" {
+		t.Fatalf("display = %q", display)
+	}
+	if linkedUser != "discord-9" || linkedName != "Ace#KR1" {
+		t.Fatalf("onLinked %s %s", linkedUser, linkedName)
+	}
+	if len(st.accounts) != 1 || st.accounts[0].PUUID != "puuid-1" {
+		t.Fatalf("accounts = %+v", st.accounts)
+	}
+	// The ssid cookie must be stored so /shop can reauth without a new scan.
+	if string(box.lastPlain) != "ssid=SSID_VALUE" {
+		t.Fatalf("stored session = %q", box.lastPlain)
+	}
+}
+
+func TestWaitQRLogin_FallsBackToAccessToken(t *testing.T) {
+	st := newMockStore()
+	box := &mockBoxer{}
+	qr := &mockQRAuth{
+		pollsUntilDone: 1,
+		tokens: riot.QRTokens{
+			AccessToken: jwtAccessToken("kr"),
+			IDToken:     jwtIDToken("NoSsid", "0001"),
+		},
+	}
+	d := testDeps(st, &mockRiot{entitlements: "ent", puuid: "p1", namesErr: context.Canceled}, box)
+	d.QRAuth = qr
+	d.QRPollInterval = time.Millisecond
+	s := New(d)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, state, err := s.BeginQRAuth(ctx, "d1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WaitQRLogin(ctx, state); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(box.lastPlain), "access_token=") {
+		t.Fatalf("stored session = %q", box.lastPlain)
+	}
+}
+
+func TestWaitQRLogin_TimesOut(t *testing.T) {
+	st := newMockStore()
+	qr := &mockQRAuth{pollsUntilDone: 1 << 30}
+	d := testDeps(st, &mockRiot{}, &mockBoxer{})
+	d.QRAuth = qr
+	d.QRPollInterval = time.Millisecond
+	s := New(d)
+
+	_, state, err := s.BeginQRAuth(context.Background(), "d1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := s.WaitQRLogin(ctx, state); err == nil {
+		t.Fatal("expected timeout error")
+	}
+}
+
+func TestWaitQRLogin_ExpiredSession(t *testing.T) {
+	st := newMockStore()
+	qr := &mockQRAuth{pollErr: riot.ErrQRExpired}
+	d := testDeps(st, &mockRiot{}, &mockBoxer{})
+	d.QRAuth = qr
+	d.QRPollInterval = time.Millisecond
+	s := New(d)
+
+	_, state, err := s.BeginQRAuth(context.Background(), "d1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WaitQRLogin(context.Background(), state); !errors.Is(err, riot.ErrQRExpired) {
+		t.Fatalf("err = %v, want ErrQRExpired", err)
+	}
 }
 
 func TestBeginAuth(t *testing.T) {

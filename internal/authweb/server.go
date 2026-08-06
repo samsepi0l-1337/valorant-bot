@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -19,7 +20,10 @@ import (
 	"github.com/dosfsociety/valorant-bot/internal/store"
 )
 
-const defaultPendingTTL = 15 * time.Minute
+const (
+	defaultPendingTTL     = 15 * time.Minute
+	defaultQRPollInterval = 2 * time.Second
+)
 
 // RiotRedirectURI is the OAuth redirect Riot returns to after login (riot-client).
 // Must be served at http://localhost/redirect (port 80) on the browser machine.
@@ -39,6 +43,13 @@ type RiotClient interface {
 	GetPlayerNames(ctx context.Context, accessToken, entitlementsToken, shard string, puuids []string) ([]riot.PlayerName, error)
 }
 
+// QRAuthClient drives the Riot Mobile QR login (primary /auth path).
+type QRAuthClient interface {
+	StartQRSession(ctx context.Context) (*riot.QRSession, error)
+	PollQRSession(ctx context.Context, sess *riot.QRSession) (loginToken string, err error)
+	ExchangeLoginToken(ctx context.Context, loginToken string) (riot.QRTokens, error)
+}
+
 // Boxer encrypts session material at rest.
 type Boxer interface {
 	Encrypt(plain []byte) ([]byte, error)
@@ -53,8 +64,12 @@ type Deps struct {
 	PendingTTL  time.Duration
 	Store       Store
 	Riot        RiotClient
-	Boxer       Boxer
-	OnLinked    LinkedNotifier
+	QRAuth      QRAuthClient
+	// QRPollInterval is how often WaitQRLogin asks Riot whether the QR code
+	// was approved. Defaults to defaultQRPollInterval.
+	QRPollInterval time.Duration
+	Boxer          Boxer
+	OnLinked       LinkedNotifier
 }
 
 type authOutcome struct {
@@ -66,16 +81,19 @@ type authOutcome struct {
 
 // Server serves login redirect + Riot callback catcher.
 type Server struct {
-	authBaseURL string
-	pendingTTL  time.Duration
-	store       Store
-	riot        RiotClient
-	boxer       Boxer
-	onLinked    LinkedNotifier
-	mux         *http.ServeMux
+	authBaseURL    string
+	pendingTTL     time.Duration
+	store          Store
+	riot           RiotClient
+	qrAuth         QRAuthClient
+	qrPollInterval time.Duration
+	boxer          Boxer
+	onLinked       LinkedNotifier
+	mux            *http.ServeMux
 
-	mu       sync.Mutex
-	outcomes map[string]authOutcome
+	mu         sync.Mutex
+	outcomes   map[string]authOutcome
+	qrSessions map[string]*riot.QRSession
 }
 
 // New builds an auth web Server.
@@ -84,15 +102,22 @@ func New(d Deps) *Server {
 	if ttl <= 0 {
 		ttl = defaultPendingTTL
 	}
+	poll := d.QRPollInterval
+	if poll <= 0 {
+		poll = defaultQRPollInterval
+	}
 	s := &Server{
-		authBaseURL: strings.TrimRight(d.AuthBaseURL, "/"),
-		pendingTTL:  ttl,
-		store:       d.Store,
-		riot:        d.Riot,
-		boxer:       d.Boxer,
-		onLinked:    d.OnLinked,
-		mux:         http.NewServeMux(),
-		outcomes:    make(map[string]authOutcome),
+		authBaseURL:    strings.TrimRight(d.AuthBaseURL, "/"),
+		pendingTTL:     ttl,
+		store:          d.Store,
+		riot:           d.Riot,
+		qrAuth:         d.QRAuth,
+		qrPollInterval: poll,
+		boxer:          d.Boxer,
+		onLinked:       d.OnLinked,
+		mux:            http.NewServeMux(),
+		outcomes:       make(map[string]authOutcome),
+		qrSessions:     make(map[string]*riot.QRSession),
 	}
 	s.mux.HandleFunc("GET /login", s.handleLogin)
 	s.mux.HandleFunc("GET /redirect", s.handleRedirectCatcher)
@@ -108,16 +133,6 @@ func New(d Deps) *Server {
 // Handler returns the HTTP handler (AUTH_PORT).
 func (s *Server) Handler() http.Handler {
 	return s.mux
-}
-
-// RedirectHandler serves localhost:80 routes for the Riot callback on this machine.
-func (s *Server) RedirectHandler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /redirect", s.handleRedirectCatcher)
-	mux.HandleFunc("/redirect", s.handleRedirectCatcher)
-	mux.HandleFunc("GET /catcher-ping", s.handleCatcherPing)
-	mux.HandleFunc("/catcher-ping", s.handleCatcherPing)
-	return mux
 }
 
 func (s *Server) handleCatcherPing(w http.ResponseWriter, r *http.Request) {
@@ -139,6 +154,86 @@ func (s *Server) BeginAuth(discordUserID string) (loginURL, state string, err er
 	s.setOutcome(state, authOutcome{Done: false})
 	loginURL = s.authBaseURL + "/login?state=" + url.QueryEscape(state)
 	return loginURL, state, nil
+}
+
+// BeginQRAuth starts a Riot Mobile QR login and returns the URL the user scans.
+// The caller then blocks on WaitQRLogin with the returned state.
+func (s *Server) BeginQRAuth(ctx context.Context, discordUserID string) (loginURL, state string, err error) {
+	if s.qrAuth == nil {
+		return "", "", fmt.Errorf("qr auth not configured")
+	}
+	sess, err := s.qrAuth.StartQRSession(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	state, err = newState()
+	if err != nil {
+		return "", "", err
+	}
+	if err := s.store.PutAuthPending(state, discordUserID, time.Now().Add(s.pendingTTL)); err != nil {
+		return "", "", err
+	}
+	s.mu.Lock()
+	s.qrSessions[state] = sess
+	s.mu.Unlock()
+	return sess.LoginURL, state, nil
+}
+
+// WaitQRLogin polls Riot until the QR code is approved, then links the account.
+// It returns once the account is stored, ctx expires, or the QR session dies.
+func (s *Server) WaitQRLogin(ctx context.Context, state string) (displayName string, err error) {
+	s.mu.Lock()
+	sess, ok := s.qrSessions[state]
+	s.mu.Unlock()
+	if !ok {
+		return "", fmt.Errorf("unknown or expired QR session")
+	}
+	defer func() {
+		s.mu.Lock()
+		delete(s.qrSessions, state)
+		s.mu.Unlock()
+	}()
+
+	ticker := time.NewTicker(s.qrPollInterval)
+	defer ticker.Stop()
+
+	for {
+		loginToken, perr := s.qrAuth.PollQRSession(ctx, sess)
+		switch {
+		case perr == nil:
+			tokens, xerr := s.qrAuth.ExchangeLoginToken(ctx, loginToken)
+			if xerr != nil {
+				return "", xerr
+			}
+			return s.completeQRLogin(ctx, state, tokens)
+		case errors.Is(perr, riot.ErrQRPending):
+		default:
+			return "", perr
+		}
+
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (s *Server) completeQRLogin(ctx context.Context, state string, tokens riot.QRTokens) (string, error) {
+	discordUserID, ok, err := s.store.TakeAuthPending(state)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("unknown or expired state")
+	}
+	// Persisted QR logins hand back an ssid cookie, which CookieReauth can
+	// refresh for daily store checks; otherwise fall back to the raw token.
+	session := tokens.SessionCookie
+	if session == "" {
+		session = "access_token=" + tokens.AccessToken
+	}
+	return s.linkAccount(ctx, discordUserID, tokens.AccessToken, tokens.IDToken, session, "kr")
 }
 
 func (s *Server) setOutcome(state string, o authOutcome) {
@@ -166,6 +261,7 @@ func riotAuthorizeURL(state string) string {
 }
 
 // CompleteFromRedirectURL links a Riot account from an OAuth redirect URL.
+// This is the browser fallback; /auth uses the QR flow.
 func (s *Server) CompleteFromRedirectURL(ctx context.Context, state, redirectURL, regionFallback string) (displayName string, err error) {
 	if regionFallback == "" {
 		regionFallback = "kr"
@@ -182,7 +278,12 @@ func (s *Server) CompleteFromRedirectURL(ctx context.Context, state, redirectURL
 	if err != nil {
 		return "", err
 	}
+	return s.linkAccount(ctx, discordUserID, accessToken, idToken, "access_token="+accessToken, regionFallback)
+}
 
+// linkAccount resolves the Riot identity behind accessToken and stores it for
+// discordUserID. session is the material encrypted at rest for later reauth.
+func (s *Server) linkAccount(ctx context.Context, discordUserID, accessToken, idToken, session, regionFallback string) (displayName string, err error) {
 	entitlements, err := s.riot.GetEntitlements(ctx, accessToken)
 	if err != nil {
 		return "", fmt.Errorf("entitlements: %w", err)
@@ -216,7 +317,7 @@ func (s *Server) CompleteFromRedirectURL(ctx context.Context, state, redirectURL
 		return "", fmt.Errorf("player names: %w", nerr)
 	}
 
-	cipherText, err := s.boxer.Encrypt([]byte("access_token=" + accessToken))
+	cipherText, err := s.boxer.Encrypt([]byte(session))
 	if err != nil {
 		return "", err
 	}
@@ -507,8 +608,8 @@ const indexHTML = `<!DOCTYPE html>
 <head><meta charset="utf-8"><title>Valorant Bot Auth</title></head>
 <body style="font-family:system-ui;max-width:36rem;margin:2rem auto;padding:0 1rem">
 <h1>Valorant Bot</h1>
-<p>Discord에서 <code>/auth</code> 를 실행한 뒤 로그인 버튼을 누르세요.</p>
-<p>다른 PC에서는 연동 페이지가 안내하는 자동 연동 도우미(포트 80)를 한 번 실행하면 URL 붙여넣기 없이 완료됩니다.</p>
+<p>Discord에서 <code>/auth</code> 를 실행하고, 표시된 QR 코드를 <strong>Riot Mobile</strong> 앱으로 스캔해 로그인을 승인하세요.</p>
+<p>이 페이지는 브라우저 로그인 예비 경로입니다. 평소에는 필요하지 않습니다.</p>
 </body>
 </html>
 `

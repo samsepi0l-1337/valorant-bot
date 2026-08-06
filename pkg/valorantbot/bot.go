@@ -100,6 +100,7 @@ func (b *Bot) Run(ctx context.Context) error {
 		AuthBaseURL: b.cfg.AuthBaseURL,
 		Store:       st,
 		Riot:        riotClient,
+		QRAuth:      riot.NewQRClient(nil),
 		Boxer:       boxer,
 		OnLinked: func(discordUserID, displayName string) {
 			ch, err := dg.UserChannelCreate(discordUserID)
@@ -128,26 +129,6 @@ func (b *Bot) Run(ctx context.Context) error {
 		}
 	}()
 	warnIfLoopbackAuthBase(b.cfg.AuthBaseURL, b.cfg.AuthPort)
-
-	// Riot redirects to http://localhost/redirect — requires port 80 on this machine.
-	redirectSrv := &http.Server{Addr: "127.0.0.1:80", Handler: authServer.RedirectHandler()}
-	go func() {
-		if err := redirectSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("WARNING: localhost:80 redirect catcher failed (%v). Auto-auth needs port 80. Try: sudo ./valorant-bot", err)
-		} else if err == nil || errors.Is(err, http.ErrServerClosed) {
-			// started or closed later
-		}
-	}()
-	// ListenAndServe only returns on error or shutdown; log success via brief probe
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		resp, err := http.Get("http://127.0.0.1/redirect")
-		if err != nil {
-			return
-		}
-		_ = resp.Body.Close()
-		log.Printf("riot redirect catcher listening on http://localhost/redirect")
-	}()
 
 	shopFetcher := &bot.ShopFetcher{
 		Accounts: st,
@@ -224,6 +205,5 @@ func (b *Bot) Run(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = httpSrv.Shutdown(shutdownCtx)
-	_ = redirectSrv.Shutdown(shutdownCtx)
 	return nil
 }

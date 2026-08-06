@@ -5,6 +5,9 @@
 #   docker compose --env-file .env.docker up -d --build
 #
 # Pi tip: AUTH_BASE_URL=http://<pi-lan-ip>:8787
+# Publish AUTH_PORT only (it serves /invite and the browser fallback page).
+# /auth is a Riot Mobile QR login, so no inbound port is required at all and
+# host port 80 must never be mapped.
 
 services:
   valorant-bot:

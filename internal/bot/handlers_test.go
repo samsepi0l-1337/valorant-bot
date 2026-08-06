@@ -1,8 +1,12 @@
 package bot_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"image"
+	_ "image/png"
+	"io"
 	"strings"
 	"testing"
 
@@ -13,16 +17,25 @@ import (
 )
 
 type fakeAuth struct {
-	url   string
-	state string
-	err   error
+	url     string
+	state   string
+	err     error
+	display string
+	waitErr error
 }
 
-func (f *fakeAuth) BeginAuth(discordUserID string) (string, string, error) {
+func (f *fakeAuth) BeginQRAuth(ctx context.Context, discordUserID string) (string, string, error) {
 	if f.err != nil {
 		return "", "", f.err
 	}
 	return f.url, f.state, nil
+}
+
+func (f *fakeAuth) WaitQRLogin(ctx context.Context, state string) (string, error) {
+	if f.waitErr != nil {
+		return "", f.waitErr
+	}
+	return f.display, nil
 }
 
 type memAccounts struct {
@@ -79,30 +92,63 @@ func (m *memLang) SetUserLanguage(discordUserID, language string) error {
 	return nil
 }
 
-func TestHandleAuth_EphemeralLoginURL(t *testing.T) {
+func TestHandleAuth_QRCodeAttachment(t *testing.T) {
+	const scanURL = "https://qrlogin.riotgames.com/riotmobile?suuid=s1"
 	h := &bot.Handlers{
-		Auth: &fakeAuth{url: "https://auth.example/login", state: "st"},
+		Auth: &fakeAuth{url: scanURL, state: "st"},
 	}
-	resp, err := h.HandleAuth("discord-1", i18n.KO)
+	resp, state, err := h.HandleAuth(context.Background(), "discord-1", i18n.KO)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if state != "st" {
+		t.Fatalf("state = %q", state)
 	}
 	if !resp.Ephemeral {
 		t.Error("expected ephemeral")
 	}
-	if resp.Content == "" {
-		t.Fatal("expected content")
+	if !strings.Contains(resp.Content, "Riot Mobile") {
+		t.Fatalf("content should tell the user to use Riot Mobile: %q", resp.Content)
 	}
-	if len(resp.Components) == 0 {
-		t.Fatal("expected login button component")
+
+	if len(resp.Files) != 1 {
+		t.Fatalf("expected one QR attachment, got %d", len(resp.Files))
 	}
+	png, err := io.ReadAll(resp.Files[0].Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := image.Decode(bytes.NewReader(png)); err != nil {
+		t.Fatalf("attachment is not a decodable image: %v", err)
+	}
+	if len(resp.Embeds) != 1 || resp.Embeds[0].Image == nil {
+		t.Fatalf("expected an embed showing the QR image: %+v", resp.Embeds)
+	}
+	if want := "attachment://" + resp.Files[0].Name; resp.Embeds[0].Image.URL != want {
+		t.Fatalf("embed image URL = %q, want %q", resp.Embeds[0].Image.URL, want)
+	}
+
+	// Mobile users tap the link instead of scanning.
 	row, ok := resp.Components[0].(discordgo.ActionsRow)
 	if !ok {
 		t.Fatalf("component type %T", resp.Components[0])
 	}
 	btn, ok := row.Components[0].(discordgo.Button)
-	if !ok || btn.URL != "https://auth.example/login" {
+	if !ok || btn.URL != scanURL {
 		t.Fatalf("button = %#v", row.Components[0])
+	}
+}
+
+func TestHandleAuth_NoLocalhostCatcherDependency(t *testing.T) {
+	h := &bot.Handlers{Auth: &fakeAuth{url: "https://qrlogin.riotgames.com/riotmobile?suuid=s1", state: "st"}}
+	resp, _, err := h.HandleAuth(context.Background(), "u", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"localhost", "127.0.0.1", "catcher", "AUTH_BASE_URL", "포트 80"} {
+		if strings.Contains(resp.Content, bad) {
+			t.Fatalf("QR auth prompt must not mention %q: %q", bad, resp.Content)
+		}
 	}
 }
 
@@ -110,9 +156,29 @@ func TestHandleAuth_Error(t *testing.T) {
 	h := &bot.Handlers{
 		Auth: &fakeAuth{err: errors.New("boom")},
 	}
-	_, err := h.HandleAuth("u", i18n.KO)
+	_, _, err := h.HandleAuth(context.Background(), "u", i18n.KO)
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestHandleAuthComplete(t *testing.T) {
+	h := &bot.Handlers{}
+
+	done := h.HandleAuthComplete("Ace#KR1", nil, i18n.KO)
+	if !strings.Contains(done.Content, "Ace#KR1") || !done.Ephemeral {
+		t.Fatalf("done = %+v", done)
+	}
+	if done.Embeds == nil || done.Components == nil {
+		t.Fatal("completion must clear the QR embed and button")
+	}
+	if len(done.Embeds) != 0 || len(done.Components) != 0 {
+		t.Fatalf("expected cleared embeds/components: %+v", done)
+	}
+
+	timedOut := h.HandleAuthComplete("", context.DeadlineExceeded, i18n.KO)
+	if !strings.Contains(timedOut.Content, "/auth") {
+		t.Fatalf("timeout message should ask the user to retry: %q", timedOut.Content)
 	}
 }
 

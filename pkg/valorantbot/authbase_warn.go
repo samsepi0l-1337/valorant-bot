@@ -9,17 +9,23 @@ import (
 )
 
 func warnIfLoopbackAuthBase(authBaseURL string, authPort int) {
-	u, err := url.Parse(strings.TrimSpace(authBaseURL))
-	if err != nil || u.Hostname() == "" {
-		return
-	}
-	host := strings.ToLower(u.Hostname())
-	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+	if !isLoopbackAuthBase(authBaseURL) {
 		return
 	}
 	hint := suggestLANAuthBase(authPort)
-	log.Printf("WARNING: AUTH_BASE_URL=%s is only reachable on this machine.", authBaseURL)
-	log.Printf("WARNING: Other PCs cannot complete /auth with 127.0.0.1. Set AUTH_BASE_URL to a LAN address, e.g. %s", hint)
+	log.Printf("NOTE: AUTH_BASE_URL=%s is only reachable on this machine.", authBaseURL)
+	log.Printf("NOTE: /auth (Riot Mobile QR) works regardless, but the /invite link and browser fallback page need a reachable address, e.g. %s", hint)
+}
+
+// isLoopbackAuthBase reports whether AUTH_BASE_URL points at this machine's
+// loopback address (same-PC login). LAN / public hosts return false.
+func isLoopbackAuthBase(authBaseURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(authBaseURL))
+	if err != nil || u.Hostname() == "" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "127.0.0.1" || host == "localhost" || host == "::1"
 }
 
 func suggestLANAuthBase(authPort int) string {

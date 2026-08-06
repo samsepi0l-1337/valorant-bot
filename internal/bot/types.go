@@ -8,9 +8,12 @@ import (
 	"github.com/dosfsociety/valorant-bot/internal/store"
 )
 
-// AuthStarter is provided by authweb later; mock in tests.
+// AuthStarter drives the Riot Mobile QR login (authweb.Server in production).
 type AuthStarter interface {
-	BeginAuth(discordUserID string) (loginURL string, state string, err error)
+	// BeginQRAuth returns the URL to render as a QR code plus a state handle.
+	BeginQRAuth(ctx context.Context, discordUserID string) (loginURL string, state string, err error)
+	// WaitQRLogin blocks until the QR login is approved and the account linked.
+	WaitQRLogin(ctx context.Context, state string) (displayName string, err error)
 }
 
 // AccountStore lists and deletes linked Riot accounts for a Discord user.
@@ -85,4 +88,5 @@ type Response struct {
 	Content    string
 	Embeds     []*discordgo.MessageEmbed
 	Components []discordgo.MessageComponent
+	Files      []*discordgo.File
 }

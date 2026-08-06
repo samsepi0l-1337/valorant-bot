@@ -1,39 +1,83 @@
 package bot
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/dosfsociety/valorant-bot/internal/i18n"
+	"github.com/dosfsociety/valorant-bot/internal/riot"
 	"github.com/dosfsociety/valorant-bot/internal/store"
+	qrcode "github.com/skip2/go-qrcode"
 )
 
-// HandleAuth starts OAuth and returns an ephemeral message with the login URL.
-func (h *Handlers) HandleAuth(discordUserID string, lang i18n.Lang) (Response, error) {
+// qrAttachmentName is referenced by the embed as attachment://<name>.
+const qrAttachmentName = "riot-qr.png"
+
+// qrImageSize is the QR PNG edge length in pixels; large enough to scan from a
+// desktop screen without dominating the ephemeral message.
+const qrImageSize = 320
+
+// HandleAuth starts a Riot Mobile QR login and returns the ephemeral message
+// holding the QR image. The returned state is passed to WaitQRLogin.
+func (h *Handlers) HandleAuth(ctx context.Context, discordUserID string, lang i18n.Lang) (Response, string, error) {
 	if h.Auth == nil {
-		return Response{}, fmt.Errorf("auth not configured")
+		return Response{}, "", fmt.Errorf("auth not configured")
 	}
-	loginURL, _, err := h.Auth.BeginAuth(discordUserID)
+	scanURL, state, err := h.Auth.BeginQRAuth(ctx, discordUserID)
 	if err != nil {
-		return Response{}, err
+		return Response{}, "", err
+	}
+	png, err := qrcode.Encode(scanURL, qrcode.Medium, qrImageSize)
+	if err != nil {
+		return Response{}, "", err
 	}
 	return Response{
 		Ephemeral: true,
 		Content:   i18n.T(lang, "auth.prompt"),
+		Files: []*discordgo.File{{
+			Name:        qrAttachmentName,
+			ContentType: "image/png",
+			Reader:      bytes.NewReader(png),
+		}},
+		Embeds: []*discordgo.MessageEmbed{{
+			Color: 0xFD4553,
+			Image: &discordgo.MessageEmbedImage{URL: "attachment://" + qrAttachmentName},
+		}},
 		Components: []discordgo.MessageComponent{
 			discordgo.ActionsRow{
 				Components: []discordgo.MessageComponent{
 					discordgo.Button{
 						Label: i18n.T(lang, "auth.button"),
 						Style: discordgo.LinkButton,
-						URL:   loginURL,
+						URL:   scanURL,
 					},
 				},
 			},
 		},
-	}, nil
+	}, state, nil
+}
+
+// HandleAuthComplete renders the final message once a QR login settles,
+// replacing the QR image and link button.
+func (h *Handlers) HandleAuthComplete(displayName string, err error, lang i18n.Lang) Response {
+	resp := Response{
+		Ephemeral:  true,
+		Embeds:     []*discordgo.MessageEmbed{},
+		Components: []discordgo.MessageComponent{},
+	}
+	switch {
+	case err == nil:
+		resp.Content = fmt.Sprintf(i18n.T(lang, "auth.qr.done"), displayName)
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, riot.ErrQRExpired):
+		resp.Content = i18n.T(lang, "auth.qr.timeout")
+	default:
+		resp.Content = fmt.Sprintf(i18n.T(lang, "auth.qr.failed"), err)
+	}
+	return resp
 }
 
 // HandleAccounts lists linked accounts for the user.

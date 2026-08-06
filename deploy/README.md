@@ -1,17 +1,27 @@
-# Deploy layouts
+# Deploy
 
-| Target | Env template | Binary | Install |
-| ------ | ------------ | ------ | ------- |
-| Local | `env.local.example` → `.env` | `make build` / `make run` | — |
-| Raspberry Pi | `env.pi.example` → `/etc/valorant-bot/env` | `make build-pi` | `sudo ./install.sh` |
-| Server (systemd) | `env.server.example` | `make build-linux` | `sudo ./install.sh` |
-| Server (Docker) | `env.server.example` → `.env.docker` | image build | `docker compose up -d` |
+| Target | One-shot script | Env template |
+| ------ | --------------- | ------------ |
+| Local | `./scripts/setup-local.sh` | `env.local.example` → `.env` |
+| Raspberry Pi | `./scripts/setup-pi.sh --host pi@…` | `env.pi.example` |
+| Cloud / VPS | `./scripts/setup-cloud.sh --host user@…` | `env.server.example` |
+| Docker | `./scripts/setup-cloud.sh --docker` | `.env.docker` |
+
+## Ports
+
+`/auth` is Riot Mobile QR. The bot host needs **no inbound port** for login.
+
+| Port | Role |
+| ---- | ---- |
+| Discord / Riot | outbound only |
+| `AUTH_PORT` (8787) | optional `/invite` page |
+| 80 | unused |
 
 ## Files
 
-- `install.sh` / `uninstall.sh` — systemd install on Linux
+- `install.sh` / `uninstall.sh` — systemd on Linux
 - `valorant-bot.service` — unit file
-- `nginx.example.conf` — optional reverse proxy
+- `nginx.example.conf` — optional reverse proxy for `/invite`
 - `env.*.example` — environment templates
 
-See the root [README](../README.md) for full steps.
+See the root [README](../README.md).
