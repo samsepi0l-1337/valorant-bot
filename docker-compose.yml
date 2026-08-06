@@ -1,0 +1,29 @@
+# Server / Pi Docker path
+#
+#   cp deploy/env.server.example .env.docker
+#   # edit DISCORD_*, BOT_SECRET, AUTH_BASE_URL
+#   docker compose --env-file .env.docker up -d --build
+#
+# Pi tip: AUTH_BASE_URL=http://<pi-lan-ip>:8787
+
+services:
+  valorant-bot:
+    build: .
+    image: valorant-bot:latest
+    container_name: valorant-bot
+    restart: unless-stopped
+    ports:
+      - "${AUTH_PORT:-8787}:8787"
+    environment:
+      DISCORD_TOKEN: ${DISCORD_TOKEN}
+      DISCORD_APP_ID: ${DISCORD_APP_ID}
+      BOT_SECRET: ${BOT_SECRET}
+      AUTH_BASE_URL: ${AUTH_BASE_URL}
+      AUTH_PORT: "8787"
+      DATABASE_PATH: /var/lib/valorant-bot/data/bot.db
+      STORE_RESET_CRON: ${STORE_RESET_CRON:-0 0 * * *}
+    volumes:
+      - valorant_bot_data:/var/lib/valorant-bot/data
+
+volumes:
+  valorant_bot_data:

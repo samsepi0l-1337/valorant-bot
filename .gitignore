@@ -1,0 +1,31 @@
+# macOS / Linux / Windows / Raspberry Pi / Docker
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Build outputs
+/bin/
+/dist/
+/valorant-bot
+/bot
+*.exe
+
+# Runtime data
+/data/
+*.db
+*.db-*
+*.lock
+
+# Go / OS
+*.test
+*.out
+.DS_Store
+Thumbs.db
+
+# Editors / local agent state (not part of the project)
+.idea/
+.vscode/
+.omc/
+.claude/
+.cursor/

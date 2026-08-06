@@ -1,0 +1,35 @@
+[Unit]
+Description=Valorant Discord Bot
+Documentation=file:///var/lib/valorant-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=valorant
+Group=valorant
+WorkingDirectory=/var/lib/valorant-bot
+EnvironmentFile=/etc/valorant-bot/env
+ExecStart=/usr/local/bin/valorant-bot
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/valorant-bot
+
+# Allow binding AUTH_PORT (default 8787). Port 80 needs CAP_NET_BIND_SERVICE
+# only if you run the localhost redirect catcher on this host.
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
