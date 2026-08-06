@@ -95,7 +95,7 @@ func (h *Handlers) HandleAccounts(discordUserID string, lang i18n.Lang) (Respons
 	var b strings.Builder
 	b.WriteString(i18n.T(lang, "accounts.header") + "\n")
 	for _, a := range accounts {
-		fmt.Fprintf(&b, "• %s#%s (%s)\n", a.GameName, a.TagLine, a.Region)
+		fmt.Fprintf(&b, "• %s#%s (%s)\n", a.GameName, a.TagLine, riot.DisplayRegion(a.Region, string(lang)))
 	}
 	return Response{Ephemeral: true, Content: strings.TrimSpace(b.String())}, nil
 }
@@ -190,7 +190,7 @@ func BuildShopEmbeds(shops []AccountShop, lang i18n.Lang) []*discordgo.MessageEm
 	for _, s := range shops {
 		account := fmt.Sprintf("%s#%s", s.GameName, s.TagLine)
 		if s.Region != "" {
-			account = fmt.Sprintf("%s (%s)", account, s.Region)
+			account = fmt.Sprintf("%s (%s)", account, riot.DisplayRegion(s.Region, string(lang)))
 		}
 
 		if s.Err != "" {

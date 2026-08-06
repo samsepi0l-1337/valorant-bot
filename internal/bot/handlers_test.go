@@ -198,10 +198,10 @@ func TestHandleAccounts_List(t *testing.T) {
 	if !resp.Ephemeral {
 		t.Error("expected ephemeral")
 	}
-	if !strings.Contains(resp.Content, "Ace#KR1 (kr)") {
+	if !strings.Contains(resp.Content, "Ace#KR1 (한국 (kr))") {
 		t.Fatalf("content %q", resp.Content)
 	}
-	if !strings.Contains(resp.Content, "Beta#NA1 (na)") {
+	if !strings.Contains(resp.Content, "Beta#NA1 (북미 (na))") {
 		t.Fatalf("content %q", resp.Content)
 	}
 }

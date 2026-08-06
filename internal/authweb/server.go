@@ -41,6 +41,7 @@ type RiotClient interface {
 	GetEntitlements(ctx context.Context, accessToken string) (string, error)
 	GetUserInfo(ctx context.Context, accessToken string) (string, error)
 	GetPlayerNames(ctx context.Context, accessToken, entitlementsToken, shard string, puuids []string) ([]riot.PlayerName, error)
+	ResolveValorantRegion(ctx context.Context, accessToken, idToken, fallback string) (region, shard string, err error)
 }
 
 // QRAuthClient drives the Riot Mobile QR login (primary /auth path).
@@ -233,7 +234,7 @@ func (s *Server) completeQRLogin(ctx context.Context, state string, tokens riot.
 	if session == "" {
 		session = "access_token=" + tokens.AccessToken
 	}
-	return s.linkAccount(ctx, discordUserID, tokens.AccessToken, tokens.IDToken, session, "kr")
+	return s.linkAccount(ctx, discordUserID, tokens.AccessToken, tokens.IDToken, session, "")
 }
 
 func (s *Server) setOutcome(state string, o authOutcome) {
@@ -263,9 +264,6 @@ func riotAuthorizeURL(state string) string {
 // CompleteFromRedirectURL links a Riot account from an OAuth redirect URL.
 // This is the browser fallback; /auth uses the QR flow.
 func (s *Server) CompleteFromRedirectURL(ctx context.Context, state, redirectURL, regionFallback string) (displayName string, err error) {
-	if regionFallback == "" {
-		regionFallback = "kr"
-	}
 	discordUserID, ok, err := s.store.TakeAuthPending(state)
 	if err != nil {
 		return "", err
@@ -294,13 +292,9 @@ func (s *Server) linkAccount(ctx context.Context, discordUserID, accessToken, id
 		return "", fmt.Errorf("userinfo: %w", err)
 	}
 
-	region, shard, err := riot.RegionFromToken(accessToken)
+	region, shard, err := s.riot.ResolveValorantRegion(ctx, accessToken, idToken, regionFallback)
 	if err != nil {
-		region = regionFallback
-		shard, err = riot.ShardForRegion(region)
-		if err != nil {
-			return "", err
-		}
+		return "", fmt.Errorf("region: %w", err)
 	}
 
 	gameName, tagLine := "", ""

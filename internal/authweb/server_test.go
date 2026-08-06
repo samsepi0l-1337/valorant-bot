@@ -51,6 +51,10 @@ type mockRiot struct {
 	puuid        string
 	names        []riot.PlayerName
 	namesErr     error
+	region       string
+	shard        string
+	regionErr    error
+	lastShard    string
 }
 
 func (m *mockRiot) GetEntitlements(ctx context.Context, accessToken string) (string, error) {
@@ -62,10 +66,25 @@ func (m *mockRiot) GetUserInfo(ctx context.Context, accessToken string) (string,
 }
 
 func (m *mockRiot) GetPlayerNames(ctx context.Context, accessToken, entitlementsToken, shard string, puuids []string) ([]riot.PlayerName, error) {
+	m.lastShard = shard
 	if m.namesErr != nil {
 		return nil, m.namesErr
 	}
 	return m.names, nil
+}
+
+func (m *mockRiot) ResolveValorantRegion(ctx context.Context, accessToken, idToken, fallback string) (string, string, error) {
+	if m.regionErr != nil {
+		return "", "", m.regionErr
+	}
+	if m.region != "" {
+		shard := m.shard
+		if shard == "" {
+			shard = m.region
+		}
+		return m.region, shard, nil
+	}
+	return riot.RegionFromToken(accessToken)
 }
 
 type mockBoxer struct {
@@ -207,6 +226,55 @@ func TestWaitQRLogin_LinksAccount(t *testing.T) {
 	// The ssid cookie must be stored so /shop can reauth without a new scan.
 	if string(box.lastPlain) != "ssid=SSID_VALUE" {
 		t.Fatalf("stored session = %q", box.lastPlain)
+	}
+}
+
+func TestWaitQRLogin_StoresAsiaPacificRegion(t *testing.T) {
+	st := newMockStore()
+	box := &mockBoxer{}
+	ri := &mockRiot{
+		entitlements: "ent",
+		puuid:        "puuid-ap",
+		names:        []riot.PlayerName{{GameName: "AsiaAce", TagLine: "AP1"}},
+		region:       "ap",
+		shard:        "ap",
+	}
+	qr := &mockQRAuth{
+		pollsUntilDone: 1,
+		tokens: riot.QRTokens{
+			// Token claim wrongly says kr; ResolveValorantRegion (geo) must win.
+			AccessToken:   jwtAccessToken("kr"),
+			IDToken:       jwtIDToken("AsiaAce", "AP1"),
+			SessionCookie: "ssid=APSSID",
+		},
+	}
+	s := New(Deps{
+		AuthBaseURL:    "http://127.0.0.1:8787",
+		Store:          st,
+		Riot:           ri,
+		Boxer:          box,
+		QRAuth:         qr,
+		QRPollInterval: time.Millisecond,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, state, err := s.BeginQRAuth(ctx, "discord-ap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.WaitQRLogin(ctx, state); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.accounts) != 1 {
+		t.Fatalf("accounts = %+v", st.accounts)
+	}
+	acc := st.accounts[0]
+	if acc.Region != "ap" || acc.Shard != "ap" {
+		t.Fatalf("stored region=%q shard=%q, want ap/ap", acc.Region, acc.Shard)
+	}
+	if ri.lastShard != "ap" {
+		t.Fatalf("GetPlayerNames shard = %q, want ap", ri.lastShard)
 	}
 }
 

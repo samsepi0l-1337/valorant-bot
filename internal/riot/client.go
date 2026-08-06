@@ -16,6 +16,7 @@ type Client struct {
 
 	AuthBaseURL         string
 	EntitlementsBaseURL string
+	GeoBaseURL          string
 	PDBaseURLFunc       func(shard string) string
 	ClientVersion       string
 }
@@ -28,6 +29,7 @@ func NewClient(httpClient *http.Client) *Client {
 		HTTPClient:          httpClient,
 		AuthBaseURL:         "https://auth.riotgames.com",
 		EntitlementsBaseURL: "https://entitlements.auth.riotgames.com",
+		GeoBaseURL:          "https://riot-geo.pas.si.riotgames.com",
 		PDBaseURLFunc: func(shard string) string {
 			return fmt.Sprintf("https://pd.%s.a.pvp.net", shard)
 		},
@@ -275,4 +277,76 @@ func (c *Client) CookieReauth(ctx context.Context, cookieHeader string) (accessT
 		return "", "", fmt.Errorf("cookie reauth: missing Location header")
 	}
 	return ParseRedirectURL(loc)
+}
+
+// GetValorantAffinity asks Riot Geo which live Valorant region the account uses.
+// This is the authoritative source for ap vs kr (and other shards).
+func (c *Client) GetValorantAffinity(ctx context.Context, accessToken, idToken string) (string, error) {
+	if accessToken == "" || idToken == "" {
+		return "", fmt.Errorf("geo: access token and id token required")
+	}
+	base := c.GeoBaseURL
+	if base == "" {
+		base = "https://riot-geo.pas.si.riotgames.com"
+	}
+	url := strings.TrimSuffix(base, "/") + "/pas/v1/product/valorant"
+	body, err := json.Marshal(map[string]string{"id_token": idToken})
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("geo: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+	}
+	var out struct {
+		Affinities struct {
+			Live string `json:"live"`
+		} `json:"affinities"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	live := NormalizeRegion(out.Affinities.Live)
+	if live == "" {
+		return "", fmt.Errorf("geo: unknown live affinity %q", out.Affinities.Live)
+	}
+	return live, nil
+}
+
+// ResolveValorantRegion prefers Riot Geo (when idToken is present), then the
+// access-token dat.r claim, then an explicit fallback. Never assumes "kr".
+func (c *Client) ResolveValorantRegion(ctx context.Context, accessToken, idToken, fallback string) (region, shard string, err error) {
+	if idToken != "" {
+		if live, gerr := c.GetValorantAffinity(ctx, accessToken, idToken); gerr == nil {
+			shard, err = ShardForRegion(live)
+			if err != nil {
+				return "", "", err
+			}
+			return live, shard, nil
+		}
+	}
+	if region, shard, err = RegionFromToken(accessToken); err == nil {
+		return region, shard, nil
+	}
+	fb := NormalizeRegion(fallback)
+	if fb == "" {
+		return "", "", fmt.Errorf("resolve region: %w", err)
+	}
+	shard, serr := ShardForRegion(fb)
+	if serr != nil {
+		return "", "", serr
+	}
+	return fb, shard, nil
 }
