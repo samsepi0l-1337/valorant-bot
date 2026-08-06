@@ -40,7 +40,14 @@ type GuildSettings struct {
 	GuildID        string
 	DailyChannelID string
 	Enabled        bool
+	// DailyHour is the local hour (0–23) in Asia/Seoul when daily shop posts run.
+	// Default 9 (Valorant store reset ≈ 09:00 KST).
+	DailyHour int
 }
+
+// DefaultDailyHourKST is used when a guild has no explicit schedule.
+const DefaultDailyHourKST = 9
+
 
 // Open opens (or creates) a SQLite database at path and migrates the schema.
 func Open(path string) (*Store, error) {
@@ -100,14 +107,30 @@ CREATE TABLE IF NOT EXISTS wishlists (
 CREATE TABLE IF NOT EXISTS guild_settings (
 	guild_id TEXT PRIMARY KEY,
 	daily_channel_id TEXT,
-	enabled INTEGER DEFAULT 1
+	enabled INTEGER DEFAULT 1,
+	daily_hour INTEGER NOT NULL DEFAULT 9
 );
 CREATE TABLE IF NOT EXISTS user_settings (
 	discord_user_id TEXT PRIMARY KEY,
 	language TEXT NOT NULL DEFAULT 'ko'
 );
 `
-	_, err := s.db.Exec(schema)
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+	return s.ensureGuildDailyHourColumn()
+}
+
+func (s *Store) ensureGuildDailyHourColumn() error {
+	var n int
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('guild_settings') WHERE name = 'daily_hour'`).Scan(&n)
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	_, err = s.db.Exec(`ALTER TABLE guild_settings ADD COLUMN daily_hour INTEGER NOT NULL DEFAULT 9`)
 	return err
 }
 
@@ -287,12 +310,17 @@ func (s *Store) UpsertGuildSettings(gs GuildSettings) error {
 	if gs.Enabled {
 		enabled = 1
 	}
+	hour := gs.DailyHour
+	if hour < 0 || hour > 23 {
+		hour = DefaultDailyHourKST
+	}
 	_, err := s.db.Exec(`
-INSERT INTO guild_settings (guild_id, daily_channel_id, enabled) VALUES (?, ?, ?)
+INSERT INTO guild_settings (guild_id, daily_channel_id, enabled, daily_hour) VALUES (?, ?, ?, ?)
 ON CONFLICT(guild_id) DO UPDATE SET
 	daily_channel_id = excluded.daily_channel_id,
-	enabled = excluded.enabled
-`, gs.GuildID, gs.DailyChannelID, enabled)
+	enabled = excluded.enabled,
+	daily_hour = excluded.daily_hour
+`, gs.GuildID, gs.DailyChannelID, enabled, hour)
 	return err
 }
 
@@ -301,8 +329,9 @@ func (s *Store) GetGuildSettings(guildID string) (GuildSettings, bool, error) {
 	var gs GuildSettings
 	var enabled int
 	err := s.db.QueryRow(`
-SELECT guild_id, COALESCE(daily_channel_id,''), enabled FROM guild_settings WHERE guild_id = ?
-`, guildID).Scan(&gs.GuildID, &gs.DailyChannelID, &enabled)
+SELECT guild_id, COALESCE(daily_channel_id,''), enabled, COALESCE(daily_hour, ?)
+FROM guild_settings WHERE guild_id = ?
+`, DefaultDailyHourKST, guildID).Scan(&gs.GuildID, &gs.DailyChannelID, &enabled, &gs.DailyHour)
 	if err == sql.ErrNoRows {
 		return GuildSettings{}, false, nil
 	}
@@ -310,14 +339,18 @@ SELECT guild_id, COALESCE(daily_channel_id,''), enabled FROM guild_settings WHER
 		return GuildSettings{}, false, err
 	}
 	gs.Enabled = enabled != 0
+	if gs.DailyHour < 0 || gs.DailyHour > 23 {
+		gs.DailyHour = DefaultDailyHourKST
+	}
 	return gs, true, nil
 }
 
 // ListEnabledGuildSettings returns all guilds with daily posts enabled.
 func (s *Store) ListEnabledGuildSettings() ([]GuildSettings, error) {
 	rows, err := s.db.Query(`
-SELECT guild_id, COALESCE(daily_channel_id,''), enabled FROM guild_settings WHERE enabled = 1
-`)
+SELECT guild_id, COALESCE(daily_channel_id,''), enabled, COALESCE(daily_hour, ?)
+FROM guild_settings WHERE enabled = 1
+`, DefaultDailyHourKST)
 	if err != nil {
 		return nil, err
 	}
@@ -327,10 +360,13 @@ SELECT guild_id, COALESCE(daily_channel_id,''), enabled FROM guild_settings WHER
 	for rows.Next() {
 		var gs GuildSettings
 		var enabled int
-		if err := rows.Scan(&gs.GuildID, &gs.DailyChannelID, &enabled); err != nil {
+		if err := rows.Scan(&gs.GuildID, &gs.DailyChannelID, &enabled, &gs.DailyHour); err != nil {
 			return nil, err
 		}
 		gs.Enabled = enabled != 0
+		if gs.DailyHour < 0 || gs.DailyHour > 23 {
+			gs.DailyHour = DefaultDailyHourKST
+		}
 		out = append(out, gs)
 	}
 	return out, rows.Err()

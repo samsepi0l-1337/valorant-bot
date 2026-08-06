@@ -4,7 +4,6 @@ import (
 	"context"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/dosfsociety/valorant-bot/internal/bot"
@@ -235,11 +234,33 @@ func TestRunOnce_DedupsWishlistDMPerUserSkin(t *testing.T) {
 	}
 }
 
-func TestStart_RunsOnCron(t *testing.T) {
+func TestRunForHour_FiltersGuilds(t *testing.T) {
 	channels := &fakeChannels{}
 	s := &Scheduler{
 		Guilds: &fakeGuilds{settings: []store.GuildSettings{
-			{GuildID: "g1", DailyChannelID: "chan-1", Enabled: true},
+			{GuildID: "g1", DailyChannelID: "chan-9", Enabled: true, DailyHour: 9},
+			{GuildID: "g2", DailyChannelID: "chan-21", Enabled: true, DailyHour: 21},
+		}},
+		Accounts:  &fakeAccounts{accounts: []store.Account{{DiscordUserID: "u1"}}},
+		Wishlists: &fakeWishlists{},
+		Shops:     &fakeShops{byUser: map[string][]bot.AccountShop{"u1": {}}},
+		Channels:  channels,
+		DMs:       &fakeDMs{},
+	}
+
+	if err := s.RunForHour(context.Background(), 21); err != nil {
+		t.Fatal(err)
+	}
+	if len(channels.posts) != 1 || channels.posts[0].ChannelID != "chan-21" {
+		t.Fatalf("posts %+v", channels.posts)
+	}
+}
+
+func TestRunForHour_NoMatch(t *testing.T) {
+	channels := &fakeChannels{}
+	s := &Scheduler{
+		Guilds: &fakeGuilds{settings: []store.GuildSettings{
+			{GuildID: "g1", DailyChannelID: "chan-9", Enabled: true, DailyHour: 9},
 		}},
 		Accounts:  &fakeAccounts{},
 		Wishlists: &fakeWishlists{},
@@ -247,40 +268,10 @@ func TestStart_RunsOnCron(t *testing.T) {
 		Channels:  channels,
 		DMs:       &fakeDMs{},
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- s.Start(ctx, "@every 1s")
-	}()
-
-	deadline := time.After(3 * time.Second)
-	for {
-		channels.mu.Lock()
-		n := len(channels.posts)
-		channels.mu.Unlock()
-		if n >= 1 {
-			cancel()
-			break
-		}
-		select {
-		case <-deadline:
-			cancel()
-			t.Fatal("timed out waiting for cron RunOnce")
-		case err := <-errCh:
-			if err != nil && ctx.Err() == nil {
-				t.Fatalf("Start: %v", err)
-			}
-			t.Fatal("Start exited before posting")
-		case <-time.After(50 * time.Millisecond):
-		}
+	if err := s.RunForHour(context.Background(), 15); err != nil {
+		t.Fatal(err)
 	}
-
-	select {
-	case <-errCh:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Start did not return after cancel")
+	if len(channels.posts) != 0 {
+		t.Fatalf("expected no posts, got %d", len(channels.posts))
 	}
 }

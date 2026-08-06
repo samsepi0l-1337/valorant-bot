@@ -101,6 +101,12 @@ func Commands() []*discordgo.ApplicationCommand {
 					Description:              "Set this channel for daily store posts",
 					DescriptionLocalizations: map[discordgo.Locale]string{discordgo.Korean: "현재 채널을 일일 상점 알림으로 지정"},
 				},
+				{
+					Type:                     discordgo.ApplicationCommandOptionSubCommand,
+					Name:                     "time",
+					Description:              "Pick daily shop alert hour (KST)",
+					DescriptionLocalizations: map[discordgo.Locale]string{discordgo.Korean: "일일 상점 알림 시각 선택 (KST)"},
+				},
 			},
 		},
 		{
@@ -174,6 +180,17 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 			break
 		}
 		resp, err = h.HandleWishlistSelectRemove(userID, data.Values[0], lang)
+	case strings.HasPrefix(data.CustomID, customIDChannelTimePrefix):
+		guildID := strings.TrimPrefix(data.CustomID, customIDChannelTimePrefix)
+		if i.GuildID != "" && i.GuildID != guildID {
+			err = fmt.Errorf("%s", i18n.T(lang, "channel.time_denied"))
+			break
+		}
+		if len(data.Values) == 0 {
+			err = fmt.Errorf("no selection")
+			break
+		}
+		resp, err = h.HandleChannelTimeSelect(guildID, data.Values[0], lang)
 	default:
 		log.Printf("interaction: ignoring component %q", data.CustomID)
 		return
@@ -261,11 +278,14 @@ func (h *Handlers) onAppCommand(s *discordgo.Session, i *discordgo.InteractionCr
 			err = errUnknownSubcommand
 		}
 	case "channel":
-		if subCommandName(data.Options) != "set" {
+		switch subCommandName(data.Options) {
+		case "set":
+			resp, err = h.HandleChannelSet(i.GuildID, i.ChannelID, lang)
+		case "time":
+			resp, err = h.HandleChannelTimeMenu(i.GuildID, lang)
+		default:
 			err = errUnknownSubcommand
-			break
 		}
-		resp, err = h.HandleChannelSet(i.GuildID, i.ChannelID, lang)
 	case "language":
 		resp, err = h.HandleLanguage(userID, optionString(data.Options, "lang"))
 	default:

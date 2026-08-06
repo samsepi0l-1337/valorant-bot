@@ -14,6 +14,7 @@ import (
 const (
 	customIDWishlistAddPrefix    = "wishlist:add:"
 	customIDWishlistRemovePrefix = "wishlist:remove:"
+	customIDChannelTimePrefix    = "channel:time:"
 )
 
 // HandleWishlistAdd searches skins and shows a select menu to pick the exact name.
@@ -240,14 +241,102 @@ func (h *Handlers) HandleChannelSet(guildID, channelID string, lang i18n.Lang) (
 	if guildID == "" || channelID == "" {
 		return Response{}, fmt.Errorf("guild and channel are required")
 	}
+	hour := store.DefaultDailyHourKST
+	if existing, ok, err := h.Guilds.GetGuildSettings(guildID); err == nil && ok {
+		hour = existing.DailyHour
+	}
 	if err := h.Guilds.UpsertGuildSettings(store.GuildSettings{
 		GuildID:        guildID,
 		DailyChannelID: channelID,
 		Enabled:        true,
+		DailyHour:      hour,
 	}); err != nil {
 		return Response{}, err
 	}
 	return Response{
-		Content: fmt.Sprintf(i18n.T(lang, "channel.set"), channelID),
+		Content: fmt.Sprintf(i18n.T(lang, "channel.set"), channelID, hour),
 	}, nil
+}
+
+// HandleChannelTimeMenu shows a select menu to pick the daily post hour (KST).
+func (h *Handlers) HandleChannelTimeMenu(guildID string, lang i18n.Lang) (Response, error) {
+	if h.Guilds == nil {
+		return Response{}, fmt.Errorf("guild settings not configured")
+	}
+	if guildID == "" {
+		return Response{}, fmt.Errorf("guild only")
+	}
+	current := store.DefaultDailyHourKST
+	if existing, ok, err := h.Guilds.GetGuildSettings(guildID); err == nil && ok {
+		current = existing.DailyHour
+	}
+	return Response{
+		Ephemeral:  true,
+		Content:    fmt.Sprintf(i18n.T(lang, "channel.time_prompt"), current),
+		Components: []discordgo.MessageComponent{dailyHourSelectRow(customIDChannelTimePrefix+guildID, lang)},
+	}, nil
+}
+
+// HandleChannelTimeSelect saves the chosen KST hour for daily posts.
+func (h *Handlers) HandleChannelTimeSelect(guildID, hourStr string, lang i18n.Lang) (Response, error) {
+	if h.Guilds == nil {
+		return Response{}, fmt.Errorf("guild settings not configured")
+	}
+	var hour int
+	if _, err := fmt.Sscanf(hourStr, "%d", &hour); err != nil || hour < 0 || hour > 23 {
+		return Response{Ephemeral: true, Content: i18n.T(lang, "channel.time_invalid")}, nil
+	}
+	channelID := ""
+	enabled := true
+	if existing, ok, err := h.Guilds.GetGuildSettings(guildID); err == nil && ok {
+		channelID = existing.DailyChannelID
+		enabled = existing.Enabled
+	}
+	if err := h.Guilds.UpsertGuildSettings(store.GuildSettings{
+		GuildID:        guildID,
+		DailyChannelID: channelID,
+		Enabled:        enabled,
+		DailyHour:      hour,
+	}); err != nil {
+		return Response{}, err
+	}
+	msg := fmt.Sprintf(i18n.T(lang, "channel.time_set"), hour)
+	if channelID == "" {
+		msg += "\n" + i18n.T(lang, "channel.time_need_set")
+	}
+	return Response{Ephemeral: true, Content: msg}, nil
+}
+
+func dailyHourSelectRow(customID string, lang i18n.Lang) discordgo.ActionsRow {
+	options := make([]discordgo.SelectMenuOption, 0, 24)
+	for h := 0; h < 24; h++ {
+		label := fmt.Sprintf("%02d:00 KST", h)
+		desc := ""
+		if h == store.DefaultDailyHourKST {
+			if lang == i18n.EN {
+				label = fmt.Sprintf("%02d:00 KST (store reset)", h)
+				desc = "Recommended"
+			} else {
+				label = fmt.Sprintf("%02d:00 KST (상점 리셋)", h)
+				desc = "권장"
+			}
+		}
+		options = append(options, discordgo.SelectMenuOption{
+			Label:       truncateRunes(label, 100),
+			Value:       fmt.Sprintf("%d", h),
+			Description: desc,
+		})
+	}
+	placeholder := i18n.T(lang, "channel.time_placeholder")
+	return discordgo.ActionsRow{
+		Components: []discordgo.MessageComponent{
+			discordgo.SelectMenu{
+				CustomID:    customID,
+				Placeholder: truncateRunes(placeholder, 150),
+				MinValues:   ptrInt(1),
+				MaxValues:   1,
+				Options:     options,
+			},
+		},
+	}
 }

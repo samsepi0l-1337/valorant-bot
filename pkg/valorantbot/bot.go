@@ -216,7 +216,7 @@ func (b *Bot) Run(ctx context.Context) error {
 		}
 	}()
 
-	log.Printf("valorant-bot running (auth %s, discord connected, cron %q)", addr, cronExpr)
+	log.Printf("valorant-bot running (auth %s, discord connected, daily schedule Asia/Seoul hourly)", addr)
 	log.Print(formatInviteLog(appID, b.cfg.AuthBaseURL))
 
 	<-ctx.Done()

@@ -74,6 +74,11 @@ func (m *memGuild) UpsertGuildSettings(gs store.GuildSettings) error {
 	return nil
 }
 
+func (m *memGuild) GetGuildSettings(guildID string) (store.GuildSettings, bool, error) {
+	gs, ok := m.settings[guildID]
+	return gs, ok, nil
+}
+
 func TestHandleWishlistAdd_ShowsSelectMenu(t *testing.T) {
 	wl := &memWishlist{items: map[string][]store.WishlistItem{}}
 	h := &bot.Handlers{
@@ -230,5 +235,35 @@ func TestHandleChannelSet(t *testing.T) {
 	got := gs.settings["guild-1"]
 	if got.DailyChannelID != "chan-99" || !got.Enabled {
 		t.Fatalf("settings %+v", got)
+	}
+	if got.DailyHour != store.DefaultDailyHourKST {
+		t.Fatalf("hour %d", got.DailyHour)
+	}
+}
+
+func TestHandleChannelTimeMenuAndSelect(t *testing.T) {
+	gs := &memGuild{settings: map[string]store.GuildSettings{
+		"guild-1": {GuildID: "guild-1", DailyChannelID: "c1", Enabled: true, DailyHour: 9},
+	}}
+	h := &bot.Handlers{Guilds: gs}
+	menu, err := h.HandleChannelTimeMenu("guild-1", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(menu.Components) == 0 {
+		t.Fatal("expected select")
+	}
+	resp, err := h.HandleChannelTimeSelect("guild-1", "21", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Content, "21:00") {
+		t.Fatalf("content %q", resp.Content)
+	}
+	if gs.settings["guild-1"].DailyHour != 21 {
+		t.Fatalf("%+v", gs.settings["guild-1"])
+	}
+	if gs.settings["guild-1"].DailyChannelID != "c1" {
+		t.Fatal("channel should be preserved")
 	}
 }

@@ -59,6 +59,7 @@ type WishlistStore interface {
 // GuildStore persists per-guild notification settings.
 type GuildStore interface {
 	UpsertGuildSettings(gs store.GuildSettings) error
+	GetGuildSettings(guildID string) (store.GuildSettings, bool, error)
 }
 
 // LanguageStore persists per-user UI language.

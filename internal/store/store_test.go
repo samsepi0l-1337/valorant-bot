@@ -1,7 +1,11 @@
 package store
 
 import (
+	"fmt"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -246,9 +250,10 @@ func TestGuildSettings(t *testing.T) {
 	s := openTemp(t)
 
 	gs := GuildSettings{
-		GuildID:         "guild-1",
-		DailyChannelID:  "chan-1",
-		Enabled:         true,
+		GuildID:        "guild-1",
+		DailyChannelID: "chan-1",
+		Enabled:        true,
+		DailyHour:      21,
 	}
 	if err := s.UpsertGuildSettings(gs); err != nil {
 		t.Fatalf("UpsertGuildSettings: %v", err)
@@ -261,7 +266,7 @@ func TestGuildSettings(t *testing.T) {
 	if !ok {
 		t.Fatal("expected found")
 	}
-	if got.DailyChannelID != "chan-1" || !got.Enabled {
+	if got.DailyChannelID != "chan-1" || !got.Enabled || got.DailyHour != 21 {
 		t.Errorf("got %+v", got)
 	}
 
@@ -295,4 +300,105 @@ func TestGuildSettings(t *testing.T) {
 	if len(enabled) != 2 {
 		t.Fatalf("enabled len = %d, want 2", len(enabled))
 	}
+}
+
+func TestOpen_AppliesBusyTimeoutAndWAL(t *testing.T) {
+	s := openTemp(t)
+	var busy int
+	if err := s.db.QueryRow(`PRAGMA busy_timeout`).Scan(&busy); err != nil {
+		t.Fatal(err)
+	}
+	if busy < 5000 {
+		t.Fatalf("busy_timeout=%d, want >= 5000", busy)
+	}
+	var mode string
+	if err := s.db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != "wal" {
+		t.Fatalf("journal_mode=%q, want wal", mode)
+	}
+	if s.db.Stats().MaxOpenConnections != 1 {
+		t.Fatalf("MaxOpenConnections=%d, want 1 (serialize Discord handlers)", s.db.Stats().MaxOpenConnections)
+	}
+}
+
+func TestConcurrentMixedOps_NoBusy(t *testing.T) {
+	s := openTemp(t)
+	const writers = 8
+	const iters = 40
+
+	var busyHits atomic.Int64
+	var otherErrs atomic.Int64
+	var wg sync.WaitGroup
+
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			uid := fmt.Sprintf("user-%d", id)
+			for i := 0; i < iters; i++ {
+				acc := Account{
+					DiscordUserID:     uid,
+					PUUID:             fmt.Sprintf("puuid-%d-%d", id, i%3),
+					GameName:          "N",
+					TagLine:           "T",
+					Region:            "kr",
+					Shard:             "kr",
+					CookiesCiphertext: []byte("x"),
+				}
+				if err := s.UpsertRiotAccount(acc); err != nil {
+					if isBusy(err) {
+						busyHits.Add(1)
+					} else {
+						otherErrs.Add(1)
+					}
+				}
+				if _, err := s.ListRiotAccountsByDiscord(uid); err != nil {
+					if isBusy(err) {
+						busyHits.Add(1)
+					} else {
+						otherErrs.Add(1)
+					}
+				}
+				if err := s.SetUserLanguage(uid, "ko"); err != nil {
+					if isBusy(err) {
+						busyHits.Add(1)
+					} else {
+						otherErrs.Add(1)
+					}
+				}
+				if _, err := s.GetUserLanguage(uid); err != nil {
+					if isBusy(err) {
+						busyHits.Add(1)
+					} else {
+						otherErrs.Add(1)
+					}
+				}
+				if err := s.PutAuthPending(fmt.Sprintf("st-%d-%d", id, i), uid, time.Now().Add(time.Minute)); err != nil {
+					if isBusy(err) {
+						busyHits.Add(1)
+					} else {
+						otherErrs.Add(1)
+					}
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	if busyHits.Load() != 0 {
+		t.Fatalf("got %d SQLITE_BUSY errors under concurrent load", busyHits.Load())
+	}
+	if otherErrs.Load() != 0 {
+		t.Fatalf("got %d unexpected store errors", otherErrs.Load())
+	}
+}
+
+func isBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "SQLITE_BUSY") || strings.Contains(msg, "database is locked")
 }

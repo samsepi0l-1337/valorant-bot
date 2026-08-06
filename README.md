@@ -274,6 +274,7 @@ docker compose logs -f
 | `/shop` | 오늘 상점 (언어 설정에 맞는 스킨 이름) |
 | `/wishlist add\|remove\|list` | 위시리스트 (추가/제거 시 선택 메뉴) |
 | `/channel set` | 일일 알림 채널 지정 |
+| `/channel time` | 일일 알림 시각 선택 (KST, 셀렉트 박스) |
 | `/language` | 봇 응답·스킨 이름 언어 (`ko` / `en`) |
 
 ---
@@ -295,5 +296,5 @@ make test
 
 ## 스케줄러
 
-일일 길드 알림·위시리스트 DM은 `STORE_RESET_CRON`(기본 `0 0 * * *` UTC ≈ 09:00 KST)
-에 실행됩니다. `/channel set`으로 채널을 지정하세요.
+일일 길드 알림은 서버별로 `/channel time`에서 고른 **KST 시각**(기본 09:00)에
+실행됩니다. 위시리스트 DM도 그날 첫 알림 시각에 함께 검사합니다.

@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -50,13 +51,45 @@ type Scheduler struct {
 	Shops     ShopSource
 	Channels  ChannelPoster
 	DMs       DMPoster
+
+	mu               sync.Mutex
+	lastWishlistDate string // YYYY-MM-DD in Asia/Seoul
 }
 
-// RunOnce performs a single daily shop / wishlist pass.
+// Seoul is the timezone used for daily schedule hours.
+func Seoul() *time.Location {
+	loc, err := time.LoadLocation("Asia/Seoul")
+	if err != nil {
+		return time.FixedZone("KST", 9*60*60)
+	}
+	return loc
+}
+
+// RunOnce performs a single daily shop / wishlist pass for all enabled guilds.
 func (s *Scheduler) RunOnce(ctx context.Context) error {
+	return s.RunForHour(ctx, -1)
+}
+
+// RunForHour posts shops to guilds whose DailyHour matches hourKST.
+// hourKST < 0 means all enabled guilds (manual / test RunOnce).
+func (s *Scheduler) RunForHour(ctx context.Context, hourKST int) error {
 	guilds, err := s.Guilds.ListEnabledGuildSettings()
 	if err != nil {
 		return fmt.Errorf("list guild settings: %w", err)
+	}
+
+	var target []store.GuildSettings
+	for _, gs := range guilds {
+		if gs.DailyChannelID == "" {
+			continue
+		}
+		if hourKST >= 0 && gs.DailyHour != hourKST {
+			continue
+		}
+		target = append(target, gs)
+	}
+	if len(target) == 0 && hourKST >= 0 {
+		return nil
 	}
 
 	accounts, err := s.Accounts.ListAllRiotAccounts()
@@ -81,13 +114,31 @@ func (s *Scheduler) RunOnce(ctx context.Context) error {
 	}
 
 	embeds := bot.BuildShopEmbeds(allShops, i18n.KO)
-	for _, gs := range guilds {
-		if gs.DailyChannelID == "" {
-			continue
+	postGuilds := target
+	if hourKST < 0 {
+		postGuilds = nil
+		for _, gs := range guilds {
+			if gs.DailyChannelID != "" {
+				postGuilds = append(postGuilds, gs)
+			}
 		}
+	}
+	for _, gs := range postGuilds {
 		if err := s.Channels.PostChannel(ctx, gs.DailyChannelID, "Daily Valorant shop", embeds); err != nil {
 			return fmt.Errorf("post channel %s: %w", gs.DailyChannelID, err)
 		}
+	}
+
+	// Wishlist DMs once per KST calendar day (tied to the first hourly tick that runs).
+	today := time.Now().In(Seoul()).Format("2006-01-02")
+	s.mu.Lock()
+	already := s.lastWishlistDate == today
+	if !already {
+		s.lastWishlistDate = today
+	}
+	s.mu.Unlock()
+	if already && hourKST >= 0 {
+		return nil
 	}
 
 	wishlists, err := s.Wishlists.ListAllWishlists()
@@ -129,11 +180,19 @@ func shopContainsSkin(shops []bot.AccountShop, skinUUID string) bool {
 	return false
 }
 
-// Start runs RunOnce on the given cron schedule (UTC) until ctx is cancelled.
+// Start ticks every minute in Asia/Seoul and runs guild posts at each guild's DailyHour.
+// cronExpr is kept for backward compatibility but ignored for guild schedules
+// (except empty: still starts the Seoul ticker).
 func (s *Scheduler) Start(ctx context.Context, cronExpr string) error {
-	c := cron.New(cron.WithLocation(time.UTC))
-	_, err := c.AddFunc(cronExpr, func() {
-		_ = s.RunOnce(ctx)
+	_ = cronExpr
+	loc := Seoul()
+	c := cron.New(cron.WithLocation(loc))
+	_, err := c.AddFunc("* * * * *", func() {
+		now := time.Now().In(loc)
+		if now.Minute() != 0 {
+			return
+		}
+		_ = s.RunForHour(ctx, now.Hour())
 	})
 	if err != nil {
 		return fmt.Errorf("cron: %w", err)
