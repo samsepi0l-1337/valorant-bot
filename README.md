@@ -70,15 +70,15 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID
 
 ## 환경 변수
 
-| 변수               | 필수   | 설명                                       |
-| ------------------ | ------ | ------------------------------------------ |
-| `DISCORD_TOKEN`    | 예     | 봇 토큰                                    |
-| `DISCORD_APP_ID`   | 예     | 애플리케이션 ID                            |
+| 변수               | 필수   | 설명                                                 |
+| ------------------ | ------ | ---------------------------------------------------- |
+| `DISCORD_TOKEN`    | 예     | 봇 토큰                                              |
+| `DISCORD_APP_ID`   | 예     | 애플리케이션 ID                                      |
 | `BOT_SECRET`       | 예     | 세션 암호화 키 (**32자 이상**, 스크립트가 생성 가능) |
-| `AUTH_BASE_URL`    | 예     | `/invite`·예비 로그인 페이지 주소          |
-| `AUTH_PORT`        | 아니오 | HTTP 포트 (기본 `8787`)                    |
-| `DATABASE_PATH`    | 아니오 | SQLite 경로                                |
-| `STORE_RESET_CRON` | 아니오 | 레거시 크론 문자열 (일일 시각은 `/channel time`) |
+| `AUTH_BASE_URL`    | 예     | `/invite`·예비 로그인 페이지 주소                    |
+| `AUTH_PORT`        | 아니오 | HTTP 포트 (기본 `8787`)                              |
+| `DATABASE_PATH`    | 아니오 | SQLite 경로                                          |
+| `STORE_RESET_CRON` | 아니오 | 레거시 크론 문자열 (일일 시각은 `/channel time`)     |
 
 템플릿: `deploy/env.local.example`, `deploy/env.pi.example`,
 `deploy/env.server.example`, `.env.example`
@@ -89,7 +89,8 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID
 
 ## Discord 앱 설정
 
-1. [Discord Developer Portal](https://discord.com/developers/applications)에서 앱 생성
+1. [Discord Developer Portal](https://discord.com/developers/applications)에서
+   앱 생성
 2. **Bot** → 토큰 → `DISCORD_TOKEN`
 3. **OAuth2 → General** → Client ID → `DISCORD_APP_ID`
 4. Privileged Gateway Intents는 기본값으로 충분합니다
@@ -137,16 +138,16 @@ QR은 약 3분 후 만료됩니다. 여러 Riot 계정은 `/auth`를 계정마�
 
 ## 슬래시 명령
 
-| 명령                          | 설명                                   |
-| ----------------------------- | -------------------------------------- |
-| `/auth`                       | Riot Mobile QR로 계정 연동             |
-| `/accounts`                   | 연결된 계정 목록                       |
-| `/unlink`                     | 계정 연결 해제                         |
-| `/shop`                       | 오늘 상점                              |
-| `/wishlist add\|remove\|list` | 위시리스트                             |
-| `/channel set`                | 일일 알림 채널                         |
-| `/channel time`               | 일일 알림 시각 (KST)                   |
-| `/language`                   | 봇·스킨 이름 언어 (`ko` / `en`)        |
+| 명령                          | 설명                            |
+| ----------------------------- | ------------------------------- |
+| `/auth`                       | Riot Mobile QR로 계정 연동      |
+| `/accounts`                   | 연결된 계정 목록                |
+| `/unlink`                     | 계정 연결 해제                  |
+| `/shop`                       | 오늘 상점                       |
+| `/wishlist add\|remove\|list` | 위시리스트                      |
+| `/channel set`                | 일일 알림 채널                  |
+| `/channel time`               | 일일 알림 시각 (KST)            |
+| `/language`                   | 봇·스킨 이름 언어 (`ko` / `en`) |
 
 ---
 
