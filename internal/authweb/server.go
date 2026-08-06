@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dosfsociety/valorant-bot/internal/riot"
@@ -20,7 +22,7 @@ import (
 const defaultPendingTTL = 15 * time.Minute
 
 // RiotRedirectURI is the OAuth redirect Riot returns to after login (riot-client).
-// Must be served at http://localhost/redirect (port 80).
+// Must be served at http://localhost/redirect (port 80) on the browser machine.
 const RiotRedirectURI = "http://localhost/redirect"
 
 // Store persists auth pending state and Riot accounts.
@@ -55,6 +57,13 @@ type Deps struct {
 	OnLinked    LinkedNotifier
 }
 
+type authOutcome struct {
+	Done    bool   `json:"done"`
+	OK      bool   `json:"ok"`
+	Display string `json:"display,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
 // Server serves login redirect + Riot callback catcher.
 type Server struct {
 	authBaseURL string
@@ -64,6 +73,9 @@ type Server struct {
 	boxer       Boxer
 	onLinked    LinkedNotifier
 	mux         *http.ServeMux
+
+	mu       sync.Mutex
+	outcomes map[string]authOutcome
 }
 
 // New builds an auth web Server.
@@ -80,11 +92,15 @@ func New(d Deps) *Server {
 		boxer:       d.Boxer,
 		onLinked:    d.OnLinked,
 		mux:         http.NewServeMux(),
+		outcomes:    make(map[string]authOutcome),
 	}
 	s.mux.HandleFunc("GET /login", s.handleLogin)
 	s.mux.HandleFunc("GET /redirect", s.handleRedirectCatcher)
+	s.mux.HandleFunc("GET /catcher-ping", s.handleCatcherPing)
 	s.mux.HandleFunc("POST /api/auth/callback", s.handleCallback)
 	s.mux.HandleFunc("OPTIONS /api/auth/callback", s.handleCallbackCORS)
+	s.mux.HandleFunc("GET /api/auth/wait", s.handleWait)
+	s.mux.HandleFunc("GET /install-catcher.sh", s.handleInstallCatcher)
 	s.mux.HandleFunc("GET /", s.handleIndex)
 	return s
 }
@@ -94,12 +110,20 @@ func (s *Server) Handler() http.Handler {
 	return s.mux
 }
 
-// RedirectHandler serves only GET /redirect for the port-80 Riot callback.
+// RedirectHandler serves localhost:80 routes for the Riot callback on this machine.
 func (s *Server) RedirectHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /redirect", s.handleRedirectCatcher)
-	mux.HandleFunc("/redirect", s.handleRedirectCatcher) // fallback for older mux matching
+	mux.HandleFunc("/redirect", s.handleRedirectCatcher)
+	mux.HandleFunc("GET /catcher-ping", s.handleCatcherPing)
+	mux.HandleFunc("/catcher-ping", s.handleCatcherPing)
 	return mux
+}
+
+func (s *Server) handleCatcherPing(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "text/plain")
+	_, _ = w.Write([]byte("ok"))
 }
 
 // BeginAuth creates a pending auth state and returns the Discord login button URL.
@@ -112,8 +136,22 @@ func (s *Server) BeginAuth(discordUserID string) (loginURL, state string, err er
 	if err := s.store.PutAuthPending(state, discordUserID, expiresAt); err != nil {
 		return "", "", err
 	}
+	s.setOutcome(state, authOutcome{Done: false})
 	loginURL = s.authBaseURL + "/login?state=" + url.QueryEscape(state)
 	return loginURL, state, nil
+}
+
+func (s *Server) setOutcome(state string, o authOutcome) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.outcomes[state] = o
+}
+
+func (s *Server) getOutcome(state string) (authOutcome, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o, ok := s.outcomes[state]
+	return o, ok
 }
 
 func riotAuthorizeURL(state string) string {
@@ -214,7 +252,6 @@ func newState() (string, error) {
 	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32], nil
 }
 
-// handleIndex explains how remote clients should authenticate.
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
@@ -224,9 +261,6 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, indexHTML)
 }
 
-// handleLogin shows Riot login + paste form (required for other computers).
-// Riot always redirects to http://localhost/redirect on the *browser* machine,
-// so remote users must paste that URL back to this server.
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	state := strings.TrimSpace(r.URL.Query().Get("state"))
 	if state == "" {
@@ -235,21 +269,40 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	riotURL := riotAuthorizeURL(state)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
 	_, _ = fmt.Fprintf(w, loginPageHTML,
-		html.EscapeString(riotURL),
-		html.EscapeString(s.authBaseURL+"/api/auth/callback"),
-		html.EscapeString(state),
 		html.EscapeString(s.authBaseURL),
+		s.authBaseURL,
+		state,
+		riotURL,
+		s.authBaseURL+"/install-catcher.sh",
 	)
 }
 
-// handleRedirectCatcher runs at http://localhost/redirect after Riot login.
-// JS reads the hash and POSTs tokens to the bot callback automatically.
+func (s *Server) handleWait(w http.ResponseWriter, r *http.Request) {
+	setCORS(w)
+	state := strings.TrimSpace(r.URL.Query().Get("state"))
+	if state == "" {
+		http.Error(w, "missing state", http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if o, ok := s.getOutcome(state); ok && o.Done {
+		_ = json.NewEncoder(w).Encode(o)
+		return
+	}
+	_ = json.NewEncoder(w).Encode(authOutcome{Done: false})
+}
+
+func (s *Server) handleInstallCatcher(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/x-shellscript; charset=utf-8")
+	w.Header().Set("Content-Disposition", "inline; filename=\"install-catcher.sh\"")
+	_, _ = fmt.Fprintf(w, installCatcherScript, s.authBaseURL)
+}
+
 func (s *Server) handleRedirectCatcher(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = fmt.Fprintf(w, redirectCatcherHTML, s.authBaseURL+"/api/auth/callback", s.authBaseURL)
+	_, _ = fmt.Fprintf(w, redirectCatcherHTML, s.authBaseURL+"/api/auth/callback")
 }
 
 func (s *Server) handleCallbackCORS(w http.ResponseWriter, r *http.Request) {
@@ -259,7 +312,7 @@ func (s *Server) handleCallbackCORS(w http.ResponseWriter, r *http.Request) {
 
 func setCORS(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 }
 
@@ -280,6 +333,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	display, err := s.CompleteFromRedirectURL(r.Context(), state, redirectURL, region)
 	if err != nil {
 		log.Printf("auth callback error: %v", err)
+		s.setOutcome(state, authOutcome{Done: true, OK: false, Error: err.Error()})
 		msg := err.Error()
 		code := http.StatusBadRequest
 		if strings.Contains(msg, "entitlements") || strings.Contains(msg, "userinfo") || strings.Contains(msg, "player names") {
@@ -289,6 +343,7 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.setOutcome(state, authOutcome{Done: true, OK: true, Display: display})
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = fmt.Fprintf(w, successHTML, html.EscapeString(display))
@@ -296,27 +351,12 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 
 const redirectCatcherHTML = `<!DOCTYPE html>
 <html lang="ko">
-<head>
-<meta charset="utf-8">
-<title>연동 처리 중…</title>
-<style>
-  body { font-family: system-ui, sans-serif; max-width: 36rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.45; }
-  code, textarea { word-break: break-all; }
-  textarea { width: 100%%; min-height: 5rem; }
-</style>
-</head>
+<head><meta charset="utf-8"><title>연동 처리 중…</title></head>
 <body>
 <p id="msg">Discord 계정에 연결하는 중…</p>
-<div id="fallback" style="display:none">
-  <p>자동 저장에 실패했습니다. 아래 주소창 URL 전체를 복사한 뒤,
-     봇 서버의 연동 페이지에 붙여넣으세요.</p>
-  <p>연동 페이지: <a id="loginHint" href="#"></a></p>
-  <textarea id="urlBox" readonly></textarea>
-</div>
 <script>
 (function () {
   var callback = %q;
-  var authBase = %q;
   var hash = (window.location.hash || "").replace(/^#/, "");
   var params = new URLSearchParams(hash);
   var access = params.get("access_token");
@@ -337,18 +377,10 @@ const redirectCatcherHTML = `<!DOCTYPE html>
   }).then(function (res) {
     return res.text().then(function (text) {
       if (!res.ok) throw new Error(text || ("HTTP " + res.status));
-      document.open();
-      document.write(text);
-      document.close();
+      document.open(); document.write(text); document.close();
     });
   }).catch(function (err) {
     msg.textContent = "저장 실패: " + err.message;
-    var fb = document.getElementById("fallback");
-    fb.style.display = "block";
-    document.getElementById("urlBox").value = window.location.href;
-    var a = document.getElementById("loginHint");
-    a.href = authBase + "/login?state=" + encodeURIComponent(state || "");
-    a.textContent = authBase + "/login?state=…";
   });
 })();
 </script>
@@ -356,6 +388,7 @@ const redirectCatcherHTML = `<!DOCTYPE html>
 </html>
 `
 
+// loginPageHTML args: display authBase (%s), then authBase, state, riotURL, installURL (%q ×4).
 const loginPageHTML = `<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -363,43 +396,107 @@ const loginPageHTML = `<!DOCTYPE html>
 <title>Riot 계정 연동</title>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 36rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
-  .btn { display: inline-block; background: #fd4553; color: #fff; padding: .7rem 1.2rem; border-radius: 8px; text-decoration: none; font-weight: 600; }
-  textarea { width: 100%%; min-height: 6rem; font-family: ui-monospace, monospace; font-size: 12px; }
-  .box { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-top: 1.5rem; background: #fafafa; }
-  code { background: #eee; padding: 0 .25rem; }
-  button { margin-top: .5rem; padding: .5rem 1rem; }
+  .btn { display: inline-block; background: #fd4553; color: #fff; padding: .7rem 1.2rem; border-radius: 8px; text-decoration: none; font-weight: 600; border: 0; cursor: pointer; font-size: 1rem; }
+  .muted { color: #666; font-size: .9rem; }
+  .box { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-top: 1rem; background: #fafafa; display: none; }
+  code { background: #eee; padding: 0 .25rem; word-break: break-all; }
+  pre { background: #111; color: #eee; padding: .75rem; border-radius: 8px; overflow-x: auto; font-size: 12px; }
+  #status { margin-top: 1rem; font-weight: 600; }
 </style>
 </head>
 <body>
 <h1>Riot 계정 연동</h1>
-<p><a class="btn" href="%s">Riot으로 로그인</a></p>
-<p>같은 PC에서 봇을 실행 중이면 로그인 후 자동으로 완료됩니다.</p>
+<p id="status">준비 중…</p>
+<p><button class="btn" type="button" id="loginBtn" style="display:none">Riot으로 로그인</button></p>
 
-<div class="box">
-  <h2>다른 컴퓨터에서 로그인할 때</h2>
-  <ol>
-    <li>위 버튼으로 Riot 로그인</li>
-    <li>끝나면 브라우저가 <code>http://localhost/redirect#access_token=…</code> 로 이동합니다
-        (페이지가 안 열려도 <strong>주소창 URL 전체</strong>를 복사)</li>
-    <li>그 URL을 아래에 붙여넣고 제출</li>
-  </ol>
-  <p>이 페이지 주소가 <code>127.0.0.1</code> 이면 다른 PC에서 접속할 수 없습니다.
-     봇 서버의 <code>AUTH_BASE_URL</code>을 LAN IP로 바꾸세요. (예: <code>http://192.168.0.10:8787</code>)</p>
-  <form method="POST" action="%s">
-    <input type="hidden" name="state" value="%s">
-    <label>localhost/redirect URL<br>
-      <textarea name="redirect_url" placeholder="http://localhost/redirect#access_token=...&id_token=...&state=..." required></textarea>
-    </label><br>
-    <button type="submit">연동 완료</button>
-  </form>
+<div class="box" id="needCatcher">
+  <p>이 PC에서 자동 연동을 위해 <strong>한 번</strong> 아래 명령을 실행하세요 (포트 80).</p>
+  <pre id="cmd"></pre>
+  <p class="muted">실행 후 이 페이지가 도우미를 감지하면 Riot 로그인이 자동으로 열립니다. URL 붙여넣기는 필요 없습니다.</p>
 </div>
-<p style="color:#666;font-size:.9rem">서버: %s</p>
+
+<p class="muted">서버: %s</p>
 <script>
-  // Same-machine convenience: open Riot after a short delay unless user is already pasting.
-  setTimeout(function () {
-    if (document.activeElement && document.activeElement.tagName === "TEXTAREA") return;
-    // Do not auto-navigate on remote paste flow; user clicks the button.
-  }, 0);
+(function () {
+  var authBase = %q;
+  var state = %q;
+  var riotURL = %q;
+  var installURL = %q;
+  var status = document.getElementById("status");
+  var btn = document.getElementById("loginBtn");
+  var need = document.getElementById("needCatcher");
+  var cmd = document.getElementById("cmd");
+  cmd.textContent = "curl -fsSL '" + installURL + "' | sudo bash -s -- '" + authBase + "'";
+
+  var popup = null;
+  var started = false;
+
+  function openRiot() {
+    if (started) return;
+    started = true;
+    status.textContent = "Riot 로그인 창에서 로그인하세요…";
+    btn.style.display = "none";
+    need.style.display = "none";
+    popup = window.open(riotURL, "riot_auth", "width=520,height=720");
+    if (!popup) {
+      status.textContent = "팝업이 차단되었습니다. 아래 버튼으로 다시 시도하세요.";
+      btn.style.display = "inline-block";
+      started = false;
+    }
+  }
+
+  btn.addEventListener("click", openRiot);
+
+  function pingCatcher() {
+    return fetch("http://127.0.0.1/catcher-ping", { mode: "cors", cache: "no-store" })
+      .then(function (r) { return r.ok; })
+      .catch(function () { return false; });
+  }
+
+  function pollWait() {
+    fetch(authBase + "/api/auth/wait?state=" + encodeURIComponent(state), { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (o) {
+        if (o && o.done) {
+          if (o.ok) {
+            status.textContent = "연동 완료: " + (o.display || "");
+            document.body.insertAdjacentHTML("beforeend",
+              "<p>이 창을 닫고 Discord에서 <code>/shop</code> 을 사용하세요.</p>");
+            if (popup && !popup.closed) popup.close();
+            return;
+          }
+          status.textContent = "연동 실패: " + (o.error || "unknown");
+          return;
+        }
+        setTimeout(pollWait, 1500);
+      })
+      .catch(function () { setTimeout(pollWait, 2000); });
+  }
+
+  function ensureCatcherThenLogin() {
+    pingCatcher().then(function (ok) {
+      if (ok) {
+        status.textContent = "자동 연동 준비됨. Riot 로그인을 엽니다…";
+        openRiot();
+        return;
+      }
+      status.textContent = "이 PC에 자동 연동 도우미가 필요합니다.";
+      need.style.display = "block";
+      btn.style.display = "inline-block";
+      // Keep probing; once the user starts the catcher, open Riot automatically.
+      var iv = setInterval(function () {
+        pingCatcher().then(function (ready) {
+          if (!ready) return;
+          clearInterval(iv);
+          openRiot();
+        });
+      }, 1500);
+    });
+  }
+
+  pollWait();
+  ensureCatcherThenLogin();
+})();
 </script>
 </body>
 </html>
@@ -411,7 +508,7 @@ const indexHTML = `<!DOCTYPE html>
 <body style="font-family:system-ui;max-width:36rem;margin:2rem auto;padding:0 1rem">
 <h1>Valorant Bot</h1>
 <p>Discord에서 <code>/auth</code> 를 실행한 뒤 로그인 버튼을 누르세요.</p>
-<p>다른 PC에서 연동하려면 <code>AUTH_BASE_URL</code>이 이 기기의 LAN IP여야 합니다.</p>
+<p>다른 PC에서는 연동 페이지가 안내하는 자동 연동 도우미(포트 80)를 한 번 실행하면 URL 붙여넣기 없이 완료됩니다.</p>
 </body>
 </html>
 `

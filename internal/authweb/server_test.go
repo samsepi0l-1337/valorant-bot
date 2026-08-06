@@ -110,7 +110,7 @@ func TestBeginAuth(t *testing.T) {
 	}
 }
 
-func TestLogin_ShowsRiotLinkAndPasteForm(t *testing.T) {
+func TestLogin_AutoFlow(t *testing.T) {
 	s := New(testDeps(newMockStore(), &mockRiot{}, &mockBoxer{}))
 	req := httptest.NewRequest(http.MethodGet, "/login?state=abc-state", nil)
 	rec := httptest.NewRecorder()
@@ -128,11 +128,63 @@ func TestLogin_ShowsRiotLinkAndPasteForm(t *testing.T) {
 	if !strings.Contains(body, "abc-state") {
 		t.Fatalf("missing state: %s", body)
 	}
-	if !strings.Contains(body, "redirect_url") {
-		t.Fatal("missing paste form")
+	if !strings.Contains(body, "catcher-ping") {
+		t.Fatal("missing catcher detection")
 	}
-	if !strings.Contains(body, "/api/auth/callback") {
-		t.Fatal("missing callback action")
+	if !strings.Contains(body, "/api/auth/wait") {
+		t.Fatal("missing wait poll")
+	}
+	if !strings.Contains(body, "install-catcher.sh") {
+		t.Fatal("missing catcher install hint")
+	}
+	if strings.Contains(body, "붙여넣") && strings.Contains(body, "<form") {
+		t.Fatal("paste form should be removed")
+	}
+}
+
+func TestWait_AndInstallCatcher(t *testing.T) {
+	st := newMockStore()
+	s := New(testDeps(st, &mockRiot{}, &mockBoxer{}))
+	_, state, err := s.BeginAuth("d1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/wait?state="+url.QueryEscape(state), nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("wait status %d", rec.Code)
+	}
+	var pending authOutcome
+	if err := json.NewDecoder(rec.Body).Decode(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending.Done {
+		t.Fatal("expected not done yet")
+	}
+
+	s.setOutcome(state, authOutcome{Done: true, OK: true, Display: "A#B"})
+	req2 := httptest.NewRequest(http.MethodGet, "/api/auth/wait?state="+url.QueryEscape(state), nil)
+	rec2 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec2, req2)
+	var done authOutcome
+	if err := json.NewDecoder(rec2.Body).Decode(&done); err != nil {
+		t.Fatal(err)
+	}
+	if !done.Done || !done.OK || done.Display != "A#B" {
+		t.Fatalf("%+v", done)
+	}
+
+	req3 := httptest.NewRequest(http.MethodGet, "/install-catcher.sh", nil)
+	rec3 := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("install status %d", rec3.Code)
+	}
+	script := rec3.Body.String()
+	if !strings.Contains(script, "127.0.0.1:8787") || !strings.Contains(script, "catcher-ping") {
+		t.Fatalf("bad install script: %s", script)
 	}
 }
 

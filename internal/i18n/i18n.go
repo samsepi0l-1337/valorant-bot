@@ -37,7 +37,7 @@ func T(lang Lang, key string) string {
 }
 
 var ko = map[string]string{
-	"auth.prompt":                "Riot 계정을 연결하려면 아래 **로그인** 버튼을 누르세요.\n다른 PC에서는 로그인 페이지의 **URL 붙여넣기**가 필요합니다.\n(`AUTH_BASE_URL`은 봇 PC의 LAN IP여야 합니다.)",
+	"auth.prompt":                "Riot 계정을 연결하려면 아래 **로그인** 버튼을 누르세요.\n다른 PC에서는 연동 페이지가 안내하는 **자동 연동 도우미**(포트 80)를 한 번 실행하면 됩니다.\n(`AUTH_BASE_URL`은 봇 PC의 LAN IP여야 합니다.)",
 	"auth.button":                "로그인",
 	"accounts.empty":       "연결된 계정이 없습니다. `/auth` 로 Riot 계정을 연결하세요.",
 	"accounts.header":      "**연결된 계정**",
@@ -70,7 +70,7 @@ var ko = map[string]string{
 }
 
 var en = map[string]string{
-	"auth.prompt":                "Press **Login** below to link your Riot account.\nOn another PC, use the **paste URL** form on the login page.\n(`AUTH_BASE_URL` must be this machine's LAN IP.)",
+	"auth.prompt":                "Press **Login** below to link your Riot account.\nOn another PC, run the **auth catcher** (port 80) shown on the login page once — no URL paste needed.\n(`AUTH_BASE_URL` must be this machine's LAN IP.)",
 	"auth.button":                "Login",
 	"accounts.empty":       "No linked accounts. Use `/auth` to connect a Riot account.",
 	"accounts.header":      "**Linked accounts**",

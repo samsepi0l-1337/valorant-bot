@@ -18,7 +18,7 @@ VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo de
 LDFLAGS   := -s -w -X main.version=$(VERSION)
 
 .PHONY: all run build build-all build-pi build-pi32 build-linux build-darwin \
-	clean test docker-build docker-up docker-down help
+	build-catcher clean test docker-build docker-up docker-down help
 
 all: build
 
@@ -26,6 +26,7 @@ help:
 	@echo "Targets:"
 	@echo "  run           Run locally (requires .env)"
 	@echo "  build         Native binary → $(BIN_DIR)/$(APP)"
+	@echo "  build-catcher Native authcatcher → $(BIN_DIR)/authcatcher"
 	@echo "  build-all     Cross-compile → $(DIST_DIR)/"
 	@echo "  build-pi      linux/arm64 (Raspberry Pi 64-bit)"
 	@echo "  build-pi32    linux/arm   (Raspberry Pi 32-bit)"
@@ -46,6 +47,10 @@ build:
 	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(APP) $(CMD)
 	@echo "→ $(BIN_DIR)/$(APP)"
 
+build-catcher:
+	@mkdir -p $(BIN_DIR)
+	go build -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/authcatcher ./cmd/authcatcher
+	@echo "→ $(BIN_DIR)/authcatcher"
 build-pi:
 	@mkdir -p $(DIST_DIR)
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" \

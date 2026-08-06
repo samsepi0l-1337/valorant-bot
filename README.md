@@ -23,11 +23,12 @@ Docker에서 실행할 수 있습니다.
 
 ## Discord 앱 설정
 
-1. [Discord Developer Portal](https://discord.com/developers/applications)에서 앱 생성
+1. [Discord Developer Portal](https://discord.com/developers/applications)에서
+   앱 생성
 2. **Bot** 탭에서 토큰 발급 → `DISCORD_TOKEN`
 3. **OAuth2 → General**에서 Client ID 확인 → `DISCORD_APP_ID`
-4. Privileged Gateway Intents는 기본값으로 충분합니다 (`Guilds`, `Guild Messages`).
-   Message Content Intent는 필요 없습니다.
+4. Privileged Gateway Intents는 기본값으로 충분합니다 (`Guilds`,
+   `Guild Messages`). Message Content Intent는 필요 없습니다.
 
 ### 봇 초대
 
@@ -35,8 +36,8 @@ Docker에서 실행할 수 있습니다.
 https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID
 ```
 
-서버에 초대되면 해당 길드에 슬래시 명령이 바로 등록됩니다.
-실행 중이면 `http://<AUTH_BASE_URL>/invite` 로도 초대 링크를 열 수 있습니다.
+서버에 초대되면 해당 길드에 슬래시 명령이 바로 등록됩니다. 실행 중이면
+`http://<AUTH_BASE_URL>/invite` 로도 초대 링크를 열 수 있습니다.
 
 ---
 
@@ -44,30 +45,30 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID
 
 템플릿:
 
-| 파일 | 용도 |
-|------|------|
-| `.env.example` | 공통 |
-| `deploy/env.local.example` | 로컬 PC |
-| `deploy/env.pi.example` | Raspberry Pi |
-| `deploy/env.server.example` | VPS / 서버 |
+| 파일                        | 용도         |
+| --------------------------- | ------------ |
+| `.env.example`              | 공통         |
+| `deploy/env.local.example`  | 로컬 PC      |
+| `deploy/env.pi.example`     | Raspberry Pi |
+| `deploy/env.server.example` | VPS / 서버   |
 
-| 변수 | 필수 | 설명 |
-|------|------|------|
-| `DISCORD_TOKEN` | 예 | 봇 토큰 |
-| `DISCORD_APP_ID` | 예 | 애플리케이션 ID |
-| `BOT_SECRET` | 예 | 세션 암호화 키 (**32자 이상**) |
-| `AUTH_BASE_URL` | 예 | 브라우저가 여는 인증 URL |
-| `AUTH_PORT` | 아니오 | 인증 HTTP 포트 (기본 `8787`) |
-| `DATABASE_PATH` | 아니오 | SQLite 경로 (기본 `./data/bot.db`) |
+| 변수               | 필수   | 설명                                  |
+| ------------------ | ------ | ------------------------------------- |
+| `DISCORD_TOKEN`    | 예     | 봇 토큰                               |
+| `DISCORD_APP_ID`   | 예     | 애플리케이션 ID                       |
+| `BOT_SECRET`       | 예     | 세션 암호화 키 (**32자 이상**)        |
+| `AUTH_BASE_URL`    | 예     | 브라우저가 여는 인증 URL              |
+| `AUTH_PORT`        | 아니오 | 인증 HTTP 포트 (기본 `8787`)          |
+| `DATABASE_PATH`    | 아니오 | SQLite 경로 (기본 `./data/bot.db`)    |
 | `STORE_RESET_CRON` | 아니오 | 일일 상점 크론 (기본 `0 0 * * *` UTC) |
 
 **`AUTH_BASE_URL` 규칙**
 
-| 사용 방식 | 예시 |
-|-----------|------|
-| 봇과 같은 PC에서만 로그인 | `http://127.0.0.1:8787` |
+| 사용 방식                          | 예시                                          |
+| ---------------------------------- | --------------------------------------------- |
+| 봇과 같은 PC에서만 로그인          | `http://127.0.0.1:8787`                       |
 | 같은 Wi‑Fi의 다른 PC/폰에서 로그인 | `http://192.168.0.37:8787` (봇 기기의 LAN IP) |
-| 공개 서버 + 도메인 | `https://bot.example.com` |
+| 공개 서버 + 도메인                 | `https://bot.example.com`                     |
 
 `127.0.0.1`로 두면 **다른 기기에서는 로그인할 수 없습니다.**
 
@@ -138,11 +139,12 @@ go build -o valorant-bot.exe .\cmd\bot
 **방법 C — WSL2 (Ubuntu)**
 
 WSL 안에서 [Linux](#linux-일반-pc--vps) 절과 동일하게 `make run` / systemd 없이
-포그라운드 실행하면 됩니다. `AUTH_BASE_URL`은 Windows 호스트 LAN IP 또는
-WSL IP를 상황에 맞게 넣으세요.
+포그라운드 실행하면 됩니다. `AUTH_BASE_URL`은 Windows 호스트 LAN IP 또는 WSL
+IP를 상황에 맞게 넣으세요.
 
 > Windows에서 Riot `localhost/redirect`(포트 80) 자동 캡처는 관리자 권한이
-> 필요할 수 있습니다. 다른 PC 연동은 **URL 붙여넣기**를 쓰는 편이 쉽습니다.
+> 필요할 수 있습니다. 다른 PC에서 연동할 때는 연동 페이지가 안내하는 **자동 연동
+> 도우미**(포트 80)를 그 PC에서 한 번 실행하세요.
 
 ### Linux (일반 PC / VPS)
 
@@ -182,12 +184,12 @@ sudo journalctl -u valorant-bot -f
 
 설치 위치:
 
-| 경로 | 내용 |
-|------|------|
-| `/usr/local/bin/valorant-bot` | 바이너리 |
-| `/etc/valorant-bot/env` | 환경 변수 |
-| `/var/lib/valorant-bot/data/` | SQLite |
-| `systemd: valorant-bot` | 서비스 |
+| 경로                          | 내용      |
+| ----------------------------- | --------- |
+| `/usr/local/bin/valorant-bot` | 바이너리  |
+| `/etc/valorant-bot/env`       | 환경 변수 |
+| `/var/lib/valorant-bot/data/` | SQLite    |
+| `systemd: valorant-bot`       | 서비스    |
 
 제거: `sudo ./deploy/uninstall.sh` (데이터까지 삭제: `--purge`)
 
@@ -195,7 +197,9 @@ HTTPS는 `deploy/nginx.example.conf` 참고.
 
 ### Raspberry Pi
 
-봇만 Pi에 두고, 로그인은 **폰/PC 브라우저 + URL 붙여넣기**를 쓰는 구성을 권장합니다.
+봇만 Pi에 두고, 로그인은 **폰/PC 브라우저 + 자동 연동 도우미**를 쓰는 구성을
+권장합니다. (Riot은 `http://localhost/redirect`만 허용하므로, 브라우저가 열린
+기기에서 포트 80 도우미가 필요합니다.)
 
 **1) Mac/PC에서 크로스 빌드**
 
@@ -233,9 +237,9 @@ sudo journalctl -u valorant-bot -f
 
 Pi LAN IP 확인: `hostname -I`
 
-> Pi에 모니터/브라우저가 없어도 됩니다. Discord `/auth` → 로그인 페이지가
-> Pi IP로 열리면, Riot 로그인 후 주소창의 `localhost/redirect#...` 를
-> 붙여넣으면 연동됩니다.
+> Pi에 모니터/브라우저가 없어도 됩니다. Discord `/auth` → 로그인 페이지가 Pi
+> IP로 열리면, **브라우저를 연 PC**에서 연동 페이지가 안내하는 자동 연동
+> 도우미(포트 80)를 실행한 뒤 Riot 로그인을 완료하면 됩니다.
 
 ### Docker
 
@@ -254,28 +258,43 @@ docker compose logs -f
 
 ## Riot 계정 연동 (`/auth`)
 
+Riot은 redirect를 `http://localhost/redirect`(포트 80)만 허용합니다. 봇이 다른
+기기에 있어도, **브라우저를 연 PC**에서 localhost 캡처가 되면 연동이 자동으로
+끝납니다. URL 붙여넣기는 필요 없습니다.
+
 1. Discord에서 `/auth` → **로그인** 버튼
-2. 연동 페이지에서 **Riot으로 로그인**
-3. **봇과 같은 기기:** `http://localhost/redirect` 자동 캡처  
-   (포트 80 필요 → macOS/Linux에서는 보통 `sudo ./valorant-bot`)
-4. **다른 기기:** 로그인 후 주소창의  
-   `http://localhost/redirect#access_token=...` **전체**를 연동 페이지 폼에 붙여넣기
-5. Discord DM으로 연동 완료 알림
+2. 연동 페이지가 열림 (`AUTH_BASE_URL` — LAN IP여야 다른 기기에서 접근 가능)
+3. **봇과 같은 기기:** 봇이 포트 80을 쓰는 경우(`sudo ./valorant-bot`) 자동으로
+   Riot 로그인 창이 열리고 완료됩니다
+4. **다른 기기:** 연동 페이지가 안내하는 명령을 **그 PC의 터미널**에서 한 번
+   실행합니다 (Python3 + 포트 80 권한 필요):
+
+   ```bash
+   curl -fsSL 'http://<AUTH_BASE_URL>/install-catcher.sh' | sudo bash -s -- 'http://<AUTH_BASE_URL>'
+   ```
+
+   도우미가 감지되면 Riot 로그인이 자동으로 열리고, 로그인 후 봇으로 토큰이
+   전달됩니다. (Go 바이너리 대안:
+   `sudo ./authcatcher -forward http://<AUTH_BASE_URL>`)
+
+5. Discord DM으로 연동 완료 알림 · 연동 페이지에도 완료 표시
+
+> 모바일 브라우저는 포트 80 도우미를 띄우기 어렵습니다. PC/맥에서 연동하세요.
 
 ---
 
 ## 슬래시 명령
 
-| 명령 | 설명 |
-|------|------|
-| `/auth` | Riot 계정 연동 |
-| `/accounts` | 연결된 계정 목록 |
-| `/unlink` | 계정 연결 해제 |
-| `/shop` | 오늘 상점 (언어 설정에 맞는 스킨 이름) |
-| `/wishlist add\|remove\|list` | 위시리스트 (추가/제거 시 선택 메뉴) |
-| `/channel set` | 일일 알림 채널 지정 |
-| `/channel time` | 일일 알림 시각 선택 (KST, 셀렉트 박스) |
-| `/language` | 봇 응답·스킨 이름 언어 (`ko` / `en`) |
+| 명령                          | 설명                                   |
+| ----------------------------- | -------------------------------------- |
+| `/auth`                       | Riot 계정 연동                         |
+| `/accounts`                   | 연결된 계정 목록                       |
+| `/unlink`                     | 계정 연결 해제                         |
+| `/shop`                       | 오늘 상점 (언어 설정에 맞는 스킨 이름) |
+| `/wishlist add\|remove\|list` | 위시리스트 (추가/제거 시 선택 메뉴)    |
+| `/channel set`                | 일일 알림 채널 지정                    |
+| `/channel time`               | 일일 알림 시각 선택 (KST, 셀렉트 박스) |
+| `/language`                   | 봇 응답·스킨 이름 언어 (`ko` / `en`)   |
 
 ---
 
