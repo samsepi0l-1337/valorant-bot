@@ -44,11 +44,17 @@ type RiotClient interface {
 	ResolveValorantRegion(ctx context.Context, accessToken, idToken, fallback string) (region, shard string, err error)
 }
 
-// QRAuthClient drives the Riot Mobile QR login (primary /auth path).
+// QRAuthClient drives the Riot Mobile QR login.
 type QRAuthClient interface {
 	StartQRSession(ctx context.Context) (*riot.QRSession, error)
 	PollQRSession(ctx context.Context, sess *riot.QRSession) (loginToken string, err error)
 	ExchangeLoginToken(ctx context.Context, loginToken string) (riot.QRTokens, error)
+}
+
+// PasswordAuthClient drives Discord modal username/password login.
+type PasswordAuthClient interface {
+	LoginWithPassword(ctx context.Context, username, password string) (riot.PasswordTokens, *riot.MFAChallenge, error)
+	SubmitMFA(ctx context.Context, challenge *riot.MFAChallenge, code string) (riot.PasswordTokens, error)
 }
 
 // Boxer encrypts session material at rest.
@@ -61,13 +67,12 @@ type LinkedNotifier func(discordUserID, displayName string)
 
 // Deps configures the auth web server.
 type Deps struct {
-	AuthBaseURL string
-	PendingTTL  time.Duration
-	Store       Store
-	Riot        RiotClient
-	QRAuth      QRAuthClient
-	// QRPollInterval is how often WaitQRLogin asks Riot whether the QR code
-	// was approved. Defaults to defaultQRPollInterval.
+	AuthBaseURL    string
+	PendingTTL     time.Duration
+	Store          Store
+	Riot           RiotClient
+	QRAuth         QRAuthClient
+	PasswordAuth   PasswordAuthClient
 	QRPollInterval time.Duration
 	Boxer          Boxer
 	OnLinked       LinkedNotifier
@@ -80,6 +85,12 @@ type authOutcome struct {
 	Error   string `json:"error,omitempty"`
 }
 
+type mfaPending struct {
+	discordUserID string
+	challenge     *riot.MFAChallenge
+	expiresAt     time.Time
+}
+
 // Server serves login redirect + Riot callback catcher.
 type Server struct {
 	authBaseURL    string
@@ -87,6 +98,7 @@ type Server struct {
 	store          Store
 	riot           RiotClient
 	qrAuth         QRAuthClient
+	passwordAuth   PasswordAuthClient
 	qrPollInterval time.Duration
 	boxer          Boxer
 	onLinked       LinkedNotifier
@@ -95,6 +107,7 @@ type Server struct {
 	mu         sync.Mutex
 	outcomes   map[string]authOutcome
 	qrSessions map[string]*riot.QRSession
+	mfaPending map[string]mfaPending
 }
 
 // New builds an auth web Server.
@@ -113,12 +126,14 @@ func New(d Deps) *Server {
 		store:          d.Store,
 		riot:           d.Riot,
 		qrAuth:         d.QRAuth,
+		passwordAuth:   d.PasswordAuth,
 		qrPollInterval: poll,
 		boxer:          d.Boxer,
 		onLinked:       d.OnLinked,
 		mux:            http.NewServeMux(),
 		outcomes:       make(map[string]authOutcome),
 		qrSessions:     make(map[string]*riot.QRSession),
+		mfaPending:     make(map[string]mfaPending),
 	}
 	s.mux.HandleFunc("GET /login", s.handleLogin)
 	s.mux.HandleFunc("GET /redirect", s.handleRedirectCatcher)
@@ -237,6 +252,111 @@ func (s *Server) completeQRLogin(ctx context.Context, state string, tokens riot.
 	return s.linkAccount(ctx, discordUserID, tokens.AccessToken, tokens.IDToken, session, "")
 }
 
+// LoginWithPassword authenticates via Discord modal credentials and links the account.
+// When MFA is required, mfaState is non-empty for CompletePasswordMFA.
+func (s *Server) LoginWithPassword(ctx context.Context, discordUserID, username, password string) (displayName, mfaState, mfaHint string, err error) {
+	if s.passwordAuth == nil {
+		return "", "", "", fmt.Errorf("password auth not configured")
+	}
+	tokens, challenge, err := s.passwordAuth.LoginWithPassword(ctx, username, password)
+	if err != nil {
+		return "", "", "", err
+	}
+	if challenge != nil {
+		state, err := newState()
+		if err != nil {
+			return "", "", "", err
+		}
+		s.mu.Lock()
+		s.mfaPending[state] = mfaPending{
+			discordUserID: discordUserID,
+			challenge:     challenge,
+			expiresAt:     time.Now().Add(s.pendingTTL),
+		}
+		s.mu.Unlock()
+		return "", state, formatMFAHint(challenge), nil
+	}
+	display, err := s.completePasswordTokens(ctx, discordUserID, tokens)
+	return display, "", "", err
+}
+
+func formatMFAHint(challenge *riot.MFAChallenge) string {
+	if challenge == nil {
+		return ""
+	}
+	if email := strings.TrimSpace(challenge.Email); email != "" {
+		return email
+	}
+	method := strings.ToLower(strings.TrimSpace(challenge.Method))
+	if method == "" {
+		for _, m := range challenge.Methods {
+			if method = strings.ToLower(strings.TrimSpace(m)); method != "" {
+				break
+			}
+		}
+	}
+	switch method {
+	case "email":
+		return "email"
+	case "authenticator", "otp", "otpauth", "riot_mobile", "mobile":
+		return "authenticator"
+	default:
+		return method
+	}
+}
+
+// CompletePasswordMFA finishes a password login after the Discord MFA modal.
+func (s *Server) CompletePasswordMFA(ctx context.Context, mfaState, code string) (displayName string, err error) {
+	if s.passwordAuth == nil {
+		return "", fmt.Errorf("password auth not configured")
+	}
+	s.mu.Lock()
+	pending, ok := s.mfaPending[mfaState]
+	s.mu.Unlock()
+	if !ok || time.Now().After(pending.expiresAt) {
+		return "", fmt.Errorf("unknown or expired mfa session")
+	}
+	tokens, err := s.passwordAuth.SubmitMFA(ctx, pending.challenge, code)
+	if err != nil {
+		// Keep pending so the user can retry email / Riot Mobile codes.
+		return "", err
+	}
+	s.mu.Lock()
+	delete(s.mfaPending, mfaState)
+	s.mu.Unlock()
+	return s.completePasswordTokens(ctx, pending.discordUserID, tokens)
+}
+
+func (s *Server) completePasswordTokens(ctx context.Context, discordUserID string, tokens riot.PasswordTokens) (string, error) {
+	session := tokens.SessionCookie
+	if session == "" {
+		session = "access_token=" + tokens.AccessToken
+	}
+	return s.linkAccount(ctx, discordUserID, tokens.AccessToken, tokens.IDToken, session, "")
+}
+
+// WaitBrowserLogin blocks until the browser OAuth callback completes for state.
+func (s *Server) WaitBrowserLogin(ctx context.Context, state string) (displayName string, err error) {
+	ticker := time.NewTicker(s.qrPollInterval)
+	defer ticker.Stop()
+	for {
+		if o, ok := s.getOutcome(state); ok && o.Done {
+			if !o.OK {
+				if o.Error != "" {
+					return "", fmt.Errorf("%s", o.Error)
+				}
+				return "", errors.New("browser login failed")
+			}
+			return o.Display, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 func (s *Server) setOutcome(state string, o authOutcome) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -261,8 +381,8 @@ func riotAuthorizeURL(state string) string {
 	return "https://auth.riotgames.com/authorize?" + q.Encode()
 }
 
-// CompleteFromRedirectURL links a Riot account from an OAuth redirect URL.
-// This is the browser fallback; /auth uses the QR flow.
+// CompleteFromRedirectURL links a Riot account from an OAuth redirect URL
+// captured when Riot sends the browser to http://localhost/redirect (this bot).
 func (s *Server) CompleteFromRedirectURL(ctx context.Context, state, redirectURL, regionFallback string) (displayName string, err error) {
 	discordUserID, ok, err := s.store.TakeAuthPending(state)
 	if err != nil {
@@ -369,7 +489,6 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.authBaseURL,
 		state,
 		riotURL,
-		s.authBaseURL+"/install-catcher.sh",
 	)
 }
 
@@ -483,7 +602,7 @@ const redirectCatcherHTML = `<!DOCTYPE html>
 </html>
 `
 
-// loginPageHTML args: display authBase (%s), then authBase, state, riotURL, installURL (%q ×4).
+// loginPageHTML args: display authBase (%s), then authBase, state, riotURL (%q ×3).
 const loginPageHTML = `<!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -493,9 +612,6 @@ const loginPageHTML = `<!DOCTYPE html>
   body { font-family: system-ui, sans-serif; max-width: 36rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
   .btn { display: inline-block; background: #fd4553; color: #fff; padding: .7rem 1.2rem; border-radius: 8px; text-decoration: none; font-weight: 600; border: 0; cursor: pointer; font-size: 1rem; }
   .muted { color: #666; font-size: .9rem; }
-  .box { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-top: 1rem; background: #fafafa; display: none; }
-  code { background: #eee; padding: 0 .25rem; word-break: break-all; }
-  pre { background: #111; color: #eee; padding: .75rem; border-radius: 8px; overflow-x: auto; font-size: 12px; }
   #status { margin-top: 1rem; font-weight: 600; }
 </style>
 </head>
@@ -503,35 +619,23 @@ const loginPageHTML = `<!DOCTYPE html>
 <h1>Riot 계정 연동</h1>
 <p id="status">준비 중…</p>
 <p><button class="btn" type="button" id="loginBtn" style="display:none">Riot으로 로그인</button></p>
-
-<div class="box" id="needCatcher">
-  <p>이 PC에서 자동 연동을 위해 <strong>한 번</strong> 아래 명령을 실행하세요 (포트 80).</p>
-  <pre id="cmd"></pre>
-  <p class="muted">실행 후 이 페이지가 도우미를 감지하면 Riot 로그인이 자동으로 열립니다. URL 붙여넣기는 필요 없습니다.</p>
-</div>
-
+<p class="muted">브라우저에서 로그인·2차 인증을 마치면 자동으로 Discord에 연동됩니다.</p>
 <p class="muted">서버: %s</p>
 <script>
 (function () {
   var authBase = %q;
   var state = %q;
   var riotURL = %q;
-  var installURL = %q;
   var status = document.getElementById("status");
   var btn = document.getElementById("loginBtn");
-  var need = document.getElementById("needCatcher");
-  var cmd = document.getElementById("cmd");
-  cmd.textContent = "curl -fsSL '" + installURL + "' | sudo bash -s -- '" + authBase + "'";
-
   var popup = null;
   var started = false;
 
   function openRiot() {
     if (started) return;
     started = true;
-    status.textContent = "Riot 로그인 창에서 로그인하세요…";
+    status.textContent = "Riot 로그인 창에서 로그인하세요. 2차 인증이 있으면 그 창에서 완료하세요…";
     btn.style.display = "none";
-    need.style.display = "none";
     popup = window.open(riotURL, "riot_auth", "width=520,height=720");
     if (!popup) {
       status.textContent = "팝업이 차단되었습니다. 아래 버튼으로 다시 시도하세요.";
@@ -542,7 +646,7 @@ const loginPageHTML = `<!DOCTYPE html>
 
   btn.addEventListener("click", openRiot);
 
-  function pingCatcher() {
+  function pingLocalhost() {
     return fetch("http://127.0.0.1/catcher-ping", { mode: "cors", cache: "no-store" })
       .then(function (r) { return r.ok; })
       .catch(function () { return false; });
@@ -568,29 +672,17 @@ const loginPageHTML = `<!DOCTYPE html>
       .catch(function () { setTimeout(pollWait, 2000); });
   }
 
-  function ensureCatcherThenLogin() {
-    pingCatcher().then(function (ok) {
-      if (ok) {
-        status.textContent = "자동 연동 준비됨. Riot 로그인을 엽니다…";
-        openRiot();
-        return;
-      }
-      status.textContent = "이 PC에 자동 연동 도우미가 필요합니다.";
-      need.style.display = "block";
-      btn.style.display = "inline-block";
-      // Keep probing; once the user starts the catcher, open Riot automatically.
-      var iv = setInterval(function () {
-        pingCatcher().then(function (ready) {
-          if (!ready) return;
-          clearInterval(iv);
-          openRiot();
-        });
-      }, 1500);
-    });
-  }
+  pingLocalhost().then(function (ok) {
+    if (ok) {
+      status.textContent = "봇이 localhost를 소유 중입니다. Riot 로그인을 엽니다…";
+      openRiot();
+      return;
+    }
+    status.textContent = "이 PC에서 봇이 localhost:80을 열지 못했습니다. 봇을 이 컴퓨터에서 실행한 뒤 다시 시도하거나 Discord에서 Riot Mobile QR을 사용하세요.";
+    btn.style.display = "inline-block";
+  });
 
   pollWait();
-  ensureCatcherThenLogin();
 })();
 </script>
 </body>

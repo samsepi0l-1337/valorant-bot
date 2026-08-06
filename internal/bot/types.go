@@ -8,12 +8,12 @@ import (
 	"github.com/dosfsociety/valorant-bot/internal/store"
 )
 
-// AuthStarter drives the Riot Mobile QR login (authweb.Server in production).
+// AuthStarter drives Riot account linking (authweb.Server in production).
 type AuthStarter interface {
-	// BeginQRAuth returns the URL to render as a QR code plus a state handle.
 	BeginQRAuth(ctx context.Context, discordUserID string) (loginURL string, state string, err error)
-	// WaitQRLogin blocks until the QR login is approved and the account linked.
 	WaitQRLogin(ctx context.Context, state string) (displayName string, err error)
+	LoginWithPassword(ctx context.Context, discordUserID, username, password string) (displayName, mfaState, mfaHint string, err error)
+	CompletePasswordMFA(ctx context.Context, mfaState, code string) (displayName string, err error)
 }
 
 // AccountStore lists and deletes linked Riot accounts for a Discord user.
@@ -33,6 +33,8 @@ type OfferView struct {
 	IconURL     string
 	CostVP      int
 	SkinUUID    string
+	// Color is the Discord embed left-border color from skin rarity.
+	Color int
 }
 
 // AccountShop is the shop state for one linked account.
@@ -80,6 +82,8 @@ type Handlers struct {
 	Wishlist WishlistStore
 	Guilds   GuildStore
 	Lang     LanguageStore
+
+	shopCache *shopPageCache
 }
 
 // Response is a Discord reply shape tests can assert without the gateway.

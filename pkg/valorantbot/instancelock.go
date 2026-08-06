@@ -20,6 +20,9 @@ func acquireInstanceLock(databasePath string) (*os.File, error) {
 	path := filepath.Join(dir, "bot.lock")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("open lock: %w (is %s owned by root from a previous sudo run? try: sudo rm -f %s)", err, path, path)
+		}
 		return nil, fmt.Errorf("open lock: %w", err)
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {

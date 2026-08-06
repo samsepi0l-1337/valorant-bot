@@ -21,8 +21,8 @@ func Commands() []*discordgo.ApplicationCommand {
 	return []*discordgo.ApplicationCommand{
 		{
 			Name:                     "auth",
-			Description:              "Link your Riot account by scanning a QR code in Riot Mobile",
-			DescriptionLocalizations: loc(map[discordgo.Locale]string{discordgo.Korean: "Riot Mobile QR 스캔으로 계정 연동"}),
+			Description:              "Link a Riot account (Mobile QR or ID/password modal)",
+			DescriptionLocalizations: loc(map[discordgo.Locale]string{discordgo.Korean: "Riot 계정 연동 (Mobile QR 또는 아이디/비밀번호)"}),
 		},
 		{
 			Name:                     "accounts",
@@ -145,6 +145,8 @@ func (h *Handlers) OnInteraction(s *discordgo.Session, i *discordgo.InteractionC
 		h.onAppCommand(s, i)
 	case discordgo.InteractionMessageComponent:
 		h.onComponent(s, i)
+	case discordgo.InteractionModalSubmit:
+		h.onModal(s, i)
 	}
 }
 
@@ -154,11 +156,47 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 	lang := h.userLang(userID)
 	log.Printf("interaction: component %s user=%s", data.CustomID, userID)
 
+	if data.CustomID == customIDAuthPassword {
+		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseModal,
+			Data: PasswordLoginModal(lang),
+		}); err != nil {
+			log.Printf("interaction: password modal: %v", err)
+		}
+		return
+	}
+	if strings.HasPrefix(data.CustomID, customIDAuthMFAOpenPref) {
+		mfaState := strings.TrimPrefix(data.CustomID, customIDAuthMFAOpenPref)
+		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseModal,
+			Data: MFALoginModal(mfaState, "", lang),
+		}); err != nil {
+			log.Printf("interaction: mfa modal: %v", err)
+		}
+		return
+	}
+
 	var (
-		resp Response
-		err  error
+		resp           Response
+		err            error
+		keepComponents bool
+		qrState        string
 	)
 	switch {
+	case data.CustomID == customIDAuthQR:
+		resp, qrState, err = h.HandleAuthQR(context.Background(), userID, lang)
+		keepComponents = true
+	case strings.HasPrefix(data.CustomID, customIDShopPagePrefix):
+		owner, page, noop, ok := parseShopPageCustomID(data.CustomID)
+		if !ok {
+			err = fmt.Errorf("invalid shop navigation")
+			break
+		}
+		if noop {
+			return
+		}
+		resp, err = h.HandleShopNav(owner, page, userID, lang)
+		keepComponents = true
 	case strings.HasPrefix(data.CustomID, customIDWishlistAddPrefix):
 		owner := strings.TrimPrefix(data.CustomID, customIDWishlistAddPrefix)
 		if owner != userID {
@@ -202,11 +240,123 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 		_ = updateComponentMessage(s, i, Response{Content: i18n.T(lang, "error.prefix") + err.Error()})
 		return
 	}
-	// Clear the select menu after a choice.
-	resp.Components = []discordgo.MessageComponent{}
+	// Ephemeral replies (e.g. shop nav denied) go only to the clicker and
+	// must not replace the public component message.
+	if resp.Ephemeral {
+		if rerr := respondEphemeralEmbed(s, i, resp); rerr != nil {
+			log.Printf("interaction: ephemeral component reply failed: %v", rerr)
+		}
+		return
+	}
+	if !keepComponents {
+		resp.Components = []discordgo.MessageComponent{}
+	}
+	if data.CustomID == customIDAuthQR {
+		if rerr := updateComponentMessageWithFiles(s, i, resp); rerr != nil {
+			log.Printf("interaction: qr component update failed: %v", rerr)
+		}
+		if qrState != "" {
+			go h.watchQRLogin(s, i, qrState, lang)
+		}
+		return
+	}
 	if rerr := updateComponentMessage(s, i, resp); rerr != nil {
 		log.Printf("interaction: component update failed: %v", rerr)
 	}
+}
+
+func (h *Handlers) onModal(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	data := i.ModalSubmitData()
+	userID := interactionUserID(i)
+	lang := h.userLang(userID)
+	log.Printf("interaction: modal %s user=%s", data.CustomID, userID)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+
+	switch {
+	case data.CustomID == customIDAuthPWModal:
+		resp, err := h.HandlePasswordLogin(ctx, userID, modalValue(data, "username"), modalValue(data, "password"), modalValue(data, "mfa_code"), lang)
+		if err != nil {
+			_ = respondEphemeral(s, i, i18n.T(lang, "error.prefix")+err.Error())
+			return
+		}
+		_ = respondEphemeralWithComponents(s, i, resp)
+	case strings.HasPrefix(data.CustomID, customIDAuthMFAPref):
+		mfaState := strings.TrimPrefix(data.CustomID, customIDAuthMFAPref)
+		resp, err := h.HandlePasswordMFA(ctx, mfaState, modalValue(data, "code"), lang)
+		if err != nil {
+			_ = respondEphemeral(s, i, i18n.T(lang, "error.prefix")+err.Error())
+			return
+		}
+		_ = respondEphemeralWithComponents(s, i, resp)
+	default:
+		log.Printf("interaction: ignoring modal %q", data.CustomID)
+	}
+}
+
+func modalValue(data discordgo.ModalSubmitInteractionData, customID string) string {
+	for _, row := range data.Components {
+		actions, ok := row.(*discordgo.ActionsRow)
+		if !ok {
+			if ar, ok2 := row.(discordgo.ActionsRow); ok2 {
+				for _, c := range ar.Components {
+					if ti, ok := c.(*discordgo.TextInput); ok && ti.CustomID == customID {
+						return ti.Value
+					}
+					if ti, ok := c.(discordgo.TextInput); ok && ti.CustomID == customID {
+						return ti.Value
+					}
+				}
+			}
+			continue
+		}
+		for _, c := range actions.Components {
+			if ti, ok := c.(*discordgo.TextInput); ok && ti.CustomID == customID {
+				return ti.Value
+			}
+			if ti, ok := c.(discordgo.TextInput); ok && ti.CustomID == customID {
+				return ti.Value
+			}
+		}
+	}
+	return ""
+}
+
+func respondEphemeral(s *discordgo.Session, i *discordgo.InteractionCreate, content string) error {
+	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: content,
+			Flags:   discordgo.MessageFlagsEphemeral,
+		},
+	})
+}
+
+func respondEphemeralWithComponents(s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
+	components := resp.Components
+	if components == nil {
+		components = []discordgo.MessageComponent{}
+	}
+	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content:    resp.Content,
+			Components: components,
+			Flags:      discordgo.MessageFlagsEphemeral,
+		},
+	})
+}
+
+func respondEphemeralEmbed(s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
+	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Content: resp.Content,
+			Embeds:  resp.Embeds,
+			Flags:   discordgo.MessageFlagsEphemeral,
+		},
+	})
 }
 
 func updateComponentMessage(s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
@@ -225,6 +375,22 @@ func updateComponentMessage(s *discordgo.Session, i *discordgo.InteractionCreate
 			Content:    content,
 			Embeds:     derefEmbeds(embeds),
 			Components: components,
+		},
+	})
+}
+
+func updateComponentMessageWithFiles(s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
+	components := resp.Components
+	if components == nil {
+		components = []discordgo.MessageComponent{}
+	}
+	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseUpdateMessage,
+		Data: &discordgo.InteractionResponseData{
+			Content:    resp.Content,
+			Embeds:     resp.Embeds,
+			Components: components,
+			Files:      resp.Files,
 		},
 	})
 }
@@ -256,17 +422,18 @@ func (h *Handlers) onAppCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	)
 	ctx := context.Background()
 
-	var qrState string
 	switch data.Name {
 	case "auth":
-		resp, qrState, err = h.HandleAuth(ctx, userID, lang)
+		resp, err = h.HandleAuth(ctx, userID, lang)
 	case "accounts":
 		resp, err = h.HandleAccounts(userID, lang)
 	case "unlink":
 		identifier := optionString(data.Options, "puuid")
 		resp, err = h.HandleUnlink(userID, identifier, lang)
 	case "shop":
-		resp, err = h.HandleShop(ctx, userID, lang)
+		shopCtx, cancel := context.WithTimeout(ctx, shopTimeout)
+		defer cancel()
+		resp, err = h.HandleShop(shopCtx, userID, lang)
 	case "wishlist":
 		sub := subCommandName(data.Options)
 		switch sub {
@@ -309,14 +476,14 @@ func (h *Handlers) onAppCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	if rerr := editInteraction(s, i, resp); rerr != nil {
 		log.Printf("interaction: edit /%s failed: %v", data.Name, rerr)
 	}
-	if qrState != "" {
-		go h.watchQRLogin(s, i, qrState, lang)
-	}
 }
 
 // qrLoginTimeout bounds how long the bot waits for a Riot Mobile approval.
-// Riot expires the QR session on its own side at a similar horizon.
 const qrLoginTimeout = 3 * time.Minute
+
+// shopTimeout bounds /shop's multi-account fetch so the deferred interaction
+// edit always fires instead of hanging forever on a stuck upstream request.
+const shopTimeout = 45 * time.Second
 
 // watchQRLogin polls until the user approves the QR login, then rewrites the
 // ephemeral /auth message with the outcome.

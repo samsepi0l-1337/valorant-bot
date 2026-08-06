@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"image"
 	_ "image/png"
 	"io"
@@ -17,11 +18,17 @@ import (
 )
 
 type fakeAuth struct {
-	url     string
-	state   string
-	err     error
-	display string
-	waitErr error
+	url        string
+	state      string
+	err        error
+	display    string
+	waitErr    error
+	pwDisplay  string
+	pwMFA      string
+	pwHint     string
+	pwErr      error
+	mfaDisplay string
+	mfaErr     error
 }
 
 func (f *fakeAuth) BeginQRAuth(ctx context.Context, discordUserID string) (string, string, error) {
@@ -36,6 +43,20 @@ func (f *fakeAuth) WaitQRLogin(ctx context.Context, state string) (string, error
 		return "", f.waitErr
 	}
 	return f.display, nil
+}
+
+func (f *fakeAuth) LoginWithPassword(ctx context.Context, discordUserID, username, password string) (string, string, string, error) {
+	if f.pwErr != nil {
+		return "", "", "", f.pwErr
+	}
+	return f.pwDisplay, f.pwMFA, f.pwHint, nil
+}
+
+func (f *fakeAuth) CompletePasswordMFA(ctx context.Context, mfaState, code string) (string, error) {
+	if f.mfaErr != nil {
+		return "", f.mfaErr
+	}
+	return f.mfaDisplay, nil
 }
 
 type memAccounts struct {
@@ -92,12 +113,27 @@ func (m *memLang) SetUserLanguage(discordUserID, language string) error {
 	return nil
 }
 
-func TestHandleAuth_QRCodeAttachment(t *testing.T) {
+func TestHandleAuth_Chooser(t *testing.T) {
+	h := &bot.Handlers{Auth: &fakeAuth{}}
+	resp, err := h.HandleAuth(context.Background(), "u1", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Content, "연동 방식") {
+		t.Fatalf("content %q", resp.Content)
+	}
+	row := resp.Components[0].(discordgo.ActionsRow)
+	if len(row.Components) != 2 {
+		t.Fatalf("buttons %#v", row.Components)
+	}
+}
+
+func TestHandleAuthQR_QRCodeAttachment(t *testing.T) {
 	const scanURL = "https://qrlogin.riotgames.com/riotmobile?suuid=s1"
 	h := &bot.Handlers{
 		Auth: &fakeAuth{url: scanURL, state: "st"},
 	}
-	resp, state, err := h.HandleAuth(context.Background(), "discord-1", i18n.KO)
+	resp, state, err := h.HandleAuthQR(context.Background(), "discord-1", i18n.KO)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +164,6 @@ func TestHandleAuth_QRCodeAttachment(t *testing.T) {
 		t.Fatalf("embed image URL = %q, want %q", resp.Embeds[0].Image.URL, want)
 	}
 
-	// Mobile users tap the link instead of scanning.
 	row, ok := resp.Components[0].(discordgo.ActionsRow)
 	if !ok {
 		t.Fatalf("component type %T", resp.Components[0])
@@ -139,9 +174,9 @@ func TestHandleAuth_QRCodeAttachment(t *testing.T) {
 	}
 }
 
-func TestHandleAuth_NoLocalhostCatcherDependency(t *testing.T) {
+func TestHandleAuthQR_NoLocalhostCatcherDependency(t *testing.T) {
 	h := &bot.Handlers{Auth: &fakeAuth{url: "https://qrlogin.riotgames.com/riotmobile?suuid=s1", state: "st"}}
-	resp, _, err := h.HandleAuth(context.Background(), "u", i18n.KO)
+	resp, _, err := h.HandleAuthQR(context.Background(), "u", i18n.KO)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,13 +187,65 @@ func TestHandleAuth_NoLocalhostCatcherDependency(t *testing.T) {
 	}
 }
 
-func TestHandleAuth_Error(t *testing.T) {
+func TestHandleAuthQR_Error(t *testing.T) {
 	h := &bot.Handlers{
 		Auth: &fakeAuth{err: errors.New("boom")},
 	}
-	_, _, err := h.HandleAuth(context.Background(), "u", i18n.KO)
+	_, _, err := h.HandleAuthQR(context.Background(), "u", i18n.KO)
 	if err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestHandlePasswordLogin_Success(t *testing.T) {
+	h := &bot.Handlers{Auth: &fakeAuth{pwDisplay: "Ace#KR1"}}
+	resp, err := h.HandlePasswordLogin(context.Background(), "u1", "user", "pass", "", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Content, "Ace#KR1") {
+		t.Fatalf("content %q", resp.Content)
+	}
+}
+
+func TestHandlePasswordLogin_MFAButton(t *testing.T) {
+	h := &bot.Handlers{Auth: &fakeAuth{pwMFA: "mfa-1", pwHint: "a***@ex.com"}}
+	resp, err := h.HandlePasswordLogin(context.Background(), "u1", "user", "pass", "", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Content, "a***@ex.com") {
+		t.Fatalf("content %q", resp.Content)
+	}
+	if !strings.Contains(resp.Content, "Riot Mobile") {
+		t.Fatalf("expected Riot Mobile hint in %q", resp.Content)
+	}
+	row := resp.Components[0].(discordgo.ActionsRow)
+	btn := row.Components[0].(discordgo.Button)
+	if btn.CustomID != "auth:mfaopen:mfa-1" {
+		t.Fatalf("customID %q", btn.CustomID)
+	}
+}
+
+func TestHandlePasswordLogin_MFACodeInline(t *testing.T) {
+	h := &bot.Handlers{Auth: &fakeAuth{pwMFA: "mfa-1", mfaDisplay: "Ace#KR1"}}
+	resp, err := h.HandlePasswordLogin(context.Background(), "u1", "user", "pass", "123456", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Content, "Ace#KR1") {
+		t.Fatalf("content %q", resp.Content)
+	}
+}
+
+func TestHandlePasswordLogin_MFAAuthenticatorPrompt(t *testing.T) {
+	h := &bot.Handlers{Auth: &fakeAuth{pwMFA: "mfa-1", pwHint: "authenticator"}}
+	resp, err := h.HandlePasswordLogin(context.Background(), "u1", "user", "pass", "", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Content, "Riot Mobile") {
+		t.Fatalf("content %q", resp.Content)
 	}
 }
 
@@ -286,6 +373,9 @@ func TestHandleShop_Embeds(t *testing.T) {
 				TagLine:  "KR1",
 				Offers: []bot.OfferView{
 					{DisplayName: "Prime Vandal", CostVP: 1775, IconURL: "https://icon"},
+					{DisplayName: "Reaver Sheriff", CostVP: 1775, IconURL: "https://icon2"},
+					{DisplayName: "Ion Phantom", CostVP: 1775, IconURL: "https://icon3"},
+					{DisplayName: "Oni Operator", CostVP: 2475, IconURL: "https://icon4"},
 				},
 			},
 		}},
@@ -294,8 +384,17 @@ func TestHandleShop_Embeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Embeds) != 1 {
-		t.Fatalf("embeds %d", len(resp.Embeds))
+	if !strings.Contains(resp.Content, "Player#KR1") {
+		t.Fatalf("page content should include account: %q", resp.Content)
+	}
+	if len(resp.Components) != 0 {
+		t.Fatalf("single account should have no nav buttons, got %d", len(resp.Components))
+	}
+	if len(resp.Embeds) != 4 {
+		t.Fatalf("expected 4 skin embeds on one account page, got %d", len(resp.Embeds))
+	}
+	if resp.Embeds[0].Author != nil {
+		t.Fatalf("account should be in message content, not embed author: %+v", resp.Embeds[0].Author)
 	}
 	if !strings.Contains(resp.Embeds[0].Title, "Prime Vandal") {
 		t.Fatalf("title %q", resp.Embeds[0].Title)
@@ -303,14 +402,148 @@ func TestHandleShop_Embeds(t *testing.T) {
 	if !strings.Contains(resp.Embeds[0].Title, "1775") {
 		t.Fatalf("title should include VP: %q", resp.Embeds[0].Title)
 	}
-	if resp.Embeds[0].Author == nil || resp.Embeds[0].Author.Name != "Player#KR1" {
-		t.Fatalf("author %+v", resp.Embeds[0].Author)
-	}
 	if resp.Embeds[0].Thumbnail == nil || resp.Embeds[0].Thumbnail.URL != "https://icon" {
 		t.Fatalf("thumbnail %+v", resp.Embeds[0].Thumbnail)
 	}
-	if resp.Embeds[0].Image != nil {
-		t.Fatal("expected no full-size Image (use Thumbnail for compact shop)")
+	if resp.Embeds[3].Thumbnail == nil || resp.Embeds[3].Thumbnail.URL != "https://icon4" {
+		t.Fatalf("4th skin thumbnail %+v", resp.Embeds[3].Thumbnail)
+	}
+	for i, e := range resp.Embeds {
+		if e.Image != nil {
+			t.Fatalf("embed %d: expected Thumbnail not full-size Image", i)
+		}
+	}
+}
+
+func TestBuildAccountPageEmbeds_RarityColors(t *testing.T) {
+	embeds := bot.BuildAccountPageEmbeds(bot.AccountShop{
+		GameName: "P",
+		TagLine:  "1",
+		Offers: []bot.OfferView{
+			{DisplayName: "Select", CostVP: 875, Color: 0x5a9fe2},
+			{DisplayName: "Exclusive", CostVP: 2175, Color: 0xf5955b},
+			{DisplayName: "Unknown", CostVP: 1275},
+		},
+	}, i18n.KO)
+	if len(embeds) != 3 {
+		t.Fatalf("got %d embeds", len(embeds))
+	}
+	if embeds[0].Color != 0x5a9fe2 {
+		t.Fatalf("select color %#x", embeds[0].Color)
+	}
+	if embeds[1].Color != 0xf5955b {
+		t.Fatalf("exclusive color %#x", embeds[1].Color)
+	}
+	if embeds[2].Color != 0xFD4553 {
+		t.Fatalf("fallback color %#x", embeds[2].Color)
+	}
+}
+
+func TestHandleShop_MultiAccountHasNavButtons(t *testing.T) {
+	h := &bot.Handlers{
+		Accounts: &memAccounts{byUser: map[string][]store.Account{
+			"u1": {{PUUID: "p1"}, {PUUID: "p2"}},
+		}},
+		Shops: &fakeShops{shops: []bot.AccountShop{
+			{GameName: "A", TagLine: "1", Offers: []bot.OfferView{{DisplayName: "SkinA", CostVP: 1}}},
+			{GameName: "B", TagLine: "2", Offers: []bot.OfferView{{DisplayName: "SkinB", CostVP: 2}}},
+		}},
+	}
+	resp, err := h.HandleShop(context.Background(), "u1", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Content, "A#1") || !strings.Contains(resp.Content, "1 / 2") {
+		t.Fatalf("content %q", resp.Content)
+	}
+	if len(resp.Embeds) != 1 {
+		t.Fatalf("should show one account page; with 1 skin got embeds=%d", len(resp.Embeds))
+	}
+	if resp.Embeds[0].Author != nil {
+		t.Fatalf("account should be in message content, not embed author: %+v", resp.Embeds[0].Author)
+	}
+	if len(resp.Components) != 1 {
+		t.Fatalf("expected nav row, got %d", len(resp.Components))
+	}
+	row, ok := resp.Components[0].(discordgo.ActionsRow)
+	if !ok || len(row.Components) != 3 {
+		t.Fatalf("nav row %#v", resp.Components[0])
+	}
+	prev, _ := row.Components[0].(discordgo.Button)
+	next, _ := row.Components[2].(discordgo.Button)
+	if !prev.Disabled {
+		t.Fatal("prev should be disabled on first page")
+	}
+	if next.Disabled {
+		t.Fatal("next should be enabled on first page")
+	}
+	if !strings.Contains(next.CustomID, "shop:page:u1:1") {
+		t.Fatalf("next customID %q", next.CustomID)
+	}
+
+	page2, err := h.HandleShopNav("u1", 1, "u1", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(page2.Content, "B#2") || !strings.Contains(page2.Content, "2 / 2") {
+		t.Fatalf("page2 content %q", page2.Content)
+	}
+	if page2.Embeds[0].Author != nil {
+		t.Fatalf("account should be in message content, not embed author: %+v", page2.Embeds[0].Author)
+	}
+	row2 := page2.Components[0].(discordgo.ActionsRow)
+	prev2 := row2.Components[0].(discordgo.Button)
+	next2 := row2.Components[2].(discordgo.Button)
+	if prev2.Disabled {
+		t.Fatal("prev should be enabled on last page")
+	}
+	if !next2.Disabled {
+		t.Fatal("next should be disabled on last page")
+	}
+
+	if denied, err := h.HandleShopNav("u1", 1, "other", i18n.KO); err != nil {
+		t.Fatal(err)
+	} else {
+		if !denied.Ephemeral {
+			t.Fatal("denial must be ephemeral (only the clicker sees it)")
+		}
+		if len(denied.Embeds) != 1 || !strings.Contains(denied.Embeds[0].Description, "본인만") {
+			t.Fatalf("expected denial embed, got %+v", denied)
+		}
+	}
+}
+
+// TestBuildShopEmbeds_OneEmbedPerAccount guards against Discord's 10-embed-
+// per-message limit: 3 accounts x 4 skins used to produce 12 embeds (one per
+// skin) and silently fail the deferred interaction edit.
+func TestBuildShopEmbeds_OneEmbedPerAccount(t *testing.T) {
+	shops := make([]bot.AccountShop, 0, 3)
+	for i := 0; i < 3; i++ {
+		offers := make([]bot.OfferView, 0, 4)
+		for j := 0; j < 4; j++ {
+			offers = append(offers, bot.OfferView{
+				DisplayName: fmt.Sprintf("Skin%d-%d", i, j),
+				CostVP:      1000 + j,
+			})
+		}
+		shops = append(shops, bot.AccountShop{
+			GameName: fmt.Sprintf("Player%d", i),
+			TagLine:  "KR1",
+			Offers:   offers,
+		})
+	}
+
+	embeds := bot.BuildShopEmbeds(shops, i18n.KO)
+	if len(embeds) != 3 {
+		t.Fatalf("expected exactly 3 embeds (1 per account), got %d", len(embeds))
+	}
+	if len(embeds) > 10 {
+		t.Fatalf("embeds exceed Discord's 10-embed-per-message limit: %d", len(embeds))
+	}
+	for i, e := range embeds {
+		if len(e.Fields) != 4 {
+			t.Fatalf("embed %d: expected 4 skin fields, got %d", i, len(e.Fields))
+		}
 	}
 }
 

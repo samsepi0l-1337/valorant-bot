@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -19,11 +20,16 @@ const (
 	LangEN = "en-US"
 )
 
+// DefaultEmbedColor is used when rarity is unknown (Valorant red accent).
+const DefaultEmbedColor = 0xFD4553
+
 // Skin is a displayable weapon skin (resolved from skin, level, or chroma UUID).
 type Skin struct {
 	UUID        string // parent skin UUID
 	DisplayName string
 	DisplayIcon string
+	// Color is the Discord embed accent from the content tier highlight color.
+	Color int
 }
 
 type langIndex struct {
@@ -37,6 +43,7 @@ type Cache struct {
 
 	mu    sync.RWMutex
 	langs map[string]*langIndex // API language → index
+	tiers map[string]int        // contentTier UUID → 0xRRGGBB
 }
 
 func NewCache(client *http.Client, baseURL string) *Cache {
@@ -50,6 +57,7 @@ func NewCache(client *http.Client, baseURL string) *Cache {
 		client:  client,
 		baseURL: strings.TrimSuffix(baseURL, "/"),
 		langs:   make(map[string]*langIndex),
+		tiers:   make(map[string]int),
 	}
 }
 
@@ -85,6 +93,10 @@ func (c *Cache) EnsureLoaded(ctx context.Context, language string) error {
 		return nil
 	}
 
+	if err := c.ensureTiersLocked(ctx); err != nil {
+		return err
+	}
+
 	u, err := url.Parse(c.baseURL + "/v1/weapons/skins")
 	if err != nil {
 		return err
@@ -111,10 +123,11 @@ func (c *Cache) EnsureLoaded(ctx context.Context, language string) error {
 
 	var payload struct {
 		Data []struct {
-			UUID        string `json:"uuid"`
-			DisplayName string `json:"displayName"`
-			DisplayIcon string `json:"displayIcon"`
-			Levels      []struct {
+			UUID            string `json:"uuid"`
+			DisplayName     string `json:"displayName"`
+			DisplayIcon     string `json:"displayIcon"`
+			ContentTierUUID string `json:"contentTierUuid"`
+			Levels          []struct {
 				UUID        string `json:"uuid"`
 				DisplayName string `json:"displayName"`
 				DisplayIcon string `json:"displayIcon"`
@@ -144,11 +157,13 @@ func (c *Cache) EnsureLoaded(ctx context.Context, language string) error {
 		if parentIcon == "" && len(s.Chromas) > 0 {
 			parentIcon = firstNonEmpty(s.Chromas[0].FullRender, s.Chromas[0].DisplayIcon)
 		}
+		color := c.tierColor(s.ContentTierUUID)
 
 		parent := Skin{
 			UUID:        s.UUID,
 			DisplayName: s.DisplayName,
 			DisplayIcon: parentIcon,
+			Color:       color,
 		}
 		idx.byUUID[s.UUID] = parent
 		idx.all = append(idx.all, parent)
@@ -159,6 +174,7 @@ func (c *Cache) EnsureLoaded(ctx context.Context, language string) error {
 				UUID:        s.UUID,
 				DisplayName: s.DisplayName,
 				DisplayIcon: icon,
+				Color:       color,
 			}
 		}
 		for _, chroma := range s.Chromas {
@@ -171,11 +187,70 @@ func (c *Cache) EnsureLoaded(ctx context.Context, language string) error {
 				UUID:        s.UUID,
 				DisplayName: name,
 				DisplayIcon: icon,
+				Color:       color,
 			}
 		}
 	}
 	c.langs[language] = idx
 	return nil
+}
+
+func (c *Cache) ensureTiersLocked(ctx context.Context) error {
+	if len(c.tiers) > 0 {
+		return nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/contenttiers", nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("content tiers: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("content tiers: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	var payload struct {
+		Data []struct {
+			UUID           string `json:"uuid"`
+			HighlightColor string `json:"highlightColor"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return fmt.Errorf("content tiers decode: %w", err)
+	}
+	for _, t := range payload.Data {
+		if color, ok := ParseHighlightColor(t.HighlightColor); ok {
+			c.tiers[t.UUID] = color
+		}
+	}
+	return nil
+}
+
+func (c *Cache) tierColor(tierUUID string) int {
+	if tierUUID == "" {
+		return DefaultEmbedColor
+	}
+	if color, ok := c.tiers[tierUUID]; ok {
+		return color
+	}
+	return DefaultEmbedColor
+}
+
+// ParseHighlightColor converts valorant-api highlightColor (RRGGBBAA) to Discord 0xRRGGBB.
+func ParseHighlightColor(raw string) (int, bool) {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "#")
+	if len(raw) < 6 {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(raw[:6], 16, 64)
+	if err != nil {
+		return 0, false
+	}
+	return int(n), true
 }
 
 func isStandardChromaName(name string) bool {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/dosfsociety/valorant-bot/internal/crypto"
 	"github.com/dosfsociety/valorant-bot/internal/riot"
@@ -26,7 +27,8 @@ type ShopFetcher struct {
 	Skins    *skins.Cache
 }
 
-// ShopsForUser implements ShopService.
+// ShopsForUser implements ShopService. Accounts are fetched concurrently
+// (order preserved) so N accounts take roughly one round-trip instead of N.
 func (f *ShopFetcher) ShopsForUser(ctx context.Context, discordUserID, language string) ([]AccountShop, error) {
 	if f.Accounts == nil {
 		return nil, fmt.Errorf("accounts not configured")
@@ -35,14 +37,27 @@ func (f *ShopFetcher) ShopsForUser(ctx context.Context, discordUserID, language 
 	if err != nil {
 		return nil, err
 	}
-	out := make([]AccountShop, 0, len(accounts))
-	for _, acc := range accounts {
-		out = append(out, f.shopForAccount(ctx, acc, language))
+
+	// Load skin metadata once up front rather than once per account.
+	var skinsErr error
+	if f.Skins != nil {
+		skinsErr = f.Skins.EnsureLoaded(ctx, language)
 	}
+
+	out := make([]AccountShop, len(accounts))
+	var wg sync.WaitGroup
+	for idx, acc := range accounts {
+		wg.Add(1)
+		go func(idx int, acc store.Account) {
+			defer wg.Done()
+			out[idx] = f.shopForAccount(ctx, acc, language, skinsErr)
+		}(idx, acc)
+	}
+	wg.Wait()
 	return out, nil
 }
 
-func (f *ShopFetcher) shopForAccount(ctx context.Context, acc store.Account, language string) AccountShop {
+func (f *ShopFetcher) shopForAccount(ctx context.Context, acc store.Account, language string, skinsErr error) AccountShop {
 	view := AccountShop{
 		GameName: acc.GameName,
 		TagLine:  acc.TagLine,
@@ -77,11 +92,9 @@ func (f *ShopFetcher) shopForAccount(ctx context.Context, acc store.Account, lan
 		view.Err = fmt.Sprintf("상점을 불러오지 못했습니다: %v", err)
 		return view
 	}
-	if f.Skins != nil {
-		if err := f.Skins.EnsureLoaded(ctx, language); err != nil {
-			view.Err = fmt.Sprintf("스킨 데이터를 불러오지 못했습니다: %v", err)
-			return view
-		}
+	if skinsErr != nil {
+		view.Err = fmt.Sprintf("스킨 데이터를 불러오지 못했습니다: %v", skinsErr)
+		return view
 	}
 	for _, offer := range sf.Offers {
 		ov := OfferView{
@@ -92,6 +105,7 @@ func (f *ShopFetcher) shopForAccount(ctx context.Context, acc store.Account, lan
 			if skin, ok := f.Skins.Get(offer.SkinUUID, language); ok {
 				ov.DisplayName = skin.DisplayName
 				ov.IconURL = skin.DisplayIcon
+				ov.Color = skin.Color
 			}
 		}
 		if ov.DisplayName == "" {

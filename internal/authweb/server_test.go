@@ -374,13 +374,13 @@ func TestLogin_AutoFlow(t *testing.T) {
 		t.Fatalf("missing state: %s", body)
 	}
 	if !strings.Contains(body, "catcher-ping") {
-		t.Fatal("missing catcher detection")
+		t.Fatal("missing localhost detection")
 	}
 	if !strings.Contains(body, "/api/auth/wait") {
 		t.Fatal("missing wait poll")
 	}
-	if !strings.Contains(body, "install-catcher.sh") {
-		t.Fatal("missing catcher install hint")
+	if strings.Contains(body, "install-catcher.sh") {
+		t.Fatal("separate authcatcher install should not be required")
 	}
 	if strings.Contains(body, "붙여넣") && strings.Contains(body, "<form") {
 		t.Fatal("paste form should be removed")

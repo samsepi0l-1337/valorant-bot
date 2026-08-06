@@ -10,6 +10,7 @@ import (
 	"github.com/bwmarrin/discordgo"
 	"github.com/dosfsociety/valorant-bot/internal/i18n"
 	"github.com/dosfsociety/valorant-bot/internal/riot"
+	"github.com/dosfsociety/valorant-bot/internal/skins"
 	"github.com/dosfsociety/valorant-bot/internal/store"
 	qrcode "github.com/skip2/go-qrcode"
 )
@@ -21,9 +22,43 @@ const qrAttachmentName = "riot-qr.png"
 // desktop screen without dominating the ephemeral message.
 const qrImageSize = 320
 
-// HandleAuth starts a Riot Mobile QR login and returns the ephemeral message
+const (
+	customIDAuthQR          = "auth:qr"
+	customIDAuthPassword    = "auth:password"
+	customIDAuthPWModal     = "auth:pw"
+	customIDAuthMFAPref     = "auth:mfa:"
+	customIDAuthMFAOpenPref = "auth:mfaopen:"
+)
+
+// HandleAuth returns the dual auth chooser: Riot Mobile QR or Discord modal ID login.
+func (h *Handlers) HandleAuth(ctx context.Context, discordUserID string, lang i18n.Lang) (Response, error) {
+	_ = ctx
+	_ = discordUserID
+	return Response{
+		Ephemeral: true,
+		Content:   i18n.T(lang, "auth.choose"),
+		Components: []discordgo.MessageComponent{
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.Button{
+						Label:    i18n.T(lang, "auth.choose.qr"),
+						Style:    discordgo.PrimaryButton,
+						CustomID: customIDAuthQR,
+					},
+					discordgo.Button{
+						Label:    i18n.T(lang, "auth.choose.password"),
+						Style:    discordgo.SecondaryButton,
+						CustomID: customIDAuthPassword,
+					},
+				},
+			},
+		},
+	}, nil
+}
+
+// HandleAuthQR starts a Riot Mobile QR login and returns the ephemeral message
 // holding the QR image. The returned state is passed to WaitQRLogin.
-func (h *Handlers) HandleAuth(ctx context.Context, discordUserID string, lang i18n.Lang) (Response, string, error) {
+func (h *Handlers) HandleAuthQR(ctx context.Context, discordUserID string, lang i18n.Lang) (Response, string, error) {
 	if h.Auth == nil {
 		return Response{}, "", fmt.Errorf("auth not configured")
 	}
@@ -61,8 +96,170 @@ func (h *Handlers) HandleAuth(ctx context.Context, discordUserID string, lang i1
 	}, state, nil
 }
 
-// HandleAuthComplete renders the final message once a QR login settles,
-// replacing the QR image and link button.
+// PasswordLoginModal is the Discord modal for Riot username/password.
+// Optional MFA code lets users submit email / Riot Mobile OTP in one step.
+func PasswordLoginModal(lang i18n.Lang) *discordgo.InteractionResponseData {
+	return &discordgo.InteractionResponseData{
+		CustomID: customIDAuthPWModal,
+		Title:    i18n.T(lang, "auth.password.title"),
+		Components: []discordgo.MessageComponent{
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.TextInput{
+						CustomID:    "username",
+						Label:       i18n.T(lang, "auth.password.username"),
+						Style:       discordgo.TextInputShort,
+						Placeholder: "Riot ID / email",
+						Required:    true,
+						MaxLength:   128,
+					},
+				},
+			},
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.TextInput{
+						CustomID:  "password",
+						Label:     i18n.T(lang, "auth.password.password"),
+						Style:     discordgo.TextInputShort,
+						Required:  true,
+						MinLength: 1,
+						MaxLength: 128,
+					},
+				},
+			},
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.TextInput{
+						CustomID:    "mfa_code",
+						Label:       i18n.T(lang, "auth.password.mfa_code"),
+						Style:       discordgo.TextInputShort,
+						Placeholder: "000000",
+						Required:    false,
+						MinLength:   0,
+						MaxLength:   8,
+					},
+				},
+			},
+		},
+	}
+}
+
+// MFALoginModal asks for an email or Riot Mobile OTP after password MFA.
+func MFALoginModal(mfaState string, hint string, lang i18n.Lang) *discordgo.InteractionResponseData {
+	placeholder := "000000"
+	if strings.Contains(hint, "@") {
+		placeholder = hint
+	}
+	return &discordgo.InteractionResponseData{
+		CustomID: customIDAuthMFAPref + mfaState,
+		Title:    i18n.T(lang, "auth.mfa.title"),
+		Components: []discordgo.MessageComponent{
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.TextInput{
+						CustomID:    "code",
+						Label:       i18n.T(lang, "auth.mfa.code"),
+						Style:       discordgo.TextInputShort,
+						Placeholder: placeholder,
+						Required:    true,
+						MinLength:   6,
+						MaxLength:   8,
+					},
+				},
+			},
+		},
+	}
+}
+
+func mfaPrompt(lang i18n.Lang, hint string) string {
+	switch {
+	case strings.Contains(hint, "@"):
+		return fmt.Sprintf(i18n.T(lang, "auth.mfa.prompt_email"), hint)
+	case hint == "authenticator", hint == "otp", hint == "otpauth", hint == "riot_mobile", hint == "mobile":
+		return i18n.T(lang, "auth.mfa.prompt_app")
+	default:
+		return i18n.T(lang, "auth.mfa.prompt")
+	}
+}
+
+// HandlePasswordLogin links an account from Discord modal credentials.
+// mfaCode is optional; when Riot challenges MFA and a code was provided, it is submitted immediately.
+func (h *Handlers) HandlePasswordLogin(ctx context.Context, discordUserID, username, password, mfaCode string, lang i18n.Lang) (Response, error) {
+	if h.Auth == nil {
+		return Response{}, fmt.Errorf("auth not configured")
+	}
+	display, mfaState, mfaHint, err := h.Auth.LoginWithPassword(ctx, discordUserID, username, password)
+	if err != nil {
+		return Response{
+			Ephemeral: true,
+			Content:   fmt.Sprintf(i18n.T(lang, "auth.password.failed"), err),
+		}, nil
+	}
+	if mfaState != "" {
+		if code := strings.TrimSpace(mfaCode); code != "" {
+			return h.HandlePasswordMFA(ctx, mfaState, code, lang)
+		}
+		return Response{
+			Ephemeral: true,
+			Content:   mfaPrompt(lang, mfaHint),
+			Components: []discordgo.MessageComponent{
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.Button{
+							Label:    i18n.T(lang, "auth.mfa.button"),
+							Style:    discordgo.PrimaryButton,
+							CustomID: customIDAuthMFAOpenPref + mfaState,
+						},
+					},
+				},
+			},
+		}, nil
+	}
+	return Response{
+		Ephemeral:  true,
+		Content:    fmt.Sprintf(i18n.T(lang, "auth.qr.done"), display),
+		Embeds:     []*discordgo.MessageEmbed{},
+		Components: []discordgo.MessageComponent{},
+	}, nil
+}
+
+// HandlePasswordMFA completes MFA for a pending password login.
+func (h *Handlers) HandlePasswordMFA(ctx context.Context, mfaState, code string, lang i18n.Lang) (Response, error) {
+	if h.Auth == nil {
+		return Response{}, fmt.Errorf("auth not configured")
+	}
+	display, err := h.Auth.CompletePasswordMFA(ctx, mfaState, code)
+	if err != nil {
+		msg := fmt.Sprintf(i18n.T(lang, "auth.password.failed"), err)
+		if strings.Contains(strings.ToLower(err.Error()), "invalid multifactor") ||
+			strings.Contains(strings.ToLower(err.Error()), "invalid_code") {
+			msg = i18n.T(lang, "auth.mfa.invalid")
+		}
+		return Response{
+			Ephemeral: true,
+			Content:   msg,
+			Components: []discordgo.MessageComponent{
+				discordgo.ActionsRow{
+					Components: []discordgo.MessageComponent{
+						discordgo.Button{
+							Label:    i18n.T(lang, "auth.mfa.button"),
+							Style:    discordgo.PrimaryButton,
+							CustomID: customIDAuthMFAOpenPref + mfaState,
+						},
+					},
+				},
+			},
+		}, nil
+	}
+	return Response{
+		Ephemeral:  true,
+		Content:    fmt.Sprintf(i18n.T(lang, "auth.qr.done"), display),
+		Embeds:     []*discordgo.MessageEmbed{},
+		Components: []discordgo.MessageComponent{},
+	}, nil
+}
+
+// HandleAuthComplete renders the final message once a QR login settles.
 func (h *Handlers) HandleAuthComplete(displayName string, err error, lang i18n.Lang) Response {
 	resp := Response{
 		Ephemeral:  true,
@@ -135,7 +332,8 @@ func (h *Handlers) HandleShop(ctx context.Context, discordUserID string, lang i1
 	if err != nil {
 		return Response{}, err
 	}
-	return Response{Embeds: BuildShopEmbeds(shops, lang)}, nil
+	h.ensureShopCache().put(discordUserID, shops, lang)
+	return shopPageResponse(discordUserID, shops, 0, lang), nil
 }
 
 // HandleLanguage sets the user's bot reply language.
@@ -183,51 +381,98 @@ func resolveAccountPUUID(accounts []store.Account, identifier string) (string, b
 	return "", false
 }
 
-// BuildShopEmbeds converts account shops into compact Discord embeds.
-// One embed per skin with Thumbnail (not full-width Image) so ~2 accounts fit on one screen.
+// FormatShopAccountLabel returns "Name#Tag (region)" for shop message headers.
+func FormatShopAccountLabel(s AccountShop, lang i18n.Lang) string {
+	account := fmt.Sprintf("%s#%s", s.GameName, s.TagLine)
+	if s.Region != "" {
+		account = fmt.Sprintf("%s (%s)", account, riot.DisplayRegion(s.Region, string(lang)))
+	}
+	return account
+}
+
+// BuildAccountPageEmbeds builds the /shop page for one account: one embed per
+// skin (with image) so all four daily offers are visible. Pagination switches
+// accounts, not skins. Account name/region belong in the message content above.
+func BuildAccountPageEmbeds(s AccountShop, lang i18n.Lang) []*discordgo.MessageEmbed {
+	switch {
+	case s.Err != "":
+		return []*discordgo.MessageEmbed{{
+			Title:       i18n.T(lang, "shop.fail_title"),
+			Description: s.Err,
+			Color:       skins.DefaultEmbedColor,
+		}}
+	case len(s.Offers) == 0:
+		return []*discordgo.MessageEmbed{{
+			Description: i18n.T(lang, "shop.none"),
+			Color:       skins.DefaultEmbedColor,
+		}}
+	}
+
+	out := make([]*discordgo.MessageEmbed, 0, len(s.Offers))
+	for _, o := range s.Offers {
+		name := o.DisplayName
+		if name == "" {
+			name = o.SkinUUID
+		}
+		color := o.Color
+		if color == 0 {
+			color = skins.DefaultEmbedColor
+		}
+		embed := &discordgo.MessageEmbed{
+			Title:       fmt.Sprintf("%s · %d VP", name, o.CostVP),
+			Color:       color,
+			Description: "\u200b",
+		}
+		if o.IconURL != "" {
+			embed.Thumbnail = &discordgo.MessageEmbedThumbnail{URL: o.IconURL}
+		}
+		out = append(out, embed)
+	}
+	return out
+}
+
+// BuildShopEmbeds converts account shops into compact Discord embeds: one
+// embed per account. Used by the daily scheduler where many accounts may share
+// one message (Discord caps at 10 embeds).
 func BuildShopEmbeds(shops []AccountShop, lang i18n.Lang) []*discordgo.MessageEmbed {
-	out := make([]*discordgo.MessageEmbed, 0)
+	out := make([]*discordgo.MessageEmbed, 0, len(shops))
 	for _, s := range shops {
 		account := fmt.Sprintf("%s#%s", s.GameName, s.TagLine)
 		if s.Region != "" {
 			account = fmt.Sprintf("%s (%s)", account, riot.DisplayRegion(s.Region, string(lang)))
 		}
+		embed := &discordgo.MessageEmbed{
+			Author: &discordgo.MessageEmbedAuthor{Name: account},
+			Color:  skins.DefaultEmbedColor,
+		}
 
-		if s.Err != "" {
-			out = append(out, &discordgo.MessageEmbed{
-				Author:      &discordgo.MessageEmbedAuthor{Name: account},
-				Title:       i18n.T(lang, "shop.fail_title"),
-				Description: s.Err,
-				Color:       0xFD4553,
-			})
-			continue
+		switch {
+		case s.Err != "":
+			embed.Title = i18n.T(lang, "shop.fail_title")
+			embed.Description = s.Err
+		case len(s.Offers) == 0:
+			embed.Description = i18n.T(lang, "shop.none")
+		default:
+			embed.Fields = make([]*discordgo.MessageEmbedField, 0, len(s.Offers))
+			for _, o := range s.Offers {
+				name := o.DisplayName
+				if name == "" {
+					name = o.SkinUUID
+				}
+				embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
+					Name:   name,
+					Value:  fmt.Sprintf("%d VP", o.CostVP),
+					Inline: true,
+				})
+				if embed.Thumbnail == nil && o.IconURL != "" {
+					embed.Thumbnail = &discordgo.MessageEmbedThumbnail{URL: o.IconURL}
+				}
+				if embed.Color == skins.DefaultEmbedColor && o.Color != 0 {
+					embed.Color = o.Color
+				}
+			}
 		}
-		if len(s.Offers) == 0 {
-			out = append(out, &discordgo.MessageEmbed{
-				Author:      &discordgo.MessageEmbedAuthor{Name: account},
-				Description: i18n.T(lang, "shop.none"),
-				Color:       0xFD4553,
-			})
-			continue
-		}
-		for i, o := range s.Offers {
-			name := o.DisplayName
-			if name == "" {
-				name = o.SkinUUID
-			}
-			embed := &discordgo.MessageEmbed{
-				// Single line: name + price (avoids extra description block height).
-				Title: fmt.Sprintf("%s · %d VP", name, o.CostVP),
-				Color: 0xFD4553,
-			}
-			if i == 0 {
-				embed.Author = &discordgo.MessageEmbedAuthor{Name: account}
-			}
-			if o.IconURL != "" {
-				embed.Thumbnail = &discordgo.MessageEmbedThumbnail{URL: o.IconURL}
-			}
-			out = append(out, embed)
-		}
+		out = append(out, embed)
 	}
 	return out
 }

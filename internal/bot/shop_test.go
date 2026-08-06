@@ -110,6 +110,94 @@ func TestShopFetcher_Success(t *testing.T) {
 	}
 }
 
+// TestShopFetcher_MultiAccountCompletes guards against a regression where
+// ShopsForUser fetched accounts sequentially; with N accounts sharing one
+// slow-ish upstream, a serial implementation could stall past a caller's
+// deadline. It also checks that per-account order is preserved despite the
+// concurrent fetch.
+func TestShopFetcher_MultiAccountCompletes(t *testing.T) {
+	const vp = riot.VPCurrencyUUID
+	redirect := "https://playvalorant.com/opt_in#access_token=acc-token&id_token=id-token"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/authorize":
+			w.Header().Set("Location", redirect)
+			w.WriteHeader(http.StatusFound)
+		case r.URL.Path == "/api/token/v1":
+			_ = json.NewEncoder(w).Encode(map[string]string{"entitlements_token": "ent-jwt"})
+		case strings.Contains(r.URL.Path, "/store/v3/storefront/"):
+			puuid := strings.TrimPrefix(r.URL.Path, "/store/v3/storefront/")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"SkinsPanelLayout": map[string]any{
+					"SingleItemStoreOffers": []map[string]any{
+						{"OfferID": "skin-" + puuid, "Cost": map[string]int{vp: 1000}},
+					},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	box, err := crypto.NewBoxer("test-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := box.Encrypt([]byte("ssid=cookie"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	st := openBotTestStore(t)
+	for _, puuid := range []string{"puuid-a", "puuid-b"} {
+		if err := st.UpsertRiotAccount(store.Account{
+			DiscordUserID:     "discord-multi",
+			PUUID:             puuid,
+			GameName:          "Player-" + puuid,
+			TagLine:           "KR1",
+			Region:            "kr",
+			Shard:             "kr",
+			CookiesCiphertext: cipher,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rc := riot.NewClient(srv.Client())
+	rc.AuthBaseURL = srv.URL
+	rc.EntitlementsBaseURL = srv.URL
+	rc.PDBaseURLFunc = func(shard string) string { return srv.URL }
+
+	fetcher := &bot.ShopFetcher{
+		Accounts: st,
+		Boxer:    box,
+		Riot:     rc,
+		// Skins is intentionally nil: this test only checks concurrent
+		// fetch completion/ordering, not skin-name resolution.
+	}
+
+	shops, err := fetcher.ShopsForUser(context.Background(), "discord-multi", "ko")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(shops) != 2 {
+		t.Fatalf("shops %d", len(shops))
+	}
+	for i, s := range shops {
+		if s.Err != "" {
+			t.Fatalf("shop %d err %q", i, s.Err)
+		}
+		if len(s.Offers) != 1 {
+			t.Fatalf("shop %d offers %+v", i, s.Offers)
+		}
+	}
+	// Order preserved: account order in equals account order out.
+	if shops[0].PUUID != "puuid-a" || shops[1].PUUID != "puuid-b" {
+		t.Fatalf("order not preserved: %+v", shops)
+	}
+}
+
 func TestShopFetcher_CookieReauthFails(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

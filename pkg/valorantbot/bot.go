@@ -97,11 +97,12 @@ func (b *Bot) Run(ctx context.Context) error {
 	dg.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages
 
 	authServer := authweb.New(authweb.Deps{
-		AuthBaseURL: b.cfg.AuthBaseURL,
-		Store:       st,
-		Riot:        riotClient,
-		QRAuth:      riot.NewQRClient(nil),
-		Boxer:       boxer,
+		AuthBaseURL:  b.cfg.AuthBaseURL,
+		Store:        st,
+		Riot:         riotClient,
+		QRAuth:       riot.NewQRClient(nil),
+		PasswordAuth: riot.NewPasswordClient(nil),
+		Boxer:        boxer,
 		OnLinked: func(discordUserID, displayName string) {
 			ch, err := dg.UserChannelCreate(discordUserID)
 			if err != nil {
