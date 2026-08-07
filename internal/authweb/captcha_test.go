@@ -1440,7 +1440,19 @@ func TestCaptchaSubmitAccountCommitClaimWinsBeforeCleanup(t *testing.T) {
 	if response["ok"] != true || len(st.accounts) != 1 || linked.Load() != 1 {
 		t.Errorf("commit-wins response=%+v accounts=%+v onLinked=%d", response, st.accounts, linked.Load())
 	}
-	s.cleanupPasswordState(state)
+	select {
+	case <-flow.ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("automatic cleanup did not run after the requested commit finished")
+	}
+	s.mu.Lock()
+	_, pending := s.passwordPending[state]
+	_, outcome := s.passwordOutcomes[state]
+	_, ready := s.passwordReady[state]
+	s.mu.Unlock()
+	if pending || outcome || ready {
+		t.Fatalf("automatic cleanup retained pending=%v outcome=%v ready=%v", pending, outcome, ready)
+	}
 }
 
 func TestCaptchaBrowserCloseFailurePreventsSuccessOrTerminalResponse(t *testing.T) {
@@ -1992,6 +2004,194 @@ func TestWaitPasswordLoginCancellationWinsBeforeLaterPublishers(t *testing.T) {
 	}
 	if controller.closeCalls.Load() != 1 {
 		t.Fatalf("browser closes=%d, want 1", controller.closeCalls.Load())
+	}
+}
+
+func TestWaitPasswordLoginCancellationDoesNotYieldToContendingMFAPublisher(t *testing.T) {
+	s := newCaptchaServer(&fakePasswordAuth{})
+	const state = "cancellation-publisher-race"
+	flowCtx, flowCancel := context.WithCancel(context.Background())
+	defer flowCancel()
+	pending := passwordPending{
+		discordUserID: "owner-1",
+		username:      "user",
+		password:      "secret-password",
+		flow: &passwordFlow{
+			ctx:    flowCtx,
+			cancel: flowCancel,
+		},
+		expiresAt: time.Now().Add(time.Minute),
+	}
+	s.mu.Lock()
+	s.passwordPending[state] = pending
+	s.passwordOutcomes[state] = passwordOutcome{}
+	s.passwordReady[state] = make(chan struct{})
+	s.mu.Unlock()
+
+	publisherAtLock := make(chan struct{})
+	allowPublisherAttempt := make(chan struct{})
+	publisherAttempted := make(chan bool)
+	publisherDone := make(chan struct{})
+	syncFailures := make(chan error, 4)
+	recordSyncFailure := func(err error) {
+		select {
+		case syncFailures <- err:
+		default:
+		}
+	}
+	var releasePublisherOnce sync.Once
+	releasePublisher := func() { releasePublisherOnce.Do(func() { close(allowPublisherAttempt) }) }
+	defer releasePublisher()
+
+	var lockEntry atomic.Int32
+	s.mu.lockForTest = func(mu *sync.Mutex) {
+		entry := lockEntry.Add(1)
+		switch entry {
+		case 1:
+			// The real MFA publisher's finalization claim must complete before it
+			// can reach the outcome-publication lock covered by this regression.
+			mu.Lock()
+		case 2:
+			close(publisherAtLock)
+			select {
+			case <-allowPublisherAttempt:
+			case <-time.After(2 * time.Second):
+				recordSyncFailure(errors.New("publisher was not released to attempt Server.mu"))
+			}
+			acquired := mu.TryLock()
+			select {
+			case publisherAttempted <- acquired:
+			case <-time.After(2 * time.Second):
+				recordSyncFailure(errors.New("publisher lock-attempt handshake timed out"))
+			}
+			if !acquired {
+				mu.Lock()
+			}
+		default:
+			if entry >= 5 {
+				// A split-lock cancellation claimant enters here before trying to
+				// barge ahead of the queued publisher. Hold that relock until the
+				// real publisher has completed its publication attempt.
+				select {
+				case <-publisherDone:
+				case <-time.After(2 * time.Second):
+					recordSyncFailure(errors.New("later Server.mu entrant timed out waiting for publisher"))
+				}
+			}
+			mu.Lock()
+		}
+	}
+
+	type publishResult struct {
+		out passwordOutcome
+		err error
+	}
+	published := make(chan publishResult, 1)
+	go func() {
+		out, publishErr := s.finishPasswordMFA(
+			state,
+			pending,
+			"contending-mfa",
+			&riot.MFAChallenge{Email: "late@example.com", Method: "email"},
+			"late@example.com",
+		)
+		published <- publishResult{out: out, err: publishErr}
+		close(publisherDone)
+	}()
+	select {
+	case <-publisherAtLock:
+	case <-time.After(2 * time.Second):
+		t.Fatal("MFA publisher did not reach its outcome-publication Server.mu boundary")
+	}
+
+	claimReached := make(chan struct{})
+	publisherContending := make(chan struct{})
+	allowClaim := make(chan struct{})
+	var publisherAcquired atomic.Bool
+	var releaseClaimOnce sync.Once
+	releaseClaim := func() { releaseClaimOnce.Do(func() { close(allowClaim) }) }
+	defer releaseClaim()
+	s.beforePasswordWaitCancellationClaim = func() {
+		close(claimReached)
+		releasePublisher()
+		select {
+		case acquired := <-publisherAttempted:
+			publisherAcquired.Store(acquired)
+		case <-time.After(2 * time.Second):
+			recordSyncFailure(errors.New("cancellation claimant did not observe publisher lock attempt"))
+		}
+		close(publisherContending)
+		select {
+		case <-allowClaim:
+		case <-time.After(2 * time.Second):
+			recordSyncFailure(errors.New("cancellation claimant release handshake timed out"))
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	waitDone := make(chan error, 1)
+	go func() {
+		_, _, _, waitErr := s.WaitPasswordLogin(ctx, state)
+		waitDone <- waitErr
+	}()
+	select {
+	case <-claimReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not reach the cancellation claim")
+	}
+	select {
+	case <-publisherContending:
+	case <-time.After(2 * time.Second):
+		t.Fatal("MFA publisher did not contend on Server.mu")
+	}
+	if publisherAcquired.Load() {
+		t.Error("MFA publisher unexpectedly acquired Server.mu while cancellation claimant held it")
+	}
+	if s.mu.TryLock() {
+		s.mu.Unlock()
+		t.Fatal("cancellation claimant released Server.mu before state detach")
+	}
+	releaseClaim()
+
+	var publish publishResult
+	select {
+	case publish = <-published:
+	case <-time.After(2 * time.Second):
+		t.Fatal("MFA publisher did not finish after cancellation claim")
+	}
+	select {
+	case waitErr := <-waitDone:
+		if !errors.Is(waitErr, context.Canceled) {
+			t.Fatalf("wait error = %v, want context cancellation", waitErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not return after cancellation claim")
+	}
+	if !errors.Is(publish.err, errPasswordFlowClosed) {
+		t.Errorf("contending MFA publisher error = %v, want closed flow", publish.err)
+	}
+	if publish.out.done {
+		t.Errorf("contending MFA publisher published %+v after cancellation won", publish.out)
+	}
+
+	s.mu.Lock()
+	_, passwordPending := s.passwordPending[state]
+	_, passwordOutcome := s.passwordOutcomes[state]
+	_, mfaContinuation := s.mfaPending["contending-mfa"]
+	s.mu.Unlock()
+	if passwordPending || passwordOutcome || mfaContinuation {
+		t.Errorf(
+			"cancellation cleanup left pending=%v outcome=%v mfa=%v",
+			passwordPending,
+			passwordOutcome,
+			mfaContinuation,
+		)
+	}
+	select {
+	case syncErr := <-syncFailures:
+		t.Fatal(syncErr)
+	default:
 	}
 }
 

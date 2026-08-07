@@ -109,6 +109,21 @@ type captchaBrowserCloseFailure struct {
 	possiblyRunning bool
 }
 
+type serverMutex struct {
+	sync.Mutex
+	// Test-only lock-entry seam. A non-nil hook must return with the supplied
+	// mutex locked; nil delegates directly to sync.Mutex.Lock.
+	lockForTest func(*sync.Mutex)
+}
+
+func (m *serverMutex) Lock() {
+	if hook := m.lockForTest; hook != nil {
+		hook(&m.Mutex)
+		return
+	}
+	m.Mutex.Lock()
+}
+
 // Server serves login redirect + Riot callback catcher.
 type Server struct {
 	authBaseURL    string
@@ -122,7 +137,7 @@ type Server struct {
 	onLinked       LinkedNotifier
 	mux            *http.ServeMux
 
-	mu                   sync.Mutex
+	mu                   serverMutex
 	outcomes             map[string]authOutcome
 	qrSessions           map[string]*riot.QRSession
 	mfaPending           map[string]mfaPending
