@@ -15,30 +15,38 @@ import (
 	"github.com/dosfsociety/valorant-bot/internal/authweb"
 	"github.com/dosfsociety/valorant-bot/internal/bot"
 	"github.com/dosfsociety/valorant-bot/internal/i18n"
+	"github.com/dosfsociety/valorant-bot/internal/riot"
 	"github.com/dosfsociety/valorant-bot/internal/store"
 )
 
 type fakeAuth struct {
-	url         string
-	state       string
-	err         error
-	display     string
-	waitErr     error
-	captchaURL  string
-	pwState     string
-	pwErr       error
-	waitDisp    string
-	waitMFA     string
-	waitHint    string
-	waitPWErr   error
-	mfaDisplay  string
-	mfaErr      error
-	launchErr   error
-	launchState string
-	launchUser  string
-	pwBegins    int
-	launches    int
-	browserRuns int
+	url          string
+	state        string
+	err          error
+	display      string
+	waitErr      error
+	captchaURL   string
+	pwState      string
+	pwErr        error
+	waitDisp     string
+	waitMFA      string
+	waitHint     string
+	waitPWErr    error
+	mfaDisplay   string
+	mfaErr       error
+	mfaState     string
+	mfaUser      string
+	mfaCode      string
+	validateMFA  string
+	validateUID  string
+	validateHint string
+	validateErr  error
+	launchErr    error
+	launchState  string
+	launchUser   string
+	pwBegins     int
+	launches     int
+	browserRuns  int
 }
 
 func (f *fakeAuth) BeginQRAuth(ctx context.Context, discordUserID string) (string, string, error) {
@@ -88,11 +96,20 @@ func (f *fakeAuth) LaunchPasswordCaptcha(ctx context.Context, state, discordUser
 	return f.launchErr
 }
 
-func (f *fakeAuth) CompletePasswordMFA(ctx context.Context, mfaState, code string) (string, error) {
+func (f *fakeAuth) CompletePasswordMFA(ctx context.Context, mfaState, discordUserID, code string) (string, error) {
+	f.mfaState = mfaState
+	f.mfaUser = discordUserID
+	f.mfaCode = code
 	if f.mfaErr != nil {
 		return "", f.mfaErr
 	}
 	return f.mfaDisplay, nil
+}
+
+func (f *fakeAuth) ValidatePasswordMFA(mfaState, discordUserID string) (string, error) {
+	f.validateMFA = mfaState
+	f.validateUID = discordUserID
+	return f.validateHint, f.validateErr
 }
 
 type memAccounts struct {
@@ -339,8 +356,8 @@ func TestHandlePasswordCaptchaComplete_MFA(t *testing.T) {
 }
 
 func TestHandlePasswordMFA_InvalidCodeKeepsRetry(t *testing.T) {
-	h := &bot.Handlers{Auth: &fakeAuth{mfaErr: errors.New("invalid multifactor code")}}
-	resp, err := h.HandlePasswordMFA(context.Background(), "mfa-1", "000000", i18n.KO)
+	h := &bot.Handlers{Auth: &fakeAuth{mfaErr: fmt.Errorf("riot response: %w", riot.ErrPasswordInvalidCode)}}
+	resp, err := h.HandlePasswordMFA(context.Background(), "mfa-1", "owner-1", "000000", i18n.KO)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,6 +371,40 @@ func TestHandlePasswordMFA_InvalidCodeKeepsRetry(t *testing.T) {
 	btn := row.Components[0].(discordgo.Button)
 	if btn.CustomID != "auth:mfaopen:mfa-1" {
 		t.Fatalf("customID %q", btn.CustomID)
+	}
+}
+
+func TestHandlePasswordMFA_TerminalFailureHasNoRetry(t *testing.T) {
+	auth := &fakeAuth{mfaErr: errors.New("sqlite write failed")}
+	h := &bot.Handlers{Auth: auth}
+	h.HandlePasswordCaptchaComplete("", "mfa-1", "a***@ex.com", nil, i18n.KO)
+
+	resp, err := h.HandlePasswordMFA(context.Background(), "mfa-1", "owner-1", "123456", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Ephemeral {
+		t.Fatal("terminal MFA failure must stay ephemeral")
+	}
+	if len(resp.Components) != 0 {
+		t.Fatalf("terminal MFA failure exposed retry controls: %#v", resp.Components)
+	}
+	if strings.Contains(resp.Content, "다시 입력") {
+		t.Fatalf("terminal MFA failure promised a consumed-state retry: %q", resp.Content)
+	}
+}
+
+func TestHandlePasswordMFA_WrongOwnerIsLocalizedAndTerminal(t *testing.T) {
+	h := &bot.Handlers{Auth: &fakeAuth{mfaErr: authweb.ErrMFAOwner}}
+	resp, err := h.HandlePasswordMFA(context.Background(), "mfa-1", "intruder-1", "123456", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Ephemeral || resp.Content != i18n.T(i18n.KO, "auth.mfa.denied") {
+		t.Fatalf("wrong-owner response=%+v", resp)
+	}
+	if len(resp.Components) != 0 {
+		t.Fatalf("wrong-owner response exposed retry controls: %#v", resp.Components)
 	}
 }
 

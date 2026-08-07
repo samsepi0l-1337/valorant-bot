@@ -25,6 +25,13 @@ const (
 	defaultQRPollInterval = 2 * time.Second
 )
 
+var (
+	// ErrMFAOwner means a Discord user tried to control another user's MFA continuation.
+	ErrMFAOwner = errors.New("only the login owner can continue this mfa session")
+	// ErrMFAExpired covers missing, expired, and already-consumed MFA continuations.
+	ErrMFAExpired = errors.New("unknown or expired mfa session")
+)
+
 // RiotRedirectURI is the OAuth redirect Riot returns to after login (riot-client).
 // Must be served at http://localhost/redirect (port 80) on the browser machine.
 const RiotRedirectURI = "http://localhost/redirect"
@@ -307,22 +314,48 @@ func (s *Server) completeQRLogin(ctx context.Context, state string, tokens riot.
 	return s.linkAccount(ctx, discordUserID, tokens.AccessToken, tokens.IDToken, session, "")
 }
 
+// ValidatePasswordMFA checks an MFA continuation in memory before Discord opens
+// its modal. It intentionally performs no Riot or persistence calls.
+func (s *Server) ValidatePasswordMFA(mfaState, discordUserID string) (hint string, err error) {
+	mfaState = strings.TrimSpace(mfaState)
+	discordUserID = strings.TrimSpace(discordUserID)
+	s.mu.Lock()
+	pending, ok := s.mfaPending[mfaState]
+	live := ok && pending.flow != nil && pending.flow.ctx.Err() == nil && time.Now().Before(pending.expiresAt)
+	s.mu.Unlock()
+	if !live {
+		return "", ErrMFAExpired
+	}
+	if pending.discordUserID != discordUserID {
+		return "", ErrMFAOwner
+	}
+	return formatMFAHint(pending.challenge), nil
+}
+
 // CompletePasswordMFA finishes a password login after the Discord MFA modal.
-func (s *Server) CompletePasswordMFA(ctx context.Context, mfaState, code string) (displayName string, err error) {
+func (s *Server) CompletePasswordMFA(ctx context.Context, mfaState, discordUserID, code string) (displayName string, err error) {
 	if s.passwordAuth == nil {
 		return "", fmt.Errorf("password auth not configured")
 	}
+	mfaState = strings.TrimSpace(mfaState)
+	discordUserID = strings.TrimSpace(discordUserID)
 	pending, done, ok := s.beginMFAOperation(mfaState)
 	if !ok {
-		return "", fmt.Errorf("unknown or expired mfa session")
+		return "", ErrMFAExpired
 	}
 	defer done()
+	if pending.discordUserID != discordUserID {
+		return "", ErrMFAOwner
+	}
 	pending.flow.submitMu.Lock()
 	defer pending.flow.submitMu.Unlock()
 
 	pending, ok = s.liveMFAState(mfaState, pending.flow)
 	if !ok {
-		return "", fmt.Errorf("unknown or expired mfa session")
+		return "", ErrMFAExpired
+	}
+	if pending.discordUserID != discordUserID {
+		return "", ErrMFAOwner
 	}
 	requestCtx, requestCancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(pending.flow.ctx, requestCancel)
@@ -331,28 +364,40 @@ func (s *Server) CompletePasswordMFA(ctx context.Context, mfaState, code string)
 	requestCancel()
 	pending, live := s.liveMFAState(mfaState, pending.flow)
 	if !live {
-		return "", fmt.Errorf("unknown or expired mfa session")
+		return "", ErrMFAExpired
 	}
 	if err != nil {
-		// Keep pending so the user can retry email / Riot Mobile codes.
+		if errors.Is(err, riot.ErrPasswordInvalidCode) {
+			// Riot has not consumed the challenge; the owner may retry a fresh code.
+			return "", err
+		}
+		// Transport and all other Riot failures are terminal because the remote
+		// challenge's retry safety is unknown.
+		if !s.consumeMFAState(mfaState, pending.flow) {
+			return "", ErrMFAExpired
+		}
+		pending.flow.cancel()
 		return "", err
 	}
 
 	// Atomically claim this one-time MFA state before linking. Any concurrent
 	// modal submission will observe the missing state after submitMu unlocks.
-	s.mu.Lock()
-	current, stillLive := s.mfaPending[mfaState]
-	stillLive = stillLive && current.flow == pending.flow && current.flow.ctx.Err() == nil &&
-		time.Now().Before(current.expiresAt)
-	if stillLive {
-		delete(s.mfaPending, mfaState)
+	if !s.consumeMFAState(mfaState, pending.flow) {
+		return "", ErrMFAExpired
 	}
-	s.mu.Unlock()
-	if !stillLive {
-		return "", fmt.Errorf("unknown or expired mfa session")
-	}
-	defer pending.flow.cancel()
+	pending.flow.cancel()
 	return s.completePasswordTokens(ctx, pending.discordUserID, tokens)
+}
+
+func (s *Server) consumeMFAState(mfaState string, flow *mfaFlow) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.mfaPending[mfaState]
+	if !ok || current.flow != flow || flow == nil || flow.ctx.Err() != nil || !time.Now().Before(current.expiresAt) {
+		return false
+	}
+	delete(s.mfaPending, mfaState)
+	return true
 }
 
 func (s *Server) beginMFAOperation(mfaState string) (mfaPending, func(), bool) {

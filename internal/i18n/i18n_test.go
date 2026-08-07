@@ -36,3 +36,38 @@ func TestCaptchaCopyDescribesButtonStartedChrome(t *testing.T) {
 		})
 	}
 }
+
+func TestMFAOwnerAndTerminalCopy(t *testing.T) {
+	tests := []struct {
+		lang     Lang
+		denied   string
+		expired  string
+		terminal string
+	}{
+		{
+			lang:     KO,
+			denied:   "이 인증 코드는 로그인 요청을 시작한 본인만 입력할 수 있습니다.",
+			expired:  "2차 인증 세션이 만료되었습니다. `/auth` 를 다시 실행해 주세요.",
+			terminal: "2차 인증에 실패했습니다: %v\n`/auth` 를 다시 실행해 주세요.",
+		},
+		{
+			lang:     EN,
+			denied:   "Only the user who started this login can enter its verification code.",
+			expired:  "The verification session expired. Run `/auth` again.",
+			terminal: "2FA failed: %v\nRun `/auth` again.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.lang), func(t *testing.T) {
+			if got := T(tt.lang, "auth.mfa.denied"); got != tt.denied {
+				t.Fatalf("denied = %q", got)
+			}
+			if got := T(tt.lang, "auth.mfa.expired"); got != tt.expired {
+				t.Fatalf("expired = %q", got)
+			}
+			if got := T(tt.lang, "auth.mfa.failed"); got != tt.terminal {
+				t.Fatalf("terminal = %q", got)
+			}
+		})
+	}
+}

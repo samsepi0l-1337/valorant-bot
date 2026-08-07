@@ -52,6 +52,7 @@ type fakePasswordAuth struct {
 	mfaCalls        atomic.Int32
 	mfaStarted      chan struct{}
 	mfaRelease      <-chan struct{}
+	mfaErr          error
 }
 
 type testCaptchaBrowserController struct {
@@ -538,12 +539,12 @@ func TestMFASubmissionIsSerializedAndSingleUse(t *testing.T) {
 	}
 	results := make(chan result, 2)
 	go func() {
-		display, submitErr := s.CompletePasswordMFA(context.Background(), mfaState, "123456")
+		display, submitErr := s.CompletePasswordMFA(context.Background(), mfaState, "owner-1", "123456")
 		results <- result{display: display, err: submitErr}
 	}()
 	<-mfaStarted
 	go func() {
-		display, submitErr := s.CompletePasswordMFA(context.Background(), mfaState, "123456")
+		display, submitErr := s.CompletePasswordMFA(context.Background(), mfaState, "owner-1", "123456")
 		results <- result{display: display, err: submitErr}
 	}()
 
@@ -582,6 +583,9 @@ func (f *fakePasswordAuth) SubmitMFA(ctx context.Context, challenge *riot.MFACha
 			return riot.PasswordTokens{}, ctx.Err()
 		}
 	}
+	if f.mfaErr != nil {
+		return riot.PasswordTokens{}, f.mfaErr
+	}
 	return f.tokens, nil
 }
 
@@ -608,6 +612,201 @@ func newCaptchaServer(pw *fakePasswordAuth) *Server {
 		return newTestCaptchaBrowserController(), nil
 	}
 	return s
+}
+
+func createMFAStateThroughCaptcha(t *testing.T, s *Server, discordUserID string) string {
+	t.Helper()
+	_, state, err := s.BeginPasswordLogin(context.Background(), discordUserID, "riot-user", "secret-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ensureCaptchaChallenge(context.Background(), state, testCaptchaBrowserSession()); err != nil {
+		t.Fatal(err)
+	}
+	req := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("captcha submit: %d %s", rec.Code, rec.Body.String())
+	}
+	_, mfaState, _, err := s.WaitPasswordLogin(context.Background(), state)
+	if err != nil || mfaState == "" {
+		t.Fatalf("MFA transition state=%q err=%v", mfaState, err)
+	}
+	return mfaState
+}
+
+func TestMFAOwnerValidation(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch:  riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
+		mfa: &riot.MFAChallenge{Email: "a***@ex.com", Method: "email"},
+	}
+	s := newCaptchaServer(pw)
+	mfaState := createMFAStateThroughCaptcha(t, s, "owner-1")
+
+	hint, err := s.ValidatePasswordMFA(mfaState, "owner-1")
+	if err != nil || hint != "a***@ex.com" {
+		t.Fatalf("owner validation hint=%q err=%v", hint, err)
+	}
+	if _, err := s.ValidatePasswordMFA(mfaState, "intruder-1"); !errors.Is(err, ErrMFAOwner) {
+		t.Fatalf("wrong-owner validation error=%v, want ErrMFAOwner", err)
+	}
+	if calls := pw.mfaCalls.Load(); calls != 0 {
+		t.Fatalf("owner validation reached Riot %d time(s)", calls)
+	}
+}
+
+func TestMFAOwnerSubmissionRejectsWrongUserBeforeRiot(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch:  riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
+		mfa: &riot.MFAChallenge{Email: "a***@ex.com", Method: "email"},
+	}
+	s := newCaptchaServer(pw)
+	mfaState := createMFAStateThroughCaptcha(t, s, "owner-1")
+
+	if _, err := s.CompletePasswordMFA(context.Background(), mfaState, "intruder-1", "123456"); !errors.Is(err, ErrMFAOwner) {
+		t.Fatalf("wrong-owner submission error=%v, want ErrMFAOwner", err)
+	}
+	if calls := pw.mfaCalls.Load(); calls != 0 {
+		t.Fatalf("wrong-owner submission reached Riot %d time(s)", calls)
+	}
+	if _, err := s.ValidatePasswordMFA(mfaState, "owner-1"); err != nil {
+		t.Fatalf("wrong-owner attempt consumed owner state: %v", err)
+	}
+}
+
+func TestMFASubmissionRejectsExpiredStateBeforeRiot(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch:  riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
+		mfa: &riot.MFAChallenge{Email: "a***@ex.com", Method: "email"},
+	}
+	s := newCaptchaServer(pw)
+	mfaState := createMFAStateThroughCaptcha(t, s, "owner-1")
+	s.mu.Lock()
+	pending := s.mfaPending[mfaState]
+	pending.expiresAt = time.Now().Add(-time.Second)
+	s.mfaPending[mfaState] = pending
+	s.mu.Unlock()
+
+	if _, err := s.CompletePasswordMFA(context.Background(), mfaState, "owner-1", "123456"); err == nil {
+		t.Fatal("expired MFA submission unexpectedly succeeded")
+	}
+	if calls := pw.mfaCalls.Load(); calls != 0 {
+		t.Fatalf("expired MFA submission reached Riot %d time(s)", calls)
+	}
+}
+
+func TestMFASubmissionInvalidCodeKeepsOwnerStateRetryable(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch:     riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
+		mfa:    &riot.MFAChallenge{Email: "a***@ex.com", Method: "email"},
+		mfaErr: fmt.Errorf("riot response: %w", riot.ErrPasswordInvalidCode),
+		tokens: riot.PasswordTokens{AccessToken: "at-1", IDToken: "id-1", SessionCookie: "ssid=s1"},
+	}
+	s := newCaptchaServer(pw)
+	mfaState := createMFAStateThroughCaptcha(t, s, "owner-1")
+
+	if _, err := s.CompletePasswordMFA(context.Background(), mfaState, "owner-1", "000000"); !errors.Is(err, riot.ErrPasswordInvalidCode) {
+		t.Fatalf("invalid-code error=%v, want ErrPasswordInvalidCode", err)
+	}
+	if _, err := s.ValidatePasswordMFA(mfaState, "owner-1"); err != nil {
+		t.Fatalf("invalid code consumed retry state: %v", err)
+	}
+	pw.mfaErr = nil
+	display, err := s.CompletePasswordMFA(context.Background(), mfaState, "owner-1", "123456")
+	if err != nil || display != "Player#KR1" {
+		t.Fatalf("owner retry display=%q err=%v", display, err)
+	}
+	if calls := pw.mfaCalls.Load(); calls != 2 {
+		t.Fatalf("Riot MFA calls=%d, want 2", calls)
+	}
+}
+
+func TestMFASubmissionTransportFailureConsumesState(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch:     riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
+		mfa:    &riot.MFAChallenge{Email: "a***@ex.com", Method: "email"},
+		mfaErr: errors.New("riot transport unavailable"),
+	}
+	s := newCaptchaServer(pw)
+	mfaState := createMFAStateThroughCaptcha(t, s, "owner-1")
+
+	if _, err := s.CompletePasswordMFA(context.Background(), mfaState, "owner-1", "123456"); err == nil {
+		t.Fatal("transport-failed MFA submission unexpectedly succeeded")
+	}
+	if _, err := s.ValidatePasswordMFA(mfaState, "owner-1"); !errors.Is(err, ErrMFAExpired) {
+		t.Fatalf("transport failure retained MFA state: %v", err)
+	}
+	if _, err := s.CompletePasswordMFA(context.Background(), mfaState, "owner-1", "123456"); !errors.Is(err, ErrMFAExpired) {
+		t.Fatalf("transport-failed MFA retry error=%v, want ErrMFAExpired", err)
+	}
+	if calls := pw.mfaCalls.Load(); calls != 1 {
+		t.Fatalf("transport retry reached Riot: calls=%d, want 1", calls)
+	}
+}
+
+type failingMFAStore struct {
+	*mockStore
+	err     error
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (s *failingMFAStore) UpsertRiotAccount(store.Account) error {
+	if s.started != nil {
+		s.started <- struct{}{}
+	}
+	if s.release != nil {
+		<-s.release
+	}
+	return s.err
+}
+
+func TestMFAPersistenceFailureConsumesState(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch:     riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
+		mfa:    &riot.MFAChallenge{Email: "a***@ex.com", Method: "email"},
+		tokens: riot.PasswordTokens{AccessToken: "at-1", IDToken: "id-1", SessionCookie: "ssid=s1"},
+	}
+	s := newCaptchaServer(pw)
+	persistErr := errors.New("sqlite write failed")
+	persistStarted := make(chan struct{}, 1)
+	persistRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	releasePersistence := func() { releaseOnce.Do(func() { close(persistRelease) }) }
+	defer releasePersistence()
+	s.store = &failingMFAStore{
+		mockStore: newMockStore(),
+		err:       persistErr,
+		started:   persistStarted,
+		release:   persistRelease,
+	}
+	mfaState := createMFAStateThroughCaptcha(t, s, "owner-1")
+
+	completed := make(chan error, 1)
+	go func() {
+		_, err := s.CompletePasswordMFA(context.Background(), mfaState, "owner-1", "123456")
+		completed <- err
+	}()
+	select {
+	case <-persistStarted:
+	case <-time.After(time.Second):
+		t.Fatal("MFA persistence did not start")
+	}
+	if _, err := s.ValidatePasswordMFA(mfaState, "owner-1"); !errors.Is(err, ErrMFAExpired) {
+		t.Fatalf("MFA state remained live after Riot success reached persistence: %v", err)
+	}
+	releasePersistence()
+	if err := <-completed; !errors.Is(err, persistErr) {
+		t.Fatalf("persistence error=%v, want %v", err, persistErr)
+	}
+	if _, err := s.CompletePasswordMFA(context.Background(), mfaState, "owner-1", "123456"); err == nil {
+		t.Fatal("consumed MFA state was retryable after persistence failure")
+	}
+	if calls := pw.mfaCalls.Load(); calls != 1 {
+		t.Fatalf("persistence retry reached Riot: calls=%d, want 1", calls)
+	}
 }
 
 func TestBeginPasswordLogin_DoesNotExposeLocalhostURL(t *testing.T) {
@@ -1886,7 +2085,7 @@ func TestWaitPasswordLoginOutcomeWinsConcurrentCancellationAndKeepsMFAUsable(t *
 		t.Fatalf("MFA continuation exists=%v count=%d value=%+v", continuationExists, mfaCount, continuation)
 	}
 
-	linkedDisplay, err := s.CompletePasswordMFA(context.Background(), wantMFAState, "123456")
+	linkedDisplay, err := s.CompletePasswordMFA(context.Background(), wantMFAState, "owner-1", "123456")
 	if err != nil || linkedDisplay != "Player#KR1" {
 		t.Fatalf("usable MFA continuation display=%q err=%v", linkedDisplay, err)
 	}
@@ -2430,6 +2629,50 @@ func TestCaptchaChallengeAndSubmit_MFA(t *testing.T) {
 	}
 }
 
+func TestCaptchaChallengeAndSubmit_MFAScrubsCredentialsBeforePublishing(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch: riot.CaptchaChallenge{
+			SessionID: "sess-1",
+			SiteKey:   "site-key",
+			RQData:    "rq-data",
+		},
+		mfa: &riot.MFAChallenge{Email: "a***@ex.com", Method: "email"},
+	}
+	s := newCaptchaServer(pw)
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "sensitive-user", "sensitive-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ensureCaptchaChallenge(context.Background(), state, testCaptchaBrowserSession()); err != nil {
+		t.Fatal(err)
+	}
+
+	req := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("captcha submit: %d %s", rec.Code, rec.Body.String())
+	}
+
+	s.mu.Lock()
+	pending, exists := s.passwordPending[state]
+	outcome := s.passwordOutcomes[state]
+	s.mu.Unlock()
+	if !exists || !outcome.done || outcome.mfaState == "" {
+		t.Fatalf("MFA publication pending=%v outcome=%+v", exists, outcome)
+	}
+	if pending.username != "" || pending.password != "" {
+		t.Fatalf("MFA publication retained credentials: username=%q passwordBytes=%d", pending.username, len(pending.password))
+	}
+
+	_, mfaState, _, err := s.WaitPasswordLogin(context.Background(), state)
+	if err != nil || mfaState != outcome.mfaState {
+		t.Fatalf("MFA wait state=%q err=%v", mfaState, err)
+	}
+	s.cleanupMFAState(mfaState)
+}
+
 func TestMFAPendingExpiresWithoutFurtherActivity(t *testing.T) {
 	pw := &fakePasswordAuth{
 		ch:  riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
@@ -2508,7 +2751,7 @@ func TestMFAExpiryCancelsInflightSubmitBeforeLink(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, submitErr := s.CompletePasswordMFA(context.Background(), mfaState, "123456")
+		_, submitErr := s.CompletePasswordMFA(context.Background(), mfaState, "discord-1", "123456")
 		done <- submitErr
 	}()
 	<-mfaStarted

@@ -168,9 +168,17 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 	}
 	if strings.HasPrefix(data.CustomID, customIDAuthMFAOpenPref) {
 		mfaState := strings.TrimPrefix(data.CustomID, customIDAuthMFAOpenPref)
+		hint, err := h.Auth.ValidatePasswordMFA(mfaState, userID)
+		if err != nil {
+			h.clearMFAHint(mfaState)
+			if rerr := respondEphemeral(s, i, mfaTerminalMessage(lang, err)); rerr != nil {
+				log.Printf("interaction: mfa validation response: %v", rerr)
+			}
+			return
+		}
 		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseModal,
-			Data: MFALoginModal(mfaState, h.mfaHintFor(mfaState), lang),
+			Data: MFALoginModal(mfaState, hint, lang),
 		}); err != nil {
 			log.Printf("interaction: mfa modal: %v", err)
 		}
@@ -319,7 +327,7 @@ func (h *Handlers) onModal(s *discordgo.Session, i *discordgo.InteractionCreate)
 		}
 	case strings.HasPrefix(data.CustomID, customIDAuthMFAPref):
 		mfaState := strings.TrimPrefix(data.CustomID, customIDAuthMFAPref)
-		resp, err := h.HandlePasswordMFA(ctx, mfaState, modalValue(data, "code"), lang)
+		resp, err := h.HandlePasswordMFA(ctx, mfaState, userID, modalValue(data, "code"), lang)
 		if err != nil {
 			_ = respondEphemeral(s, i, i18n.T(lang, "error.prefix")+err.Error())
 			return

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"io"
 	"net/http"
@@ -14,6 +15,9 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/dosfsociety/valorant-bot/internal/authweb"
+	"github.com/dosfsociety/valorant-bot/internal/i18n"
+	"github.com/dosfsociety/valorant-bot/internal/riot"
 )
 
 type acknowledgementCheckingAuth struct {
@@ -34,6 +38,90 @@ type passwordButtonAuth struct {
 	waitStarted chan<- struct{}
 	waitRelease <-chan struct{}
 	waitDone    chan<- struct{}
+}
+
+type mfaInteractionAuth struct {
+	validateState string
+	validateUser  string
+	validateHint  string
+	validateErr   error
+	completeState string
+	completeUser  string
+	completeCode  string
+	completeErr   error
+}
+
+func (*mfaInteractionAuth) BeginQRAuth(context.Context, string) (string, string, error) {
+	return "", "", nil
+}
+
+func (*mfaInteractionAuth) WaitQRLogin(context.Context, string) (string, error) {
+	return "", nil
+}
+
+func (*mfaInteractionAuth) BeginPasswordLogin(context.Context, string, string, string) (string, string, error) {
+	return "", "", nil
+}
+
+func (*mfaInteractionAuth) LaunchPasswordCaptcha(context.Context, string, string) error {
+	return nil
+}
+
+func (*mfaInteractionAuth) WaitPasswordLogin(context.Context, string) (string, string, string, error) {
+	return "", "", "", nil
+}
+
+func (a *mfaInteractionAuth) ValidatePasswordMFA(mfaState, discordUserID string) (string, error) {
+	a.validateState = mfaState
+	a.validateUser = discordUserID
+	return a.validateHint, a.validateErr
+}
+
+func (a *mfaInteractionAuth) CompletePasswordMFA(_ context.Context, mfaState, discordUserID, code string) (string, error) {
+	a.completeState = mfaState
+	a.completeUser = discordUserID
+	a.completeCode = code
+	return "", a.completeErr
+}
+
+type capturedInteractionResponse struct {
+	Type discordgo.InteractionResponseType `json:"type"`
+	Data struct {
+		Content    string                 `json:"content"`
+		CustomID   string                 `json:"custom_id"`
+		Flags      discordgo.MessageFlags `json:"flags"`
+		Components []json.RawMessage      `json:"components"`
+	} `json:"data"`
+}
+
+func newInteractionResponseCapture(t *testing.T) (*discordgo.Session, <-chan capturedInteractionResponse) {
+	t.Helper()
+	responses := make(chan capturedInteractionResponse, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/callback" {
+			http.NotFound(w, r)
+			return
+		}
+		var response capturedInteractionResponse
+		if err := json.NewDecoder(r.Body).Decode(&response); err != nil {
+			t.Errorf("decode callback: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		responses <- response
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	originalCallbackEndpoint := discordgo.EndpointInteractionResponse
+	discordgo.EndpointInteractionResponse = func(_, _ string) string { return srv.URL + "/callback" }
+	t.Cleanup(func() { discordgo.EndpointInteractionResponse = originalCallbackEndpoint })
+
+	session, err := discordgo.New("Bot test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session, responses
 }
 
 func (*passwordButtonAuth) BeginQRAuth(context.Context, string) (string, string, error) {
@@ -65,7 +153,11 @@ func (a *passwordButtonAuth) WaitPasswordLogin(context.Context, string) (string,
 	return "", "", "", context.Canceled
 }
 
-func (*passwordButtonAuth) CompletePasswordMFA(context.Context, string, string) (string, error) {
+func (*passwordButtonAuth) ValidatePasswordMFA(string, string) (string, error) {
+	return "", nil
+}
+
+func (*passwordButtonAuth) CompletePasswordMFA(context.Context, string, string, string) (string, error) {
 	return "", nil
 }
 
@@ -110,8 +202,115 @@ func (a *acknowledgementCheckingAuth) WaitPasswordLogin(context.Context, string)
 	return "", "", "", context.Canceled
 }
 
-func (*acknowledgementCheckingAuth) CompletePasswordMFA(context.Context, string, string) (string, error) {
+func (*acknowledgementCheckingAuth) ValidatePasswordMFA(string, string) (string, error) {
 	return "", nil
+}
+
+func (*acknowledgementCheckingAuth) CompletePasswordMFA(context.Context, string, string, string) (string, error) {
+	return "", nil
+}
+
+func TestMFAOpenComponentPassesOwnerToValidation(t *testing.T) {
+	session, responses := newInteractionResponseCapture(t)
+	auth := &mfaInteractionAuth{validateHint: "a***@example.com"}
+	h := &Handlers{Auth: auth}
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-mfa-open",
+		AppID: "application-1",
+		Token: "token-mfa-open",
+		Type:  discordgo.InteractionMessageComponent,
+		Data: discordgo.MessageComponentInteractionData{
+			CustomID: customIDAuthMFAOpenPref + "mfa-state-1",
+		},
+		User: &discordgo.User{ID: "owner-1"},
+	}}
+
+	h.onComponent(session, interaction)
+	response := <-responses
+	if auth.validateState != "mfa-state-1" || auth.validateUser != "owner-1" {
+		t.Fatalf("MFA validation got state=%q user=%q", auth.validateState, auth.validateUser)
+	}
+	if response.Type != discordgo.InteractionResponseModal || response.Data.CustomID != customIDAuthMFAPref+"mfa-state-1" {
+		t.Fatalf("MFA open response=%+v", response)
+	}
+}
+
+func TestMFAOpenComponentWrongOwnerIsEphemeralAndLocalized(t *testing.T) {
+	session, responses := newInteractionResponseCapture(t)
+	auth := &mfaInteractionAuth{validateErr: authweb.ErrMFAOwner}
+	h := &Handlers{Auth: auth}
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-mfa-intruder",
+		AppID: "application-1",
+		Token: "token-mfa-intruder",
+		Type:  discordgo.InteractionMessageComponent,
+		Data: discordgo.MessageComponentInteractionData{
+			CustomID: customIDAuthMFAOpenPref + "mfa-state-1",
+		},
+		User: &discordgo.User{ID: "intruder-1"},
+	}}
+
+	h.onComponent(session, interaction)
+	response := <-responses
+	if auth.validateUser != "intruder-1" {
+		t.Fatalf("MFA validation user=%q, want intruder-1", auth.validateUser)
+	}
+	if response.Type != discordgo.InteractionResponseChannelMessageWithSource ||
+		response.Data.Flags&discordgo.MessageFlagsEphemeral == 0 {
+		t.Fatalf("wrong-owner MFA response=%+v", response)
+	}
+	if response.Data.Content != i18n.T(i18n.KO, "auth.mfa.denied") {
+		t.Fatalf("wrong-owner content=%q", response.Data.Content)
+	}
+}
+
+func TestMFAModalSubmitPassesOwnerAndKeepsInvalidCodeRetry(t *testing.T) {
+	session, responses := newInteractionResponseCapture(t)
+	auth := &mfaInteractionAuth{completeErr: fmt.Errorf("riot response: %w", riot.ErrPasswordInvalidCode)}
+	h := &Handlers{Auth: auth}
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-mfa-submit",
+		AppID: "application-1",
+		Token: "token-mfa-submit",
+		Type:  discordgo.InteractionModalSubmit,
+		Data: discordgo.ModalSubmitInteractionData{
+			CustomID: customIDAuthMFAPref + "mfa-state-1",
+			Components: []discordgo.MessageComponent{discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+				discordgo.TextInput{CustomID: "code", Value: "000000"},
+			}}},
+		},
+		User: &discordgo.User{ID: "owner-1"},
+	}}
+
+	h.onModal(session, interaction)
+	response := <-responses
+	if auth.completeState != "mfa-state-1" || auth.completeUser != "owner-1" || auth.completeCode != "000000" {
+		t.Fatalf("MFA submit got state=%q user=%q code=%q", auth.completeState, auth.completeUser, auth.completeCode)
+	}
+	if response.Type != discordgo.InteractionResponseChannelMessageWithSource ||
+		response.Data.Flags&discordgo.MessageFlagsEphemeral == 0 || len(response.Data.Components) == 0 {
+		t.Fatalf("invalid-code MFA response=%+v", response)
+	}
+	if response.Data.Content != i18n.T(i18n.KO, "auth.mfa.invalid") {
+		t.Fatalf("invalid-code content=%q", response.Data.Content)
+	}
+}
+
+func TestMFATerminalFailureClearsCachedHint(t *testing.T) {
+	auth := &mfaInteractionAuth{completeErr: errors.New("identity lookup failed")}
+	h := &Handlers{Auth: auth}
+	h.rememberMFAHint("mfa-state-1", "a***@example.com")
+
+	response, err := h.HandlePasswordMFA(context.Background(), "mfa-state-1", "owner-1", "123456", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := h.mfaHintFor("mfa-state-1"); got != "" {
+		t.Fatalf("terminal MFA failure retained cached hint %q", got)
+	}
+	if len(response.Components) != 0 {
+		t.Fatalf("terminal MFA failure exposed retry controls: %#v", response.Components)
+	}
 }
 
 func TestAuthQRComponent_AcknowledgesThenEditsWithMappedAttachment(t *testing.T) {

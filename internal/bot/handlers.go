@@ -337,24 +337,37 @@ func (h *Handlers) HandlePasswordCaptchaComplete(display, mfaState, mfaHint stri
 	}
 }
 
+func mfaTerminalMessage(lang i18n.Lang, err error) string {
+	switch {
+	case errors.Is(err, authweb.ErrMFAOwner):
+		return i18n.T(lang, "auth.mfa.denied")
+	case errors.Is(err, authweb.ErrMFAExpired):
+		return i18n.T(lang, "auth.mfa.expired")
+	default:
+		return fmt.Sprintf(i18n.T(lang, "auth.mfa.failed"), err)
+	}
+}
+
 // HandlePasswordMFA is step 2: submit email or authenticator OTP.
-func (h *Handlers) HandlePasswordMFA(ctx context.Context, mfaState, code string, lang i18n.Lang) (Response, error) {
+func (h *Handlers) HandlePasswordMFA(ctx context.Context, mfaState, discordUserID, code string, lang i18n.Lang) (Response, error) {
 	if h.Auth == nil {
 		return Response{}, fmt.Errorf("auth not configured")
 	}
-	display, err := h.Auth.CompletePasswordMFA(ctx, mfaState, code)
+	display, err := h.Auth.CompletePasswordMFA(ctx, mfaState, discordUserID, code)
 	if err != nil {
-		msg := i18n.T(lang, "auth.mfa.invalid")
-		errText := strings.ToLower(err.Error())
-		if !strings.Contains(errText, "invalid multifactor") &&
-			!strings.Contains(errText, "invalid_code") &&
-			!strings.Contains(errText, "invalid riot username") {
-			msg = fmt.Sprintf(i18n.T(lang, "auth.mfa.failed"), err)
+		if errors.Is(err, riot.ErrPasswordInvalidCode) {
+			return Response{
+				Ephemeral:  true,
+				Content:    i18n.T(lang, "auth.mfa.invalid"),
+				Components: mfaRetryComponents(mfaState, lang),
+			}, nil
 		}
+		h.clearMFAHint(mfaState)
 		return Response{
 			Ephemeral:  true,
-			Content:    msg,
-			Components: mfaRetryComponents(mfaState, lang),
+			Content:    mfaTerminalMessage(lang, err),
+			Embeds:     []*discordgo.MessageEmbed{},
+			Components: []discordgo.MessageComponent{},
 		}, nil
 	}
 	h.clearMFAHint(mfaState)

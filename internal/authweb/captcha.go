@@ -317,6 +317,7 @@ func (s *Server) finishPasswordMFA(state string, pending passwordPending, mfaSta
 	if err := s.claimPasswordFinalization(state, flow); err != nil {
 		return passwordOutcome{}, err
 	}
+	scrubPasswordCredentials(&pending)
 	closeErr := s.closeOwnedCaptchaBrowser(flow)
 	if captchaBrowserMayBeRunning(closeErr) {
 		out := passwordOutcome{err: fmt.Errorf("captcha Chrome could not be closed: %w", closeErr)}
