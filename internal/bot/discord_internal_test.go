@@ -1,0 +1,181 @@
+package bot
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"image"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
+	"testing"
+
+	"github.com/bwmarrin/discordgo"
+)
+
+type acknowledgementCheckingAuth struct {
+	acknowledged   *atomic.Bool
+	beginBeforeACK atomic.Bool
+}
+
+func (a *acknowledgementCheckingAuth) BeginQRAuth(context.Context, string) (string, string, error) {
+	if !a.acknowledged.Load() {
+		a.beginBeforeACK.Store(true)
+	}
+	return "https://qrlogin.riotgames.com/riotmobile?suuid=s1", "", nil
+}
+
+func (*acknowledgementCheckingAuth) WaitQRLogin(context.Context, string) (string, error) {
+	return "", nil
+}
+
+func (*acknowledgementCheckingAuth) BeginPasswordLogin(context.Context, string, string, string) (string, string, error) {
+	return "", "", nil
+}
+
+func (*acknowledgementCheckingAuth) LaunchPasswordCaptcha(context.Context, string, string) error {
+	return nil
+}
+
+func (*acknowledgementCheckingAuth) WaitPasswordLogin(context.Context, string) (string, string, string, error) {
+	return "", "", "", nil
+}
+
+func (*acknowledgementCheckingAuth) CompletePasswordMFA(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+func TestAuthQRComponent_AcknowledgesThenEditsWithMappedAttachment(t *testing.T) {
+	type attachment struct {
+		ID       string `json:"id"`
+		Filename string `json:"filename"`
+	}
+	type editPayload struct {
+		Attachments []attachment              `json:"attachments"`
+		Components  []map[string]any          `json:"components"`
+		Embeds      []*discordgo.MessageEmbed `json:"embeds"`
+	}
+
+	var (
+		acknowledged atomic.Bool
+		callbackType atomic.Int64
+		gotEdit      editPayload
+		gotFileName  string
+		gotFileBody  []byte
+		editCalls    atomic.Int64
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/callback":
+			var response discordgo.InteractionResponse
+			if err := json.NewDecoder(r.Body).Decode(&response); err != nil {
+				t.Errorf("decode callback: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			callbackType.Store(int64(response.Type))
+			if response.Type == discordgo.InteractionResponseDeferredMessageUpdate {
+				acknowledged.Store(true)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case "/original":
+			editCalls.Add(1)
+			reader, err := r.MultipartReader()
+			if err != nil {
+				t.Errorf("MultipartReader: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			for {
+				part, err := reader.NextPart()
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					t.Errorf("NextPart: %v", err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				body, err := io.ReadAll(part)
+				if err != nil {
+					t.Errorf("ReadAll(%s): %v", part.FormName(), err)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				switch part.FormName() {
+				case "payload_json":
+					if err := json.Unmarshal(body, &gotEdit); err != nil {
+						t.Errorf("payload_json: %v", err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+				case "files[0]":
+					gotFileName = part.FileName()
+					gotFileBody = body
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	originalCallbackEndpoint := discordgo.EndpointInteractionResponse
+	originalWebhookEndpoint := discordgo.EndpointWebhookMessage
+	discordgo.EndpointInteractionResponse = func(_, _ string) string { return srv.URL + "/callback" }
+	discordgo.EndpointWebhookMessage = func(_, _, _ string) string { return srv.URL + "/original" }
+	t.Cleanup(func() {
+		discordgo.EndpointInteractionResponse = originalCallbackEndpoint
+		discordgo.EndpointWebhookMessage = originalWebhookEndpoint
+	})
+
+	session, err := discordgo.New("Bot test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := &acknowledgementCheckingAuth{acknowledged: &acknowledged}
+	h := &Handlers{Auth: auth}
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-1",
+		AppID: "application-1",
+		Token: "token-1",
+		Type:  discordgo.InteractionMessageComponent,
+		Data: discordgo.MessageComponentInteractionData{
+			CustomID: customIDAuthQR,
+		},
+		User: &discordgo.User{ID: "discord-1"},
+	}}
+
+	h.onComponent(session, interaction)
+
+	if auth.beginBeforeACK.Load() {
+		t.Error("BeginQRAuth ran before Discord acknowledged the component interaction")
+	}
+	if got := discordgo.InteractionResponseType(callbackType.Load()); got != discordgo.InteractionResponseDeferredMessageUpdate {
+		t.Fatalf("callback type = %d, want deferred message update (%d)", got, discordgo.InteractionResponseDeferredMessageUpdate)
+	}
+	if editCalls.Load() != 1 {
+		t.Fatalf("original-message edit calls = %d, want 1", editCalls.Load())
+	}
+	if len(gotEdit.Attachments) != 1 {
+		t.Fatalf("attachments = %#v, want one multipart attachment mapping", gotEdit.Attachments)
+	}
+	if got := gotEdit.Attachments[0]; got.ID != "0" || got.Filename != "riot-qr.png" {
+		t.Fatalf("attachment = %#v, want id=0 filename=riot-qr.png", got)
+	}
+	if gotFileName != "riot-qr.png" || len(gotFileBody) == 0 {
+		t.Fatalf("files[0] = (%q, %d bytes), want non-empty riot-qr.png", gotFileName, len(gotFileBody))
+	}
+	if len(gotEdit.Embeds) != 1 || gotEdit.Embeds[0].Image == nil || gotEdit.Embeds[0].Image.URL != "attachment://riot-qr.png" {
+		t.Fatalf("QR embed = %#v", gotEdit.Embeds)
+	}
+	if len(gotEdit.Components) != 1 {
+		t.Fatalf("components = %#v, want Riot Mobile link button", gotEdit.Components)
+	}
+	if _, format, err := image.Decode(bytes.NewReader(gotFileBody)); err != nil || format != "png" {
+		t.Fatalf("QR upload is not a decodable PNG: format=%q err=%v", format, err)
+	}
+}

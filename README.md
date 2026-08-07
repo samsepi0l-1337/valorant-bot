@@ -137,6 +137,15 @@ Discord에서 `/auth`를 실행한 뒤 원하는 방식을 선택합니다.
   이메일 또는 인증 앱 코드를 입력합니다.
 
 QR은 약 3분 후 만료됩니다. 여러 Riot 계정은 `/auth`를 계정마다 반복하면 됩니다.
+QR 방식은 봇 서버가 Riot 세션 생성·승인 폴링·토큰 교환을 모두 수행하고 휴대폰은
+Riot Mobile에서 승인만 합니다. 토큰 응답 안의 `http://localhost/redirect`는 Riot
+Client에 등록된 결과 URI를 파싱하기 위한 값일 뿐 브라우저가 열거나 접속하지 않으므로,
+원격 서버도 Riot/Discord로 나가는 연결만 있으면 됩니다.
+
+Riot의 공식 제3자 인증인 [RSO](https://developer.riotgames.com/docs/valorant)는 승인된
+Production 애플리케이션과 RSO Client가 필요합니다. 공개 VALORANT API에는 개인 일일
+상점 조회가 없어 현재 상점 세션을 그대로 대체할 수 없으므로, 이 봇은 QR 승인을
+서버 측에서 교환하는 방식을 사용합니다.
 
 ---
 

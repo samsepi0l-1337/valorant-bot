@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -175,17 +176,38 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 		}
 		return
 	}
+	if data.CustomID == customIDAuthQR {
+		if err := deferComponentUpdate(s, i); err != nil {
+			log.Printf("interaction: defer qr component: %v", err)
+			return
+		}
+		resp, qrState, err := h.HandleAuthQR(context.Background(), userID, lang)
+		if err != nil {
+			log.Printf("interaction: qr component error: %v", err)
+			if rerr := editInteraction(s, i, Response{
+				Content:    i18n.T(lang, "error.prefix") + err.Error(),
+				Embeds:     []*discordgo.MessageEmbed{},
+				Components: []discordgo.MessageComponent{},
+			}); rerr != nil {
+				log.Printf("interaction: qr component error edit failed: %v", rerr)
+			}
+			return
+		}
+		if rerr := editInteractionWithFiles(s, i, resp); rerr != nil {
+			log.Printf("interaction: qr component edit failed: %v", rerr)
+		}
+		if qrState != "" {
+			go h.watchQRLogin(s, i, qrState, lang)
+		}
+		return
+	}
 
 	var (
 		resp           Response
 		err            error
 		keepComponents bool
-		qrState        string
 	)
 	switch {
-	case data.CustomID == customIDAuthQR:
-		resp, qrState, err = h.HandleAuthQR(context.Background(), userID, lang)
-		keepComponents = true
 	case strings.HasPrefix(data.CustomID, customIDAuthCaptchaPref):
 		state := strings.TrimPrefix(data.CustomID, customIDAuthCaptchaPref)
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -256,15 +278,6 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 	}
 	if !keepComponents {
 		resp.Components = []discordgo.MessageComponent{}
-	}
-	if data.CustomID == customIDAuthQR {
-		if rerr := updateComponentMessageWithFiles(s, i, resp); rerr != nil {
-			log.Printf("interaction: qr component update failed: %v", rerr)
-		}
-		if qrState != "" {
-			go h.watchQRLogin(s, i, qrState, lang)
-		}
-		return
 	}
 	if rerr := updateComponentMessage(s, i, resp); rerr != nil {
 		log.Printf("interaction: component update failed: %v", rerr)
@@ -390,20 +403,38 @@ func updateComponentMessage(s *discordgo.Session, i *discordgo.InteractionCreate
 	})
 }
 
-func updateComponentMessageWithFiles(s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
+func deferComponentUpdate(s *discordgo.Session, i *discordgo.InteractionCreate) error {
+	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredMessageUpdate,
+	})
+}
+
+func editInteractionWithFiles(s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
 	components := resp.Components
 	if components == nil {
 		components = []discordgo.MessageComponent{}
 	}
-	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
-		Type: discordgo.InteractionResponseUpdateMessage,
-		Data: &discordgo.InteractionResponseData{
-			Content:    resp.Content,
-			Embeds:     resp.Embeds,
-			Components: components,
-			Files:      resp.Files,
-		},
+	content := resp.Content
+	embeds := resp.Embeds
+	_, err := s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Content:     &content,
+		Embeds:      &embeds,
+		Components:  &components,
+		Files:       resp.Files,
+		Attachments: attachmentsForFiles(resp.Files),
 	})
+	return err
+}
+
+func attachmentsForFiles(files []*discordgo.File) *[]*discordgo.MessageAttachment {
+	attachments := make([]*discordgo.MessageAttachment, 0, len(files))
+	for i, file := range files {
+		attachments = append(attachments, &discordgo.MessageAttachment{
+			ID:       strconv.Itoa(i),
+			Filename: file.Name,
+		})
+	}
+	return &attachments
 }
 
 func derefEmbeds(p *[]*discordgo.MessageEmbed) []*discordgo.MessageEmbed {
