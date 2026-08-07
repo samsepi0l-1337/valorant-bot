@@ -18,16 +18,18 @@ import (
 var ErrCaptchaOwner = errors.New("only the login owner can open this captcha")
 
 type passwordPending struct {
-	discordUserID string
-	username      string
-	password      string
-	sessionID     string
-	siteKey       string
-	rqData        string
-	challengeVer  uint64
-	challengeWait chan struct{}
-	flow          *passwordFlow
-	expiresAt     time.Time
+	discordUserID  string
+	username       string
+	password       string
+	sessionID      string
+	siteKey        string
+	rqData         string
+	challengeVer   uint64
+	challengeWait  chan struct{}
+	browserUA      string
+	browserCookies []*http.Cookie
+	flow           *passwordFlow
+	expiresAt      time.Time
 }
 
 type passwordFlow struct {
@@ -87,28 +89,21 @@ func (s *Server) BeginPasswordLogin(ctx context.Context, discordUserID, username
 	s.mu.Unlock()
 	go s.expirePasswordState(state)
 
-	// Prefetch the single Riot session and open Chrome in the background so the
-	// Discord modal can be acknowledged without waiting on Riot/network startup.
+	// Open Chrome without creating a Riot session first. The challenge request
+	// from that exact browser supplies the User-Agent used for the whole flow.
 	go func() {
 		defer flow.wg.Done()
-		s.prepareCaptchaSession(state)
+		s.prepareCaptchaPage(state)
 	}()
 
 	return "", state, nil
 }
 
-func (s *Server) prepareCaptchaSession(state string) {
+func (s *Server) prepareCaptchaPage(state string) {
 	s.mu.Lock()
 	pending, ok := s.passwordPending[state]
 	s.mu.Unlock()
 	if !ok || pending.flow == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(pending.flow.ctx, 40*time.Second)
-	defer cancel()
-	if _, err := s.ensureCaptchaChallenge(ctx, state); err != nil {
-		log.Printf("captcha prefetch state=%s: %v", state, err)
-		s.setPasswordOutcome(state, passwordOutcome{err: err})
 		return
 	}
 	if err := s.waitCaptchaTLS(3 * time.Second); err != nil {
@@ -134,9 +129,6 @@ func (s *Server) LaunchPasswordCaptcha(ctx context.Context, state, discordUserID
 	defer done()
 	if pending.discordUserID != discordUserID {
 		return ErrCaptchaOwner
-	}
-	if _, err := s.ensureCaptchaChallenge(ctx, state); err != nil {
-		return err
 	}
 	if err := s.waitCaptchaTLS(3 * time.Second); err != nil {
 		return err
@@ -258,7 +250,11 @@ func (s *Server) expirePasswordState(state string) {
 	}
 }
 
-func (s *Server) ensureCaptchaChallenge(ctx context.Context, state string) (passwordPending, error) {
+func (s *Server) ensureCaptchaChallenge(ctx context.Context, state string, browser riot.CaptchaBrowserSession) (passwordPending, error) {
+	browser.UserAgent = strings.TrimSpace(browser.UserAgent)
+	if browser.UserAgent == "" {
+		return passwordPending{}, fmt.Errorf("captcha browser user-agent missing")
+	}
 	for {
 		s.mu.Lock()
 		pending, ok := s.passwordPending[state]
@@ -267,6 +263,10 @@ func (s *Server) ensureCaptchaChallenge(ctx context.Context, state string) (pass
 			return passwordPending{}, fmt.Errorf("captcha session expired; run /auth again")
 		}
 		if pending.sessionID != "" && pending.siteKey != "" && pending.rqData != "" {
+			if pending.browserUA != browser.UserAgent {
+				s.mu.Unlock()
+				return passwordPending{}, fmt.Errorf("%w: captcha browser identity changed", riot.ErrCaptchaSession)
+			}
 			s.mu.Unlock()
 			return pending, nil
 		}
@@ -292,7 +292,7 @@ func (s *Server) ensureCaptchaChallenge(ctx context.Context, state string) (pass
 		s.mu.Unlock()
 
 		beginCtx, cancel := passwordOperationContext(ctx, pending.flow)
-		ch, err := s.passwordAuth.BeginCaptcha(beginCtx, pending.username, pending.password)
+		ch, err := s.passwordAuth.BeginCaptcha(beginCtx, pending.username, pending.password, browser)
 		cancel()
 
 		s.mu.Lock()
@@ -304,6 +304,8 @@ func (s *Server) ensureCaptchaChallenge(ctx context.Context, state string) (pass
 				cur.siteKey = ch.SiteKey
 				cur.rqData = ch.RQData
 				cur.challengeVer++
+				cur.browserUA = browser.UserAgent
+				cur.browserCookies = cloneHTTPCookies(ch.BrowserCookies)
 				cur.expiresAt = time.Now().Add(s.pendingTTL)
 			}
 			s.passwordPending[state] = cur
@@ -355,6 +357,11 @@ func (s *Server) handleCaptchaWidgetPage(w http.ResponseWriter, r *http.Request)
 func (s *Server) handleCaptchaChallenge(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
+	if !captchaRiotHost(r.Host) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": "captcha must use " + RiotCaptchaHost})
+		return
+	}
 	state := strings.TrimSpace(r.URL.Query().Get("state"))
 	_, done, ok := s.beginPasswordOperation(state)
 	if !ok {
@@ -366,13 +373,14 @@ func (s *Server) handleCaptchaChallenge(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 
-	pending, err := s.ensureCaptchaChallenge(ctx, state)
+	pending, err := s.ensureCaptchaChallenge(ctx, state, captchaBrowserSession(r))
 	if err != nil {
 		log.Printf("captcha challenge state=%s: %v", state, err)
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
+	writeCaptchaBrowserCookies(w, pending.browserCookies)
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"ok":      true,
 		"sitekey": pending.siteKey,
@@ -383,8 +391,12 @@ func (s *Server) handleCaptchaChallenge(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	if !captchaRiotHost(r.Host) || r.Header.Get("Origin") != "https://"+r.Host {
+		http.Error(w, `{"ok":false,"error":"invalid captcha origin"}`, http.StatusForbidden)
+		return
+	}
 	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Origin", "https://"+r.Host)
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		w.WriteHeader(http.StatusNoContent)
@@ -426,6 +438,7 @@ func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	pending = current
 	if req.Version != pending.challengeVer {
+		writeCaptchaBrowserCookies(w, pending.browserCookies)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"ok":      false,
 			"retry":   true,
@@ -442,7 +455,7 @@ func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := passwordOperationContext(requestCtx, pending.flow)
 	defer cancel()
 
-	tokens, challenge, err := s.passwordAuth.CompleteCaptcha(ctx, pending.sessionID, req.Token)
+	tokens, challenge, err := s.passwordAuth.CompleteCaptcha(ctx, pending.sessionID, req.Token, captchaBrowserSession(r))
 	current, live = s.livePasswordState(req.State, pending.sessionID)
 	if !live {
 		s.passwordAuth.CancelCaptcha(pending.sessionID)
@@ -465,9 +478,11 @@ func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 			p.siteKey = retry.SiteKey
 			p.rqData = retry.RQData
 			p.challengeVer++
+			p.browserCookies = cloneHTTPCookies(retry.BrowserCookies)
 			p.expiresAt = time.Now().Add(s.pendingTTL)
 			s.passwordPending[req.State] = p
 			s.mu.Unlock()
+			writeCaptchaBrowserCookies(w, retry.BrowserCookies)
 			log.Printf("captcha retry state=%s reason=%s", req.State, retry.Reason)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"ok":      false,
@@ -480,18 +495,23 @@ func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if errors.Is(err, riot.ErrCaptchaSession) {
+			s.passwordAuth.CancelCaptcha(pending.sessionID)
+			writeCaptchaBrowserCookieClears(w, r.Cookies())
 			s.mu.Lock()
 			if p, ok := s.passwordPending[req.State]; ok && p.flow == pending.flow && p.sessionID == pending.sessionID {
 				p.sessionID = ""
 				p.siteKey = ""
 				p.rqData = ""
+				p.browserUA = ""
+				p.browserCookies = nil
 				p.challengeVer++
 				s.passwordPending[req.State] = p
 			}
 			s.mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"ok":    false,
-				"error": "captcha session expired; reload this page",
+				"ok":     false,
+				"reload": true,
+				"error":  "captcha session expired; loading a fresh challenge",
 			})
 			return
 		}
@@ -538,6 +558,71 @@ func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 	}
 	s.setPasswordOutcome(req.State, passwordOutcome{display: display})
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mfa": false, "display": display})
+}
+
+func captchaRiotHost(rawHost string) bool {
+	host := strings.ToLower(strings.TrimSpace(rawHost))
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	return host == RiotCaptchaHost
+}
+
+func captchaBrowserSession(r *http.Request) riot.CaptchaBrowserSession {
+	cookies := make(map[string]string)
+	for _, cookie := range r.Cookies() {
+		cookies[cookie.Name] = cookie.Value
+	}
+	return riot.CaptchaBrowserSession{
+		UserAgent: strings.TrimSpace(r.UserAgent()),
+		Cookies:   cookies,
+	}
+}
+
+func writeCaptchaBrowserCookies(w http.ResponseWriter, cookies []*http.Cookie) {
+	for _, cookie := range cookies {
+		if cookie == nil {
+			continue
+		}
+		clone := *cookie
+		http.SetCookie(w, &clone)
+	}
+}
+
+func writeCaptchaBrowserCookieClears(w http.ResponseWriter, cookies []*http.Cookie) {
+	seen := make(map[string]struct{})
+	for _, cookie := range cookies {
+		if cookie == nil || cookie.Name == "" {
+			continue
+		}
+		if _, ok := seen[cookie.Name]; ok {
+			continue
+		}
+		seen[cookie.Name] = struct{}{}
+		for _, domain := range []string{"", "riotgames.com"} {
+			http.SetCookie(w, &http.Cookie{
+				Name:     cookie.Name,
+				Value:    "",
+				Domain:   domain,
+				Path:     "/",
+				MaxAge:   -1,
+				Secure:   true,
+				HttpOnly: true,
+			})
+		}
+	}
+}
+
+func cloneHTTPCookies(cookies []*http.Cookie) []*http.Cookie {
+	out := make([]*http.Cookie, 0, len(cookies))
+	for _, cookie := range cookies {
+		if cookie == nil {
+			continue
+		}
+		clone := *cookie
+		out = append(out, &clone)
+	}
+	return out
 }
 
 func formatMFAHint(challenge *riot.MFAChallenge) string {
@@ -736,8 +821,12 @@ async function onSolved(token) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ state: state, token: token, version: challengeVersion }),
     });
-    const data = await res.json().catch(() => ({}));
-    if (data && data.retry) {
+		const data = await res.json().catch(() => ({}));
+		if (data && data.reload) {
+			await refreshCaptchaChallenge();
+			return;
+		}
+		if (data && data.retry) {
       sitekey = data.sitekey || sitekey;
       rqdata = data.rqdata || rqdata;
       challengeVersion = Number(data.version || challengeVersion);

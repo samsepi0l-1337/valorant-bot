@@ -1,8 +1,10 @@
 package authweb
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/user"
@@ -111,7 +113,7 @@ func chromeFlags(widgetURL string) ([]string, error) {
 	)
 	// Only map the current authenticator origin. Mapping auth.riotgames.com
 	// would mint a token for Riot's legacy OAuth host and get it rejected.
-	dataDir, err := chromeUserDataDir()
+	dataDir, err := chromeUserDataDir(widgetURL)
 	if err != nil {
 		return nil, err
 	}
@@ -120,6 +122,7 @@ func chromeFlags(widgetURL string) ([]string, error) {
 		"--no-first-run",
 		"--no-default-browser-check",
 		"--new-window",
+		"--incognito",
 		"--host-resolver-rules=" + hostRules,
 		"--ignore-certificate-errors",
 		"--allow-insecure-localhost",
@@ -140,11 +143,37 @@ func chromeLaunchSpec(widgetURL string) (bin string, args []string, err error) {
 	return "", nil, fmt.Errorf("Chrome/Chromium not found — install Google Chrome on the bot machine, or use Riot Mobile QR")
 }
 
-func chromeUserDataDir() (string, error) {
-	if chromeUserDataDirFn != nil {
-		return chromeUserDataDirFn()
+func chromeUserDataDir(widgetURL string) (string, error) {
+	parsed, err := url.Parse(widgetURL)
+	if err != nil {
+		return "", fmt.Errorf("captcha widget URL: %w", err)
 	}
-	return chromeUserDataDirDefault()
+	state := strings.TrimSpace(parsed.Query().Get("state"))
+	if state == "" {
+		return "", fmt.Errorf("captcha widget URL missing state")
+	}
+
+	root := ""
+	if chromeUserDataDirFn != nil {
+		root, err = chromeUserDataDirFn()
+	} else {
+		root, err = chromeUserDataDirDefault()
+	}
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(state))
+	dir := filepath.Join(root, fmt.Sprintf("%x", sum[:16]))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	desktop := desktopUser()
+	if desktop != "" && desktop != "root" && os.Geteuid() == 0 {
+		if err := chownPath(dir, desktop); err != nil {
+			log.Printf("captcha Chrome session-dir chown: %v", err)
+		}
+	}
+	return dir, nil
 }
 
 // chromeUserDataDirFn is overridden in unit tests.
@@ -166,7 +195,7 @@ func chromeUserDataDirDefault() (string, error) {
 	if home == "" || home == "/var/root" || home == "/root" {
 		home = os.TempDir()
 	}
-	dir := captchaChromeProfileDir(home)
+	dir := filepath.Join(home, ".cache", "valorant-bot-captcha-chrome-authenticate")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		// Last resort: unique temp dir (avoids root-owned shared /tmp profile).
 		tmp, terr := os.MkdirTemp("", "valorant-bot-captcha-chrome-*")
@@ -183,11 +212,12 @@ func chromeUserDataDirDefault() (string, error) {
 	return dir, nil
 }
 
-// Keep the authenticator-origin profile separate from older releases. Chrome
-// reuses resolver flags from an already-running profile, which would otherwise
-// keep minting tokens on the legacy auth.riotgames.com origin after an upgrade.
-func captchaChromeProfileDir(home string) string {
-	return filepath.Join(home, ".cache", "valorant-bot-captcha-chrome-authenticate")
+// Each auth state gets its own incognito Chrome process and cookie jar. The
+// state is hashed so the bearer-like Discord auth state is not exposed in a
+// filesystem path.
+func captchaChromeProfileDir(home, state string) string {
+	sum := sha256.Sum256([]byte(state))
+	return filepath.Join(home, ".cache", "valorant-bot-captcha-chrome-authenticate", fmt.Sprintf("%x", sum[:16]))
 }
 
 func desktopUser() string {

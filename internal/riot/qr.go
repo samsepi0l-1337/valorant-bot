@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 )
 
 // Riot Mobile QR login ("스캔해서 로그인"). The Riot Client asks rso-authenticator
@@ -292,7 +293,7 @@ func (c *QRClient) do(ctx context.Context, method, rawURL string, body any, sess
 
 func mergeSetCookies(dst map[string]string, resp *http.Response) {
 	for _, ck := range resp.Cookies() {
-		if ck.Value == "" {
+		if ck.Value == "" || ck.MaxAge < 0 || (!ck.Expires.IsZero() && ck.Expires.Before(time.Now())) {
 			delete(dst, ck.Name)
 			continue
 		}

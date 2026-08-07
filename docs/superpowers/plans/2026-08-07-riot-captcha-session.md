@@ -77,3 +77,26 @@
 - [ ] Request an independent code review and fix all important findings.
 - [ ] Re-run fresh verification after the final edit.
 - [ ] Stage only the intended files, commit, push `main`, rebuild `bin/valorant-bot`, and report whether a manual CAPTCHA still needs to be solved after restart.
+
+### Task 5: Repair browser/API session continuity after live rejection
+
+**Files:**
+- Modify: `internal/riot/password.go`
+- Modify: `internal/authweb/server.go`
+- Modify: `internal/authweb/captcha.go`
+- Test: `internal/riot/password_test.go`
+- Test: `internal/authweb/captcha_test.go`
+
+**Interfaces:**
+- Produces: `type CaptchaBrowserSession struct { UserAgent string; Cookies map[string]string }`.
+- Changes: `BeginCaptcha` and `CompleteCaptcha` accept the browser session.
+- Produces: `CaptchaChallenge.BrowserCookies` and `CaptchaRetryError.BrowserCookies` for HttpOnly synchronization.
+
+- [ ] Write a Riot-client test in which the fake server sets literal cookies `authenticator.sid=s1` and `tdid=d1`; require begin and complete to use User-Agent `captcha-browser/1` and require a missing `tdid` to return `ErrCaptchaSession` without a PUT.
+- [ ] Run `go test ./internal/riot -run 'TestPassword(BeginAndCompleteCaptcha|CompleteCaptchaRejectsDifferentBrowserSession)' -count=1` and observe RED.
+- [ ] Implement browser User-Agent storage, defensive cookie export, exact completion-session validation, retry cookie export, and MFA User-Agent continuity.
+- [ ] Write an authweb test that requires the challenge response to set `authenticator.sid` and `tdid` with `Secure` and `HttpOnly`, then returns those cookies on submission and asserts that the fake Riot client receives them with the same User-Agent.
+- [ ] Run `go test ./internal/authweb -run 'TestCaptchaChallengeSyncsRiotBrowserSession' -count=1` and observe RED.
+- [ ] Implement request-to-browser-session conversion, preserve Riot cookie attributes for initial and retry responses, require the expected Host/Origin, and isolate each auth state in an incognito Chrome profile.
+- [ ] Run `gofmt`, `go test ./...`, `go test -race ./...`, `go vet ./...`, `git diff --check`, and `go build -o bin/valorant-bot ./cmd/bot`.
+- [ ] Independently review the final diff, commit `Fix Riot captcha browser session`, and push `origin/main`.

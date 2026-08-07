@@ -53,8 +53,8 @@ type QRAuthClient interface {
 
 // PasswordAuthClient drives Discord modal username/password login with browser captcha.
 type PasswordAuthClient interface {
-	BeginCaptcha(ctx context.Context, username, password string) (riot.CaptchaChallenge, error)
-	CompleteCaptcha(ctx context.Context, sessionID, captchaToken string) (riot.PasswordTokens, *riot.MFAChallenge, error)
+	BeginCaptcha(ctx context.Context, username, password string, browser riot.CaptchaBrowserSession) (riot.CaptchaChallenge, error)
+	CompleteCaptcha(ctx context.Context, sessionID, captchaToken string, browser riot.CaptchaBrowserSession) (riot.PasswordTokens, *riot.MFAChallenge, error)
 	CancelCaptcha(sessionID string)
 	SubmitMFA(ctx context.Context, challenge *riot.MFAChallenge, code string) (riot.PasswordTokens, error)
 }

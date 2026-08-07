@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -36,18 +37,22 @@ type fakePasswordAuth struct {
 	completeCalls   atomic.Int32
 	beginCalls      atomic.Int32
 	retryOnce       bool
+	retryCookies    []*http.Cookie
 	beginDelay      time.Duration
 	completeStarted chan struct{}
 	completeRelease <-chan struct{}
 	completeSession atomic.Value
+	beginBrowser    atomic.Value
+	completeBrowser atomic.Value
 	canceledSession atomic.Value
 	mfaCalls        atomic.Int32
 	mfaStarted      chan struct{}
 	mfaRelease      <-chan struct{}
 }
 
-func (f *fakePasswordAuth) BeginCaptcha(ctx context.Context, username, password string) (riot.CaptchaChallenge, error) {
+func (f *fakePasswordAuth) BeginCaptcha(ctx context.Context, username, password string, browser riot.CaptchaBrowserSession) (riot.CaptchaChallenge, error) {
 	f.beginCalls.Add(1)
+	f.beginBrowser.Store(browser)
 	if f.beginDelay > 0 {
 		select {
 		case <-time.After(f.beginDelay):
@@ -58,8 +63,9 @@ func (f *fakePasswordAuth) BeginCaptcha(ctx context.Context, username, password 
 	return f.ch, nil
 }
 
-func (f *fakePasswordAuth) CompleteCaptcha(ctx context.Context, sessionID, captchaToken string) (riot.PasswordTokens, *riot.MFAChallenge, error) {
+func (f *fakePasswordAuth) CompleteCaptcha(ctx context.Context, sessionID, captchaToken string, browser riot.CaptchaBrowserSession) (riot.PasswordTokens, *riot.MFAChallenge, error) {
 	f.completeSession.Store(sessionID)
+	f.completeBrowser.Store(browser)
 	if f.completeStarted != nil {
 		select {
 		case f.completeStarted <- struct{}{}:
@@ -71,16 +77,102 @@ func (f *fakePasswordAuth) CompleteCaptcha(ctx context.Context, sessionID, captc
 	}
 	n := f.completeCalls.Add(1)
 	if f.retryOnce && n == 1 {
+		cookies := f.retryCookies
+		if cookies == nil {
+			cookies = []*http.Cookie{
+				{Name: "authenticator.sid", Value: "retry-session", Path: "/", Secure: true, HttpOnly: true},
+			}
+		}
 		return riot.PasswordTokens{}, nil, &riot.CaptchaRetryError{
-			SiteKey: "k-retry",
-			RQData:  "d-retry",
-			Reason:  "captcha_not_allowed",
+			SiteKey:        "k-retry",
+			RQData:         "d-retry",
+			Reason:         "captcha_not_allowed",
+			BrowserCookies: cookies,
 		}
 	}
 	if f.complete != nil {
 		return riot.PasswordTokens{}, nil, f.complete
 	}
 	return f.tokens, f.mfa, nil
+}
+
+func testCaptchaBrowserSession() riot.CaptchaBrowserSession {
+	return riot.CaptchaBrowserSession{UserAgent: "captcha-browser/1"}
+}
+
+func newCaptchaRequest(method, target string, body io.Reader) *http.Request {
+	req := httptest.NewRequest(method, target, body)
+	req.Host = RiotCaptchaHost
+	req.Header.Set("User-Agent", "captcha-browser/1")
+	if method == http.MethodPost || method == http.MethodOptions {
+		req.Header.Set("Origin", "https://"+RiotCaptchaHost)
+	}
+	return req
+}
+
+func TestCaptchaChallengeSyncsRiotBrowserSession(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch: riot.CaptchaChallenge{
+			SessionID: "session-browser",
+			SiteKey:   "site-key",
+			RQData:    "rq-data",
+			BrowserCookies: []*http.Cookie{
+				{Name: "authenticator.sid", Value: "s1", Path: "/", Secure: true, HttpOnly: true},
+				{Name: "tdid", Value: "d1", Domain: "riotgames.com", Path: "/", Secure: true, HttpOnly: true},
+			},
+		},
+		mfa: &riot.MFAChallenge{Email: "a***@example.com", Method: "email"},
+	}
+	s := newCaptchaServer(pw)
+	_, state, err := s.BeginPasswordLogin(context.Background(), "discord-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	challengeReq := httptest.NewRequest(http.MethodGet, "/api/auth/captcha/challenge?state="+state, nil)
+	challengeReq.Host = RiotCaptchaHost
+	challengeReq.Header.Set("User-Agent", "captcha-browser/1")
+	challengeRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(challengeRec, challengeReq)
+	if challengeRec.Code != http.StatusOK {
+		t.Fatalf("challenge status=%d body=%s", challengeRec.Code, challengeRec.Body.String())
+	}
+	beginBrowser, _ := pw.beginBrowser.Load().(riot.CaptchaBrowserSession)
+	if beginBrowser.UserAgent != "captcha-browser/1" {
+		t.Fatalf("begin browser = %#v", beginBrowser)
+	}
+
+	responseCookies := challengeRec.Result().Cookies()
+	values := map[string]string{}
+	for _, cookie := range responseCookies {
+		values[cookie.Name] = cookie.Value
+		if !cookie.Secure || !cookie.HttpOnly {
+			t.Fatalf("cookie %s flags: Secure=%v HttpOnly=%v", cookie.Name, cookie.Secure, cookie.HttpOnly)
+		}
+	}
+	if values["authenticator.sid"] != "s1" || values["tdid"] != "d1" {
+		t.Fatalf("challenge cookies = %#v", values)
+	}
+
+	submitReq := httptest.NewRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+	submitReq.Host = RiotCaptchaHost
+	submitReq.Header.Set("Origin", "https://"+RiotCaptchaHost)
+	submitReq.Header.Set("User-Agent", "captcha-browser/1")
+	submitReq.Header.Set("Content-Type", "application/json")
+	for _, cookie := range responseCookies {
+		submitReq.AddCookie(cookie)
+	}
+	submitRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(submitRec, submitReq)
+	if submitRec.Code != http.StatusOK {
+		t.Fatalf("submit status=%d body=%s", submitRec.Code, submitRec.Body.String())
+	}
+	completeBrowser, _ := pw.completeBrowser.Load().(riot.CaptchaBrowserSession)
+	if completeBrowser.UserAgent != "captcha-browser/1" ||
+		completeBrowser.Cookies["authenticator.sid"] != "s1" ||
+		completeBrowser.Cookies["tdid"] != "d1" {
+		t.Fatalf("complete browser = %#v", completeBrowser)
+	}
 }
 
 func TestCaptchaSubmitDoesNotRecreateCanceledState(t *testing.T) {
@@ -97,7 +189,7 @@ func TestCaptchaSubmitDoesNotRecreateCanceledState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ensureCaptchaChallenge(context.Background(), state); err != nil {
+	if _, err := s.ensureCaptchaChallenge(context.Background(), state, testCaptchaBrowserSession()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -105,7 +197,7 @@ func TestCaptchaSubmitDoesNotRecreateCanceledState(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		req := httptest.NewRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+		req := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
 		req.Header.Set("Content-Type", "application/json")
 		s.Handler().ServeHTTP(rec, req)
 	}()
@@ -163,6 +255,40 @@ func TestPublicCaptchaLaunchRoutesAreNotMounted(t *testing.T) {
 	}
 }
 
+func TestCaptchaEndpointsRejectWrongHostOrOrigin(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch: riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
+	}
+	s := newCaptchaServer(pw)
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wrongHost := httptest.NewRequest(http.MethodGet, "/api/auth/captcha/challenge?state="+state, nil)
+	wrongHost.Host = "localhost"
+	wrongHost.Header.Set("User-Agent", "captcha-browser/1")
+	wrongHostRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(wrongHostRec, wrongHost)
+	if wrongHostRec.Code != http.StatusBadRequest || pw.beginCalls.Load() != 0 {
+		t.Fatalf("wrong-host status=%d beginCalls=%d", wrongHostRec.Code, pw.beginCalls.Load())
+	}
+
+	if _, err := s.ensureCaptchaChallenge(context.Background(), state, testCaptchaBrowserSession()); err != nil {
+		t.Fatal(err)
+	}
+	wrongOrigin := httptest.NewRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+	wrongOrigin.Host = RiotCaptchaHost
+	wrongOrigin.Header.Set("Origin", "https://attacker.example")
+	wrongOrigin.Header.Set("User-Agent", "captcha-browser/1")
+	wrongOrigin.Header.Set("Content-Type", "application/json")
+	wrongOriginRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(wrongOriginRec, wrongOrigin)
+	if wrongOriginRec.Code != http.StatusForbidden || pw.completeCalls.Load() != 0 {
+		t.Fatalf("wrong-origin status=%d completeCalls=%d", wrongOriginRec.Code, pw.completeCalls.Load())
+	}
+}
+
 func TestCaptchaChallengeInitializationIsSingleFlight(t *testing.T) {
 	pw := &fakePasswordAuth{
 		ch: riot.CaptchaChallenge{
@@ -193,7 +319,7 @@ func TestCaptchaChallengeInitializationIsSingleFlight(t *testing.T) {
 			<-start
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
-			pending, challengeErr := s.ensureCaptchaChallenge(ctx, state)
+			pending, challengeErr := s.ensureCaptchaChallenge(ctx, state, testCaptchaBrowserSession())
 			if challengeErr != nil {
 				t.Errorf("challenge: %v", challengeErr)
 				return
@@ -210,7 +336,7 @@ func TestCaptchaChallengeInitializationIsSingleFlight(t *testing.T) {
 		t.Fatalf("BeginCaptcha calls = %d, want exactly 1 for one Discord state", got)
 	}
 
-	subReq := httptest.NewRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"hcaptcha-token","version":1}`))
+	subReq := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"hcaptcha-token","version":1}`))
 	subReq.Header.Set("Content-Type", "application/json")
 	subRec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(subRec, subReq)
@@ -240,13 +366,13 @@ func TestCaptchaSubmissionsAreSerializedAndSingleUse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ensureCaptchaChallenge(context.Background(), state); err != nil {
+	if _, err := s.ensureCaptchaChallenge(context.Background(), state, testCaptchaBrowserSession()); err != nil {
 		t.Fatal(err)
 	}
 
 	request := func(rec *httptest.ResponseRecorder, done chan<- struct{}) {
 		defer close(done)
-		req := httptest.NewRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+		req := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
 		req.Header.Set("Content-Type", "application/json")
 		s.Handler().ServeHTTP(rec, req)
 	}
@@ -293,10 +419,10 @@ func TestMFASubmissionIsSerializedAndSingleUse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ensureCaptchaChallenge(context.Background(), state); err != nil {
+	if _, err := s.ensureCaptchaChallenge(context.Background(), state, testCaptchaBrowserSession()); err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+	req := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
@@ -416,6 +542,31 @@ func TestBeginPasswordLogin_PublicBaseStillUsesServerSideLaunch(t *testing.T) {
 	}
 }
 
+func TestBeginPasswordLoginWaitsForBrowserBeforeRiotSession(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch: riot.CaptchaChallenge{SessionID: "sess-browser", SiteKey: "site-key", RQData: "rq-data"},
+	}
+	s := newCaptchaServer(pw)
+	_, state, err := s.BeginPasswordLogin(context.Background(), "d1", "u", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := pw.beginCalls.Load(); got != 0 {
+		t.Fatalf("Riot session began %d times before Chrome supplied its identity", got)
+	}
+
+	req := newCaptchaRequest(http.MethodGet, "/api/auth/captcha/challenge?state="+state, nil)
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("challenge status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := pw.beginCalls.Load(); got != 1 {
+		t.Fatalf("Riot session begins = %d, want 1 after browser challenge request", got)
+	}
+}
+
 func TestLaunchPasswordCaptchaValidatesOwner(t *testing.T) {
 	pw := &fakePasswordAuth{
 		ch: riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
@@ -444,7 +595,7 @@ func TestWaitPasswordLoginCancellationClearsCredentialsAndRiotSession(t *testing
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
-	if _, err := s.ensureCaptchaChallenge(ctx, state); err != nil {
+	if _, err := s.ensureCaptchaChallenge(ctx, state, testCaptchaBrowserSession()); err != nil {
 		t.Fatal(err)
 	}
 	_, _, _, waitErr := s.WaitPasswordLogin(ctx, state)
@@ -515,6 +666,7 @@ func TestCaptchaWidgetPage_ExecutesInvisibleChallengeWithRQData(t *testing.T) {
 	}
 	if !strings.Contains(body, "async function refreshCaptchaChallenge") ||
 		!strings.Contains(body, "await refreshCaptchaChallenge()") ||
+		!strings.Contains(body, "if (data && data.reload)") ||
 		!strings.Contains(body, "renderWidget(false)") {
 		t.Fatal("a lost submit response must reload the current challenge instead of reusing its token")
 	}
@@ -546,7 +698,7 @@ func TestCaptchaChallengeAndSubmit_NoMFACompletes(t *testing.T) {
 		t.Fatalf("unexpected captcha URL %q", url)
 	}
 
-	chReq := httptest.NewRequest(http.MethodGet, "/api/auth/captcha/challenge?state="+state, nil)
+	chReq := newCaptchaRequest(http.MethodGet, "/api/auth/captcha/challenge?state="+state, nil)
 	chRec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(chRec, chReq)
 	if chRec.Code != http.StatusOK {
@@ -563,7 +715,7 @@ func TestCaptchaChallengeAndSubmit_NoMFACompletes(t *testing.T) {
 		display, mfaState, mfaHint, waitErr = s.WaitPasswordLogin(ctx, state)
 	}()
 
-	subReq := httptest.NewRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"hcaptcha-token","version":1}`))
+	subReq := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"hcaptcha-token","version":1}`))
 	subReq.Header.Set("Content-Type", "application/json")
 	subRec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(subRec, subReq)
@@ -611,7 +763,7 @@ func TestCaptchaChallengeAndSubmit_MFA(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	chReq := httptest.NewRequest(http.MethodGet, "/api/auth/captcha/challenge?state="+state, nil)
+	chReq := newCaptchaRequest(http.MethodGet, "/api/auth/captcha/challenge?state="+state, nil)
 	chRec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(chRec, chReq)
 	if chRec.Code != http.StatusOK {
@@ -628,7 +780,7 @@ func TestCaptchaChallengeAndSubmit_MFA(t *testing.T) {
 		display, mfaState, mfaHint, waitErr = s.WaitPasswordLogin(ctx, state)
 	}()
 
-	subReq := httptest.NewRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"hcaptcha-token","version":1}`))
+	subReq := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"hcaptcha-token","version":1}`))
 	subReq.Header.Set("Content-Type", "application/json")
 	subRec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(subRec, subReq)
@@ -662,11 +814,11 @@ func TestMFAPendingExpiresWithoutFurtherActivity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ensureCaptchaChallenge(context.Background(), state); err != nil {
+	if _, err := s.ensureCaptchaChallenge(context.Background(), state, testCaptchaBrowserSession()); err != nil {
 		t.Fatal(err)
 	}
 
-	subReq := httptest.NewRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+	subReq := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
 	subReq.Header.Set("Content-Type", "application/json")
 	subRec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(subRec, subReq)
@@ -715,10 +867,10 @@ func TestMFAExpiryCancelsInflightSubmitBeforeLink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ensureCaptchaChallenge(context.Background(), state); err != nil {
+	if _, err := s.ensureCaptchaChallenge(context.Background(), state, testCaptchaBrowserSession()); err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+	req := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(rec, req)
@@ -753,8 +905,16 @@ func TestCaptchaSubmit_RetryDoesNotFinishWait(t *testing.T) {
 			SessionID: "sess-1",
 			SiteKey:   "site-key",
 			RQData:    "rq-data",
+			BrowserCookies: []*http.Cookie{
+				{Name: "authenticator.sid", Value: "initial-session", Path: "/", Secure: true, HttpOnly: true},
+				{Name: "tdid", Value: "initial-device", Domain: "riotgames.com", Path: "/", Secure: true, HttpOnly: true},
+			},
 		},
 		retryOnce: true,
+		retryCookies: []*http.Cookie{
+			{Name: "authenticator.sid", Value: "retry-session", Path: "/", Secure: true, HttpOnly: true},
+			{Name: "tdid", Value: "", Domain: "riotgames.com", Path: "/", Secure: true, HttpOnly: true, MaxAge: -1},
+		},
 		mfa: &riot.MFAChallenge{
 			Email:  "a***@ex.com",
 			Method: "email",
@@ -765,7 +925,7 @@ func TestCaptchaSubmit_RetryDoesNotFinishWait(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	chReq := httptest.NewRequest(http.MethodGet, "/api/auth/captcha/challenge?state="+state, nil)
+	chReq := newCaptchaRequest(http.MethodGet, "/api/auth/captcha/challenge?state="+state, nil)
 	chRec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(chRec, chReq)
 	if chRec.Code != http.StatusOK {
@@ -784,7 +944,7 @@ func TestCaptchaSubmit_RetryDoesNotFinishWait(t *testing.T) {
 	<-waiting
 	time.Sleep(50 * time.Millisecond)
 
-	subReq := httptest.NewRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"t1","version":1}`))
+	subReq := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"t1","version":1}`))
 	subReq.Header.Set("Content-Type", "application/json")
 	subRec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(subRec, subReq)
@@ -796,8 +956,38 @@ func TestCaptchaSubmit_RetryDoesNotFinishWait(t *testing.T) {
 	if out["version"] != float64(2) {
 		t.Fatalf("retry version = %#v", out["version"])
 	}
+	retryCookies := subRec.Result().Cookies()
+	updatedSession, deletedTDID := false, false
+	for _, cookie := range retryCookies {
+		if cookie.Name == "authenticator.sid" && cookie.Value == "retry-session" && cookie.Secure && cookie.HttpOnly {
+			updatedSession = true
+		}
+		if cookie.Name == "tdid" && cookie.Value == "" && cookie.MaxAge < 0 && cookie.Domain == "riotgames.com" {
+			deletedTDID = true
+		}
+	}
+	if len(retryCookies) != 2 || !updatedSession || !deletedTDID {
+		t.Fatalf("retry cookies = %#v", retryCookies)
+	}
 
-	staleReq := httptest.NewRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"stale","version":1}`))
+	recoveryReq := newCaptchaRequest(http.MethodGet, "/api/auth/captcha/challenge?state="+state, nil)
+	recoveryRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recoveryRec, recoveryReq)
+	recoveryCookies := recoveryRec.Result().Cookies()
+	recoveredSession, recoveredDeletion := false, false
+	for _, cookie := range recoveryCookies {
+		if cookie.Name == "authenticator.sid" && cookie.Value == "retry-session" {
+			recoveredSession = true
+		}
+		if cookie.Name == "tdid" && cookie.MaxAge < 0 {
+			recoveredDeletion = true
+		}
+	}
+	if len(recoveryCookies) != 2 || !recoveredSession || !recoveredDeletion {
+		t.Fatalf("recovered challenge cookies = %#v", recoveryCookies)
+	}
+
+	staleReq := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"stale","version":1}`))
 	staleReq.Header.Set("Content-Type", "application/json")
 	staleRec := httptest.NewRecorder()
 	s.Handler().ServeHTTP(staleRec, staleReq)
@@ -813,8 +1003,13 @@ func TestCaptchaSubmit_RetryDoesNotFinishWait(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 
-	subReq2 := httptest.NewRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"t2","version":2}`))
+	subReq2 := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"t2","version":2}`))
 	subReq2.Header.Set("Content-Type", "application/json")
+	for _, cookie := range retryCookies {
+		if cookie.Value != "" && cookie.MaxAge >= 0 {
+			subReq2.AddCookie(cookie)
+		}
+	}
 	subRec2 := httptest.NewRecorder()
 	s.Handler().ServeHTTP(subRec2, subReq2)
 	var out2 map[string]any
@@ -822,10 +1017,72 @@ func TestCaptchaSubmit_RetryDoesNotFinishWait(t *testing.T) {
 	if out2["ok"] != true || out2["mfa"] != true {
 		t.Fatalf("second submit %+v body=%s", out2, subRec2.Body.String())
 	}
+	completeBrowser, _ := pw.completeBrowser.Load().(riot.CaptchaBrowserSession)
+	if completeBrowser.Cookies["authenticator.sid"] != "retry-session" {
+		t.Fatalf("retry completion browser = %#v", completeBrowser)
+	}
+	if _, ok := completeBrowser.Cookies["tdid"]; ok {
+		t.Fatalf("deleted tdid returned on retry completion: %#v", completeBrowser)
+	}
 
 	select {
 	case <-finished:
 	case <-time.After(2 * time.Second):
 		t.Fatal("WaitPasswordLogin did not finish after successful captcha")
+	}
+}
+
+func TestCaptchaSessionMismatchClearsCookiesAndReloadsChallenge(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch: riot.CaptchaChallenge{
+			SessionID: "sess-reset",
+			SiteKey:   "site-key",
+			RQData:    "rq-data",
+			BrowserCookies: []*http.Cookie{
+				{Name: "tdid", Value: "device-1", Domain: "riotgames.com", Path: "/", Secure: true, HttpOnly: true},
+			},
+		},
+		complete: riot.ErrCaptchaSession,
+	}
+	s := newCaptchaServer(pw)
+	_, state, err := s.BeginPasswordLogin(context.Background(), "discord-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	challengeReq := newCaptchaRequest(http.MethodGet, "/api/auth/captcha/challenge?state="+state, nil)
+	challengeRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(challengeRec, challengeReq)
+	if challengeRec.Code != http.StatusOK {
+		t.Fatal(challengeRec.Body.String())
+	}
+
+	submitReq := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+	submitReq.Header.Set("Content-Type", "application/json")
+	submitReq.AddCookie(&http.Cookie{Name: "tdid", Value: "stale-device"})
+	submitRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(submitRec, submitReq)
+	var out map[string]any
+	if err := json.NewDecoder(submitRec.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out["reload"] != true {
+		t.Fatalf("session mismatch response = %#v", out)
+	}
+	cleared := false
+	for _, cookie := range submitRec.Result().Cookies() {
+		if cookie.Name == "tdid" && cookie.Value == "" && cookie.MaxAge < 0 {
+			cleared = true
+		}
+	}
+	if !cleared {
+		t.Fatalf("session mismatch did not clear browser cookie: %#v", submitRec.Result().Cookies())
+	}
+
+	recoveryReq := newCaptchaRequest(http.MethodGet, "/api/auth/captcha/challenge?state="+state, nil)
+	recoveryRec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(recoveryRec, recoveryReq)
+	if recoveryRec.Code != http.StatusOK || pw.beginCalls.Load() != 2 {
+		t.Fatalf("recovery status=%d beginCalls=%d body=%s", recoveryRec.Code, pw.beginCalls.Load(), recoveryRec.Body.String())
 	}
 }

@@ -118,10 +118,38 @@ func TestCaptchaWidgetUsesAuthenticateOrigin(t *testing.T) {
 	}
 }
 
-func TestCaptchaChromeUsesAuthenticateProfile(t *testing.T) {
-	got := captchaChromeProfileDir("/Users/tester")
-	want := filepath.Join("/Users/tester", ".cache", "valorant-bot-captcha-chrome-authenticate")
-	if got != want {
-		t.Fatalf("captcha Chrome profile = %q, want %q", got, want)
+func TestCaptchaChromeProfilesAreIsolatedPerState(t *testing.T) {
+	first := captchaChromeProfileDir("/Users/tester", "state-a")
+	second := captchaChromeProfileDir("/Users/tester", "state-b")
+	if first == second {
+		t.Fatalf("concurrent captcha states share profile %q", first)
+	}
+	root := filepath.Join("/Users/tester", ".cache", "valorant-bot-captcha-chrome-authenticate")
+	for _, got := range []string{first, second} {
+		if !strings.HasPrefix(got, root+string(filepath.Separator)) {
+			t.Fatalf("captcha Chrome profile %q is outside %q", got, root)
+		}
+		if strings.Contains(got, "state-a") || strings.Contains(got, "state-b") {
+			t.Fatalf("captcha state must not be exposed in profile path: %q", got)
+		}
+	}
+
+	firstURL := "https://authenticate.riotgames.com/captcha/widget?state=state-a"
+	secondURL := "https://authenticate.riotgames.com/captcha/widget?state=state-b"
+	firstFlags, err := chromeFlags(firstURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondFlags, err := chromeFlags(secondURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstJoined := strings.Join(firstFlags, "\n")
+	secondJoined := strings.Join(secondFlags, "\n")
+	if !strings.Contains(firstJoined, "--incognito") || !strings.Contains(secondJoined, "--incognito") {
+		t.Fatalf("captcha profiles must run incognito: first=%v second=%v", firstFlags, secondFlags)
+	}
+	if firstJoined == secondJoined {
+		t.Fatalf("concurrent captcha launches use identical flags: %v", firstFlags)
 	}
 }

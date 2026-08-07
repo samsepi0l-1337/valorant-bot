@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -25,9 +26,10 @@ var (
 // CaptchaRetryError means Riot rejected the token but issued a fresh challenge.
 // The browser page should re-render the widget with SiteKey/RQData.
 type CaptchaRetryError struct {
-	SiteKey string
-	RQData  string
-	Reason  string
+	SiteKey        string
+	RQData         string
+	Reason         string
+	BrowserCookies []*http.Cookie
 }
 
 func (e *CaptchaRetryError) Error() string {
@@ -53,32 +55,44 @@ type PasswordTokens struct {
 	SessionCookie string
 }
 
+// CaptchaBrowserSession is the HTTP identity of the Chrome window that solves
+// hCaptcha. Riot's challenge cookies and User-Agent must remain identical when
+// the resulting token is submitted.
+type CaptchaBrowserSession struct {
+	UserAgent string
+	Cookies   map[string]string
+}
+
 // CaptchaChallenge is the hCaptcha widget data for browser solving.
 type CaptchaChallenge struct {
-	SessionID string
-	SiteKey   string
-	RQData    string
+	SessionID      string
+	SiteKey        string
+	RQData         string
+	BrowserCookies []*http.Cookie
 }
 
 // MFAChallenge means Riot needs a second factor before handing out tokens.
 type MFAChallenge struct {
-	Email   string
-	Method  string
-	Methods []string
-	cookies map[string]string
-	sdkSID  string
+	Email     string
+	Method    string
+	Methods   []string
+	cookies   map[string]string
+	sdkSID    string
+	userAgent string
 	// authenticate is true when MFA must be submitted to authenticate.riotgames.com.
 	authenticate bool
 }
 
 type captchaSession struct {
-	username string
-	password string
-	cookies  map[string]string
-	sdkSID   string
-	siteKey  string
-	rqData   string
-	expires  time.Time
+	username       string
+	password       string
+	cookies        map[string]string
+	browserCookies map[string]*http.Cookie
+	sdkSID         string
+	userAgent      string
+	siteKey        string
+	rqData         string
+	expires        time.Time
 }
 
 // PasswordClient performs Riot ID/password auth via authenticate.riotgames.com
@@ -112,10 +126,14 @@ func NewPasswordClient(httpClient *http.Client) *PasswordClient {
 
 // BeginCaptcha starts the Riot authenticate login and returns hCaptcha widget data.
 // Credentials are held only in memory until login completes or the session expires.
-func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password string) (CaptchaChallenge, error) {
+func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password string, browser CaptchaBrowserSession) (CaptchaChallenge, error) {
 	username = strings.TrimSpace(username)
 	if username == "" || password == "" {
 		return CaptchaChallenge{}, ErrPasswordInvalid
+	}
+	userAgent := strings.TrimSpace(browser.UserAgent)
+	if userAgent == "" {
+		return CaptchaChallenge{}, fmt.Errorf("%w: missing browser user-agent", ErrCaptchaSession)
 	}
 	c.refreshClientMeta(ctx)
 
@@ -133,7 +151,7 @@ func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password st
 			"state":    "auth",
 		},
 	}
-	resp, err := c.doJSON(ctx, http.MethodPost, c.authenticateBase()+"/api/v1/login", body, cookies, sdkSID)
+	resp, err := c.doJSON(ctx, http.MethodPost, c.authenticateBase()+"/api/v1/login", body, cookies, sdkSID, userAgent)
 	if err != nil {
 		return CaptchaChallenge{}, fmt.Errorf("captcha begin: %w", err)
 	}
@@ -153,6 +171,9 @@ func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password st
 		}
 		return CaptchaChallenge{}, errors.New("captcha begin: missing hcaptcha challenge")
 	}
+	setCookies := resp.Cookies()
+	browserCookies := mergeCaptchaBrowserCookies(nil, setCookies)
+	browserCookieSync := captchaBrowserCookieSync(browserCookies, setCookies, browser.Cookies, cookies, true)
 
 	sessionID := randomHex(16)
 	c.mu.Lock()
@@ -161,23 +182,30 @@ func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password st
 	}
 	c.purgeExpiredLocked()
 	c.sessions[sessionID] = &captchaSession{
-		username: username,
-		password: password,
-		cookies:  cookies,
-		sdkSID:   sdkSID,
-		siteKey:  siteKey,
-		rqData:   rqData,
-		expires:  time.Now().Add(captchaSessionTTL),
+		username:       username,
+		password:       password,
+		cookies:        cookies,
+		browserCookies: browserCookies,
+		sdkSID:         sdkSID,
+		userAgent:      userAgent,
+		siteKey:        siteKey,
+		rqData:         rqData,
+		expires:        time.Now().Add(captchaSessionTTL),
 	}
 	c.mu.Unlock()
 
-	return CaptchaChallenge{SessionID: sessionID, SiteKey: siteKey, RQData: rqData}, nil
+	return CaptchaChallenge{
+		SessionID:      sessionID,
+		SiteKey:        siteKey,
+		RQData:         rqData,
+		BrowserCookies: browserCookieSync,
+	}, nil
 }
 
 // CompleteCaptcha submits the browser hCaptcha token with stored credentials.
 // On MFA it returns a non-nil *MFAChallenge.
 // On captcha rejection with a fresh challenge it returns *CaptchaRetryError and keeps the session.
-func (c *PasswordClient) CompleteCaptcha(ctx context.Context, sessionID, captchaToken string) (PasswordTokens, *MFAChallenge, error) {
+func (c *PasswordClient) CompleteCaptcha(ctx context.Context, sessionID, captchaToken string, browser CaptchaBrowserSession) (PasswordTokens, *MFAChallenge, error) {
 	captchaToken = strings.TrimSpace(captchaToken)
 	if captchaToken == "" {
 		return PasswordTokens{}, nil, ErrPasswordCaptcha
@@ -193,11 +221,17 @@ func (c *PasswordClient) CompleteCaptcha(ctx context.Context, sessionID, captcha
 		c.mu.Unlock()
 		return PasswordTokens{}, nil, ErrCaptchaSession
 	}
+	if err := validateCaptchaBrowserSession(sess, browser); err != nil {
+		c.mu.Unlock()
+		return PasswordTokens{}, nil, err
+	}
 	// Copy credentials/cookies; keep session for captcha retry.
 	username := sess.username
 	password := sess.password
-	cookies := copyCookies(sess.cookies)
+	cookies := captchaSessionCookies(sess.cookies)
+	browserCookies := copyCaptchaBrowserCookies(sess.browserCookies)
 	sdkSID := sess.sdkSID
+	userAgent := sess.userAgent
 	c.mu.Unlock()
 
 	token := captchaToken
@@ -216,21 +250,24 @@ func (c *PasswordClient) CompleteCaptcha(ctx context.Context, sessionID, captcha
 			"username": username,
 		},
 	}
-	resp, err := c.doJSON(ctx, http.MethodPut, c.authenticateBase()+"/api/v1/login", body, cookies, sdkSID)
+	resp, err := c.doJSON(ctx, http.MethodPut, c.authenticateBase()+"/api/v1/login", body, cookies, sdkSID, userAgent)
 	if err != nil {
 		return PasswordTokens{}, nil, fmt.Errorf("captcha complete: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
+	setCookies := resp.Cookies()
+	browserCookies = mergeCaptchaBrowserCookies(browserCookies, setCookies)
+	browserCookieSync := captchaBrowserCookieSync(browserCookies, setCookies, browser.Cookies, cookies, false)
 
 	// Persist cookies from the attempt back into the session for retries/MFA.
-	c.updateSessionCookies(sessionID, cookies)
+	c.updateSessionCookies(sessionID, cookies, browserCookies)
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return PasswordTokens{}, nil, ErrPasswordRateLimit
 	}
 
-	tokens, mfa, perr := c.parseAuthenticateLogin(ctx, raw, cookies, true, sdkSID)
+	tokens, mfa, perr := c.parseAuthenticateLogin(ctx, raw, cookies, true, sdkSID, userAgent)
 	if perr == nil {
 		c.deleteSession(sessionID)
 		return tokens, mfa, nil
@@ -259,7 +296,12 @@ func (c *PasswordClient) CompleteCaptcha(ctx context.Context, sessionID, captcha
 		if hasChallenge {
 			c.updateSessionChallenge(sessionID, siteKey, rqData, cookies)
 			log.Printf("riot auth_failure with new captcha; retry challenge")
-			return PasswordTokens{}, nil, &CaptchaRetryError{SiteKey: siteKey, RQData: rqData, Reason: reason}
+			return PasswordTokens{}, nil, &CaptchaRetryError{
+				SiteKey:        siteKey,
+				RQData:         rqData,
+				Reason:         reason,
+				BrowserCookies: browserCookieSync,
+			}
 		}
 		c.deleteSession(sessionID)
 		log.Printf("riot password rejected after captcha (%s)", reason)
@@ -270,7 +312,12 @@ func (c *PasswordClient) CompleteCaptcha(ctx context.Context, sessionID, captcha
 	if hasChallenge && (isCaptchaError(reason) || reason == "invalid_request" || errors.Is(perr, ErrPasswordCaptcha)) {
 		c.updateSessionChallenge(sessionID, siteKey, rqData, cookies)
 		log.Printf("riot captcha rejected (%s); issuing retry challenge", reason)
-		return PasswordTokens{}, nil, &CaptchaRetryError{SiteKey: siteKey, RQData: rqData, Reason: reason}
+		return PasswordTokens{}, nil, &CaptchaRetryError{
+			SiteKey:        siteKey,
+			RQData:         rqData,
+			Reason:         reason,
+			BrowserCookies: browserCookieSync,
+		}
 	}
 
 	// invalid_request without a captcha blob usually means the token/session was
@@ -328,9 +375,9 @@ func (c *PasswordClient) SubmitMFA(ctx context.Context, challenge *MFAChallenge,
 			err    error
 		)
 		if challenge.authenticate {
-			tokens, mfa, err = c.putAuthenticate(ctx, challenge.cookies, body, challenge.sdkSID)
+			tokens, mfa, err = c.putAuthenticate(ctx, challenge.cookies, body, challenge.sdkSID, challenge.userAgent)
 		} else {
-			tokens, mfa, err = c.putAuth(ctx, challenge.cookies, body, challenge.sdkSID)
+			tokens, mfa, err = c.putAuth(ctx, challenge.cookies, body, challenge.sdkSID, challenge.userAgent)
 		}
 		if err == nil && mfa == nil {
 			return tokens, nil
@@ -350,8 +397,8 @@ func (c *PasswordClient) SubmitMFA(ctx context.Context, challenge *MFAChallenge,
 	return PasswordTokens{}, lastErr
 }
 
-func (c *PasswordClient) putAuthenticate(ctx context.Context, cookies map[string]string, body map[string]any, sdkSID string) (PasswordTokens, *MFAChallenge, error) {
-	resp, err := c.doJSON(ctx, http.MethodPut, c.authenticateBase()+"/api/v1/login", body, cookies, sdkSID)
+func (c *PasswordClient) putAuthenticate(ctx context.Context, cookies map[string]string, body map[string]any, sdkSID, userAgent string) (PasswordTokens, *MFAChallenge, error) {
+	resp, err := c.doJSON(ctx, http.MethodPut, c.authenticateBase()+"/api/v1/login", body, cookies, sdkSID, userAgent)
 	if err != nil {
 		return PasswordTokens{}, nil, fmt.Errorf("authenticate put: %w", err)
 	}
@@ -360,14 +407,14 @@ func (c *PasswordClient) putAuthenticate(ctx context.Context, cookies map[string
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return PasswordTokens{}, nil, ErrPasswordRateLimit
 	}
-	tokens, mfa, perr := c.parseAuthenticateLogin(ctx, raw, cookies, true, sdkSID)
+	tokens, mfa, perr := c.parseAuthenticateLogin(ctx, raw, cookies, true, sdkSID, userAgent)
 	if perr != nil && resp.StatusCode != http.StatusOK {
 		return PasswordTokens{}, nil, perr
 	}
 	return tokens, mfa, perr
 }
 
-func (c *PasswordClient) parseAuthenticateLogin(ctx context.Context, raw []byte, cookies map[string]string, authenticateMFA bool, sdkSID string) (PasswordTokens, *MFAChallenge, error) {
+func (c *PasswordClient) parseAuthenticateLogin(ctx context.Context, raw []byte, cookies map[string]string, authenticateMFA bool, sdkSID, userAgent string) (PasswordTokens, *MFAChallenge, error) {
 	var out struct {
 		Type    string `json:"type"`
 		Error   string `json:"error"`
@@ -399,6 +446,7 @@ func (c *PasswordClient) parseAuthenticateLogin(ctx context.Context, raw []byte,
 			Methods:      append([]string(nil), out.Multifactor.Methods...),
 			cookies:      copyCookies(cookies),
 			sdkSID:       sdkSID,
+			userAgent:    userAgent,
 			authenticate: authenticateMFA,
 		}
 		if out.Error == "invalid_code" {
@@ -426,8 +474,8 @@ func (c *PasswordClient) parseAuthenticateLogin(ctx context.Context, raw []byte,
 	}
 }
 
-func (c *PasswordClient) putAuth(ctx context.Context, cookies map[string]string, body map[string]any, sdkSID string) (PasswordTokens, *MFAChallenge, error) {
-	resp, err := c.doJSON(ctx, http.MethodPut, c.authBase()+"/api/v1/authorization", body, cookies, sdkSID)
+func (c *PasswordClient) putAuth(ctx context.Context, cookies map[string]string, body map[string]any, sdkSID, userAgent string) (PasswordTokens, *MFAChallenge, error) {
+	resp, err := c.doJSON(ctx, http.MethodPut, c.authBase()+"/api/v1/authorization", body, cookies, sdkSID, userAgent)
 	if err != nil {
 		return PasswordTokens{}, nil, fmt.Errorf("auth put: %w", err)
 	}
@@ -471,11 +519,12 @@ func (c *PasswordClient) putAuth(ctx context.Context, cookies map[string]string,
 			method = out.Multifactor.Methods[0]
 		}
 		ch := &MFAChallenge{
-			Email:   out.Multifactor.Email,
-			Method:  method,
-			Methods: append([]string(nil), out.Multifactor.Methods...),
-			cookies: copyCookies(cookies),
-			sdkSID:  sdkSID,
+			Email:     out.Multifactor.Email,
+			Method:    method,
+			Methods:   append([]string(nil), out.Multifactor.Methods...),
+			cookies:   copyCookies(cookies),
+			sdkSID:    sdkSID,
+			userAgent: userAgent,
 		}
 		if out.Error == "invalid_code" {
 			return PasswordTokens{}, ch, ErrPasswordInvalidCode
@@ -525,7 +574,7 @@ func (c *PasswordClient) exchangeLoginToken(ctx context.Context, loginToken stri
 	}, nil
 }
 
-func (c *PasswordClient) doJSON(ctx context.Context, method, rawURL string, body any, cookies map[string]string, sdkSID string) (*http.Response, error) {
+func (c *PasswordClient) doJSON(ctx context.Context, method, rawURL string, body any, cookies map[string]string, sdkSID, userAgent string) (*http.Response, error) {
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -541,7 +590,11 @@ func (c *PasswordClient) doJSON(ctx context.Context, method, rawURL string, body
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("User-Agent", c.userAgent())
+	req.Header.Set("User-Agent", userAgent)
+	if strings.HasPrefix(rawURL, c.authenticateBase()+"/") {
+		req.Header.Set("Origin", c.authenticateBase())
+		req.Header.Set("Referer", c.authenticateBase()+"/")
+	}
 	if sdkSID != "" {
 		req.Header.Set("baggage", "sdksid="+sdkSID)
 	}
@@ -560,11 +613,12 @@ func (c *PasswordClient) doJSON(ctx context.Context, method, rawURL string, body
 	return resp, nil
 }
 
-func (c *PasswordClient) updateSessionCookies(sessionID string, cookies map[string]string) {
+func (c *PasswordClient) updateSessionCookies(sessionID string, cookies map[string]string, browserCookies map[string]*http.Cookie) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if sess, ok := c.sessions[sessionID]; ok {
 		sess.cookies = copyCookies(cookies)
+		sess.browserCookies = copyCaptchaBrowserCookies(browserCookies)
 		sess.expires = time.Now().Add(captchaSessionTTL)
 	}
 }
@@ -584,6 +638,131 @@ func (c *PasswordClient) deleteSession(sessionID string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.sessions, sessionID)
+}
+
+func validateCaptchaBrowserSession(sess *captchaSession, browser CaptchaBrowserSession) error {
+	if sess == nil {
+		return ErrCaptchaSession
+	}
+	if strings.TrimSpace(browser.UserAgent) == "" || browser.UserAgent != sess.userAgent {
+		return fmt.Errorf("%w: captcha browser identity changed", ErrCaptchaSession)
+	}
+	expected := captchaBrowserCookieValues(sess.cookies)
+	actual := captchaBrowserCookieValues(browser.Cookies)
+	if len(actual) != len(expected) {
+		return fmt.Errorf("%w: captcha browser cookie set changed", ErrCaptchaSession)
+	}
+	for name, want := range expected {
+		if got, ok := actual[name]; !ok || got != want {
+			return fmt.Errorf("%w: captcha browser cookie %s changed", ErrCaptchaSession, name)
+		}
+	}
+	return nil
+}
+
+func captchaSessionCookies(expected map[string]string) map[string]string {
+	return copyCookies(expected)
+}
+
+var captchaBrowserCookieAllowlist = map[string]struct{}{
+	"authenticator.sid": {},
+	"tdid":              {},
+	"__cflb":            {},
+	"__cf_bm":           {},
+}
+
+func mergeCaptchaBrowserCookies(current map[string]*http.Cookie, setCookies []*http.Cookie) map[string]*http.Cookie {
+	out := copyCaptchaBrowserCookies(current)
+	for _, cookie := range setCookies {
+		if cookie == nil {
+			continue
+		}
+		if _, allowed := captchaBrowserCookieAllowlist[cookie.Name]; !allowed {
+			continue
+		}
+		if captchaCookieDeletes(cookie) {
+			delete(out, cookie.Name)
+			continue
+		}
+		clone := *cookie
+		out[cookie.Name] = &clone
+	}
+	return out
+}
+
+func captchaBrowserCookieValues(in map[string]string) map[string]string {
+	out := make(map[string]string)
+	for name, value := range in {
+		if _, allowed := captchaBrowserCookieAllowlist[name]; allowed {
+			out[name] = value
+		}
+	}
+	return out
+}
+
+// captchaBrowserCookieSync returns the complete active cookie set plus any
+// deletion tombstones Riot issued. It also clears allowlisted cookies retained
+// by Chrome that do not belong to the new canonical Riot session.
+func captchaBrowserCookieSync(active map[string]*http.Cookie, setCookies []*http.Cookie, browser, canonical map[string]string, reset bool) []*http.Cookie {
+	out := make([]*http.Cookie, 0, len(active)+len(setCookies))
+	deleted := make(map[string]struct{})
+	for _, cookie := range setCookies {
+		if cookie == nil || !captchaCookieDeletes(cookie) {
+			continue
+		}
+		if _, allowed := captchaBrowserCookieAllowlist[cookie.Name]; !allowed {
+			continue
+		}
+		clone := *cookie
+		out = append(out, &clone)
+		deleted[cookie.Name] = struct{}{}
+	}
+	expected := captchaBrowserCookieValues(canonical)
+	for name := range captchaBrowserCookieValues(browser) {
+		if _, keep := expected[name]; keep && !reset {
+			continue
+		}
+		if _, already := deleted[name]; already && !reset {
+			continue
+		}
+		out = append(out,
+			&http.Cookie{Name: name, Value: "", Path: "/", Secure: true, HttpOnly: true, MaxAge: -1},
+			&http.Cookie{Name: name, Value: "", Domain: "riotgames.com", Path: "/", Secure: true, HttpOnly: true, MaxAge: -1},
+		)
+	}
+	out = append(out, captchaBrowserCookieSlice(active)...)
+	return out
+}
+
+func captchaCookieDeletes(cookie *http.Cookie) bool {
+	return cookie != nil && (cookie.Value == "" || cookie.MaxAge < 0 ||
+		(!cookie.Expires.IsZero() && cookie.Expires.Before(time.Now())))
+}
+
+func copyCaptchaBrowserCookies(in map[string]*http.Cookie) map[string]*http.Cookie {
+	out := make(map[string]*http.Cookie, len(in))
+	for name, cookie := range in {
+		if cookie == nil {
+			continue
+		}
+		clone := *cookie
+		out[name] = &clone
+	}
+	return out
+}
+
+func captchaBrowserCookieSlice(in map[string]*http.Cookie) []*http.Cookie {
+	names := make([]string, 0, len(in))
+	for name := range in {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]*http.Cookie, 0, len(names))
+	for _, name := range names {
+		clone := *in[name]
+		out = append(out, &clone)
+	}
+	return out
 }
 
 func (c *PasswordClient) purgeExpiredLocked() {
