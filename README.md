@@ -145,9 +145,13 @@ Discord에서 `/auth`를 실행한 뒤 원하는 방식을 선택합니다.
 
 Discord 사용자는 Chrome, 인증 도우미, localhost 주소 또는 포트 설정을 설치·실행할
 필요가 없습니다. 반대로 비밀번호 방식에는 **봇 호스트의 화면 세션과 GUI
-Chrome/Chromium**이 필요합니다. headless Raspberry Pi·VPS·Docker 배포에서는
-Riot Mobile QR을 사용하세요. Arduino 같은 마이크로컨트롤러는 이 Go 애플리케이션을
-실행하는 지원 대상이 아닙니다.
+Chrome/Chromium**이 필요합니다. 설치 스크립트가 만드는 기본 systemd 서비스는
+비로그인 `valorant` 사용자로 실행되므로, 호스트에 화면이 있어도 그 서비스에서는 GUI
+Chrome을 열 수 없습니다. 기본 systemd·headless Raspberry Pi·VPS·Docker 배포에서는
+Riot Mobile QR을 사용하세요. GUI 비밀번호 로그인은 서비스를 중지한 뒤 실제 데스크톱
+로그인 사용자의 세션에서 별도로 실행할 때만 지원합니다. 자세한 안전 실행 절차는
+[`deploy/README.md`](deploy/README.md)를 참조하세요. Arduino 같은 마이크로컨트롤러는
+이 Go 애플리케이션을 실행하는 지원 대상이 아닙니다.
 
 QR은 약 3분 후 만료됩니다. 여러 Riot 계정은 `/auth`를 계정마다 반복하면 됩니다.
 QR 방식은 봇 서버가 Riot 세션 생성·승인 폴링·토큰 교환을 모두 수행하고 휴대폰은
