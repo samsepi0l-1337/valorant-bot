@@ -461,22 +461,40 @@ func (s *Server) CompleteFromRedirectURL(ctx context.Context, state, redirectURL
 	return s.linkAccount(ctx, discordUserID, accessToken, idToken, "access_token="+accessToken, regionFallback)
 }
 
-// linkAccount resolves the Riot identity behind accessToken and stores it for
-// discordUserID. session is the material encrypted at rest for later reauth.
-func (s *Server) linkAccount(ctx context.Context, discordUserID, accessToken, idToken, session, regionFallback string) (displayName string, err error) {
+type preparedAccountLink struct {
+	account store.Account
+	display string
+}
+
+// prepareAccountLink resolves and encrypts an account without making the
+// irreversible store/notifier commit. Callers with lifecycle state can claim
+// their commit boundary after this context-cancelable work completes.
+func (s *Server) prepareAccountLink(ctx context.Context, discordUserID, accessToken, idToken, session, regionFallback string) (preparedAccountLink, error) {
+	if err := ctx.Err(); err != nil {
+		return preparedAccountLink{}, err
+	}
 	entitlements, err := s.riot.GetEntitlements(ctx, accessToken)
 	if err != nil {
-		return "", fmt.Errorf("entitlements: %w", err)
+		return preparedAccountLink{}, fmt.Errorf("entitlements: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return preparedAccountLink{}, err
 	}
 
 	puuid, err := s.riot.GetUserInfo(ctx, accessToken)
 	if err != nil {
-		return "", fmt.Errorf("userinfo: %w", err)
+		return preparedAccountLink{}, fmt.Errorf("userinfo: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return preparedAccountLink{}, err
 	}
 
 	region, shard, err := s.riot.ResolveValorantRegion(ctx, accessToken, idToken, regionFallback)
 	if err != nil {
-		return "", fmt.Errorf("region: %w", err)
+		return preparedAccountLink{}, fmt.Errorf("region: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return preparedAccountLink{}, err
 	}
 
 	gameName, tagLine := "", ""
@@ -487,41 +505,58 @@ func (s *Server) linkAccount(ctx context.Context, discordUserID, accessToken, id
 		if gn, tl, ierr := riot.GameNameFromIDToken(idToken); ierr == nil {
 			gameName, tagLine = gn, tl
 		} else if nerr != nil {
-			return "", fmt.Errorf("player names: %w", nerr)
+			return preparedAccountLink{}, fmt.Errorf("player names: %w", nerr)
 		}
 	} else if nerr != nil {
-		return "", fmt.Errorf("player names: %w", nerr)
+		return preparedAccountLink{}, fmt.Errorf("player names: %w", nerr)
 	}
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return preparedAccountLink{}, err
 	}
 
 	cipherText, err := s.boxer.Encrypt([]byte(session))
 	if err != nil {
-		return "", err
-	}
-
-	acc := store.Account{
-		DiscordUserID:     discordUserID,
-		PUUID:             puuid,
-		GameName:          gameName,
-		TagLine:           tagLine,
-		Region:            region,
-		Shard:             shard,
-		CookiesCiphertext: cipherText,
+		return preparedAccountLink{}, err
 	}
 	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-	if err := s.store.UpsertRiotAccount(acc); err != nil {
-		return "", err
+		return preparedAccountLink{}, err
 	}
 
-	display := gameName + "#" + tagLine
-	if s.onLinked != nil {
-		s.onLinked(discordUserID, display)
+	return preparedAccountLink{
+		account: store.Account{
+			DiscordUserID:     discordUserID,
+			PUUID:             puuid,
+			GameName:          gameName,
+			TagLine:           tagLine,
+			Region:            region,
+			Shard:             shard,
+			CookiesCiphertext: cipherText,
+		},
+		display: gameName + "#" + tagLine,
+	}, nil
+}
+
+func (s *Server) commitAccountLink(prepared preparedAccountLink) error {
+	if err := s.store.UpsertRiotAccount(prepared.account); err != nil {
+		return err
 	}
-	return display, nil
+	if s.onLinked != nil {
+		s.onLinked(prepared.account.DiscordUserID, prepared.display)
+	}
+	return nil
+}
+
+// linkAccount resolves the Riot identity behind accessToken and stores it for
+// discordUserID. session is the material encrypted at rest for later reauth.
+func (s *Server) linkAccount(ctx context.Context, discordUserID, accessToken, idToken, session, regionFallback string) (string, error) {
+	prepared, err := s.prepareAccountLink(ctx, discordUserID, accessToken, idToken, session, regionFallback)
+	if err != nil {
+		return "", err
+	}
+	if err := s.commitAccountLink(prepared); err != nil {
+		return "", err
+	}
+	return prepared.display, nil
 }
 
 func newState() (string, error) {

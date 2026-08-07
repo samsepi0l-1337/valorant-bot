@@ -70,6 +70,25 @@ type blockingCaptchaStore struct {
 	upsertRelease <-chan struct{}
 }
 
+type cancelBlockingRiot struct {
+	*mockRiot
+	namesStarted chan struct{}
+	namesRelease <-chan struct{}
+}
+
+func (r *cancelBlockingRiot) GetPlayerNames(ctx context.Context, accessToken, entitlementsToken, shard string, puuids []string) ([]riot.PlayerName, error) {
+	select {
+	case r.namesStarted <- struct{}{}:
+	default:
+	}
+	select {
+	case <-r.namesRelease:
+		return r.mockRiot.GetPlayerNames(ctx, accessToken, entitlementsToken, shard, puuids)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (s *blockingCaptchaStore) UpsertRiotAccount(account store.Account) error {
 	select {
 	case s.upsertStarted <- struct{}{}:
@@ -817,9 +836,7 @@ func TestLaunchPasswordCaptchaQueuedDuringTerminalOutcomeIsRejected(t *testing.T
 
 	outcomeDone := make(chan struct{})
 	go func() {
-		_, _ = s.setPasswordOutcome(state, flow, func() passwordOutcome {
-			return passwordOutcome{display: "Player#KR1"}
-		})
+		_, _ = s.setPasswordOutcome(state, flow, passwordOutcome{display: "Player#KR1"})
 		close(outcomeDone)
 	}()
 	<-first.closeStarted
@@ -916,7 +933,7 @@ func TestCaptchaBrowserCloseFailureConvertsPublishedOutcomeToError(t *testing.T)
 			if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
 				t.Fatal(err)
 			}
-			_, _ = s.setPasswordOutcome(state, flow, func() passwordOutcome { return tc.out })
+			_, _ = s.setPasswordOutcome(state, flow, tc.out)
 			s.mu.Lock()
 			published := s.passwordOutcomes[state]
 			s.mu.Unlock()
@@ -1163,16 +1180,12 @@ func TestSetPasswordOutcomeRejectsCleanedState(t *testing.T) {
 	}
 	s.cleanupPasswordState(state)
 
-	buildCalled := false
-	published, publishErr := s.setPasswordOutcome(state, flow, func() passwordOutcome {
-		buildCalled = true
-		return passwordOutcome{display: "Player#KR1"}
-	})
+	published, publishErr := s.setPasswordOutcome(state, flow, passwordOutcome{display: "Player#KR1"})
 	if !errors.Is(publishErr, errPasswordFlowClosed) {
 		t.Fatalf("publish error=%v, want terminal flow closure", publishErr)
 	}
-	if buildCalled || published.done || published.display != "" {
-		t.Fatalf("cleaned state invoked builder or published outcome: called=%v outcome=%+v", buildCalled, published)
+	if published.done || published.display != "" {
+		t.Fatalf("cleaned state published outcome: %+v", published)
 	}
 	s.mu.Lock()
 	_, pending := s.passwordPending[state]
@@ -1185,6 +1198,223 @@ func TestSetPasswordOutcomeRejectsCleanedState(t *testing.T) {
 	if !retained || failure.controller != controller || !errors.Is(failure.err, closeFailure) || !failure.possiblyRunning {
 		t.Fatalf("retained close failure=%+v exists=%v", failure, retained)
 	}
+}
+
+func TestCaptchaSubmitCancellationWinsDuringAccountPreparation(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch:     riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
+		tokens: riot.PasswordTokens{AccessToken: "at-1", IDToken: "id-1", SessionCookie: "ssid=s1"},
+	}
+	s := newCaptchaServer(pw)
+	namesRelease := make(chan struct{})
+	s.riot = &cancelBlockingRiot{
+		mockRiot: &mockRiot{
+			entitlements: "ent",
+			puuid:        "puuid-1",
+			names:        []riot.PlayerName{{GameName: "Player", TagLine: "KR1"}},
+			region:       "kr",
+			shard:        "kr",
+		},
+		namesStarted: make(chan struct{}, 1),
+		namesRelease: namesRelease,
+	}
+	st := s.store.(*mockStore)
+	var linked atomic.Int32
+	s.onLinked = func(string, string) { linked.Add(1) }
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	flow := s.passwordPending[state].flow
+	s.mu.Unlock()
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ensureCaptchaChallenge(context.Background(), state, testCaptchaBrowserSession()); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	submitDone := make(chan struct{})
+	go func() {
+		defer close(submitDone)
+		req := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+		req.Header.Set("Content-Type", "application/json")
+		s.Handler().ServeHTTP(rec, req)
+	}()
+	r := s.riot.(*cancelBlockingRiot)
+	<-r.namesStarted
+
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		s.cleanupPasswordState(state)
+	}()
+	canceledPromptly := false
+	select {
+	case <-flow.ctx.Done():
+		canceledPromptly = true
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(namesRelease)
+	<-submitDone
+	<-cleanupDone
+
+	var response map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if !canceledPromptly {
+		t.Error("cleanup did not signal flow cancellation while Riot identity preparation was blocked")
+	}
+	if response["ok"] != false {
+		t.Errorf("canceled preparation response=%+v, want terminal closure", response)
+	}
+	if len(st.accounts) != 0 || linked.Load() != 0 {
+		t.Errorf("canceled preparation accounts=%+v onLinked=%d, want no irreversible side effects", st.accounts, linked.Load())
+	}
+}
+
+func TestCaptchaSubmitCancellationWinsBeforeMFAPublish(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch:  riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
+		mfa: &riot.MFAChallenge{Email: "a***@example.com", Method: "email"},
+	}
+	s := newCaptchaServer(pw)
+	closeRelease := make(chan struct{})
+	controller := newTestCaptchaBrowserController()
+	controller.closeRelease = closeRelease
+	s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) { return controller, nil }
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	flow := s.passwordPending[state].flow
+	s.mu.Unlock()
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ensureCaptchaChallenge(context.Background(), state, testCaptchaBrowserSession()); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	submitDone := make(chan struct{})
+	go func() {
+		defer close(submitDone)
+		req := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+		req.Header.Set("Content-Type", "application/json")
+		s.Handler().ServeHTTP(rec, req)
+	}()
+	<-controller.closeStarted
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		s.cleanupPasswordState(state)
+	}()
+	canceledPromptly := false
+	select {
+	case <-flow.ctx.Done():
+		canceledPromptly = true
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(closeRelease)
+	<-submitDone
+	<-cleanupDone
+
+	var response map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if !canceledPromptly {
+		t.Error("cleanup did not signal flow cancellation while successful Chrome close was blocked")
+	}
+	if response["ok"] != false || response["mfa"] == true {
+		t.Errorf("canceled MFA response=%+v, want terminal closure", response)
+	}
+	s.mu.Lock()
+	mfaCount := len(s.mfaPending)
+	s.mu.Unlock()
+	if mfaCount != 0 {
+		t.Errorf("canceled MFA left %d continuation(s)", mfaCount)
+	}
+}
+
+func TestCaptchaSubmitAccountCommitClaimWinsBeforeCleanup(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch:     riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
+		tokens: riot.PasswordTokens{AccessToken: "at-1", IDToken: "id-1", SessionCookie: "ssid=s1"},
+	}
+	s := newCaptchaServer(pw)
+	upsertRelease := make(chan struct{})
+	st := &blockingCaptchaStore{
+		mockStore:     newMockStore(),
+		upsertStarted: make(chan struct{}, 1),
+		upsertRelease: upsertRelease,
+	}
+	s.store = st
+	var linked atomic.Int32
+	s.onLinked = func(string, string) { linked.Add(1) }
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	flow := s.passwordPending[state].flow
+	s.mu.Unlock()
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ensureCaptchaChallenge(context.Background(), state, testCaptchaBrowserSession()); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := httptest.NewRecorder()
+	submitDone := make(chan struct{})
+	go func() {
+		defer close(submitDone)
+		req := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+		req.Header.Set("Content-Type", "application/json")
+		s.Handler().ServeHTTP(rec, req)
+	}()
+	<-st.upsertStarted
+	cleanupDone := make(chan struct{})
+	go func() {
+		defer close(cleanupDone)
+		s.cleanupPasswordState(state)
+	}()
+	cleanupObservedCommit := false
+	select {
+	case <-cleanupDone:
+		cleanupObservedCommit = true
+	case <-time.After(150 * time.Millisecond):
+	}
+	flowCanceledBeforeCommit := false
+	select {
+	case <-flow.ctx.Done():
+		flowCanceledBeforeCommit = true
+	default:
+	}
+	close(upsertRelease)
+	<-submitDone
+	<-cleanupDone
+
+	var response map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if !cleanupObservedCommit {
+		t.Error("cleanup blocked behind an already-claimed account commit")
+	}
+	if flowCanceledBeforeCommit {
+		t.Error("cleanup canceled a flow after its irreversible commit claim won")
+	}
+	if response["ok"] != true || len(st.accounts) != 1 || linked.Load() != 1 {
+		t.Errorf("commit-wins response=%+v accounts=%+v onLinked=%d", response, st.accounts, linked.Load())
+	}
+	s.cleanupPasswordState(state)
 }
 
 func TestCaptchaBrowserCloseFailurePreventsSuccessOrTerminalResponse(t *testing.T) {
@@ -1289,9 +1519,7 @@ func TestCaptchaBrowserExitedProfileFailureDoesNotReplaceSuccess(t *testing.T) {
 	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
 		t.Fatal(err)
 	}
-	_, _ = s.setPasswordOutcome(state, flow, func() passwordOutcome {
-		return passwordOutcome{display: "Player#KR1"}
-	})
+	_, _ = s.setPasswordOutcome(state, flow, passwordOutcome{display: "Player#KR1"})
 	s.mu.Lock()
 	published := s.passwordOutcomes[state]
 	failure, recorded := s.captchaCloseFailures[flow]
@@ -1533,9 +1761,7 @@ func TestPasswordOutcomeCleanupErasesCredentials(t *testing.T) {
 	s.mu.Lock()
 	flow := s.passwordPending[state].flow
 	s.mu.Unlock()
-	_, _ = s.setPasswordOutcome(state, flow, func() passwordOutcome {
-		return passwordOutcome{err: errors.New("terminal")}
-	})
+	_, _ = s.setPasswordOutcome(state, flow, passwordOutcome{err: errors.New("terminal")})
 	s.mu.Lock()
 	pending, ok := s.passwordPending[state]
 	s.mu.Unlock()

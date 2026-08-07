@@ -37,10 +37,12 @@ type passwordFlow struct {
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 	launchMu sync.Mutex
-	finishMu sync.Mutex
 	submitMu sync.Mutex
 	browser  captchaBrowserController
-	sealed   bool
+	// Lifecycle fields below are protected by Server.mu.
+	sealed           bool
+	commitClaimed    bool
+	cleanupRequested bool
 }
 
 type passwordOutcome struct {
@@ -133,6 +135,13 @@ func (s *Server) WaitPasswordLogin(ctx context.Context, state string) (displayNa
 		}
 		select {
 		case <-ctx.Done():
+			s.mu.Lock()
+			out, ok := s.passwordOutcomes[state]
+			s.mu.Unlock()
+			if ok && out.done {
+				s.cleanupPasswordState(state)
+				return out.display, out.mfaState, out.mfaHint, out.err
+			}
 			s.cleanupPasswordState(state)
 			return "", "", "", ctx.Err()
 		case <-ready:
@@ -141,55 +150,32 @@ func (s *Server) WaitPasswordLogin(ctx context.Context, state string) (displayNa
 	}
 }
 
-func (s *Server) setPasswordOutcome(state string, flow *passwordFlow, build func() passwordOutcome) (passwordOutcome, error) {
+func (s *Server) claimPasswordFinalization(state string, flow *passwordFlow) error {
 	if flow == nil {
-		return passwordOutcome{}, errPasswordFlowClosed
+		return errPasswordFlowClosed
 	}
-	flow.finishMu.Lock()
-	defer flow.finishMu.Unlock()
-
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	pending, ok := s.passwordPending[state]
 	current := s.passwordOutcomes[state]
 	if !ok || pending.flow != flow || flow.sealed || current.done || flow.ctx.Err() != nil ||
 		time.Now().After(pending.expiresAt) {
-		s.mu.Unlock()
-		return passwordOutcome{}, errPasswordFlowClosed
+		return errPasswordFlowClosed
 	}
 	flow.sealed = true
 	scrubPasswordCredentials(&pending)
 	s.passwordPending[state] = pending
-	s.mu.Unlock()
+	return nil
+}
 
-	closeErr := s.closeOwnedCaptchaBrowser(flow)
-	var out passwordOutcome
-	if captchaBrowserMayBeRunning(closeErr) {
-		out.err = fmt.Errorf("captcha Chrome could not be closed: %w", closeErr)
-	} else {
-		s.mu.Lock()
-		pending, ok = s.passwordPending[state]
-		current = s.passwordOutcomes[state]
-		stillOwned := ok && pending.flow == flow && flow.sealed && !current.done && flow.ctx.Err() == nil &&
-			time.Now().Before(pending.expiresAt)
-		s.mu.Unlock()
-		if !stillOwned {
-			return passwordOutcome{}, errPasswordFlowClosed
-		}
-		if build != nil {
-			out = build()
-		}
-	}
+func (s *Server) publishPasswordOutcome(state string, flow *passwordFlow, out passwordOutcome) (passwordOutcome, error) {
 	out.done = true
-
 	s.mu.Lock()
-	pending, ok = s.passwordPending[state]
-	current = s.passwordOutcomes[state]
-	if !ok || pending.flow != flow || !flow.sealed || current.done || flow.ctx.Err() != nil ||
-		time.Now().After(pending.expiresAt) {
+	pending, ok := s.passwordPending[state]
+	current := s.passwordOutcomes[state]
+	if !ok || pending.flow != flow || !flow.sealed || flow.commitClaimed || current.done ||
+		flow.ctx.Err() != nil || time.Now().After(pending.expiresAt) {
 		s.mu.Unlock()
-		if captchaBrowserMayBeRunning(closeErr) {
-			return passwordOutcome{}, errors.Join(errPasswordFlowClosed, out.err)
-		}
 		return passwordOutcome{}, errPasswordFlowClosed
 	}
 	s.passwordOutcomes[state] = out
@@ -198,6 +184,138 @@ func (s *Server) setPasswordOutcome(state string, flow *passwordFlow, build func
 		delete(s.passwordReady, state)
 	}
 	s.mu.Unlock()
+	return out, nil
+}
+
+func (s *Server) setPasswordOutcome(state string, flow *passwordFlow, out passwordOutcome) (passwordOutcome, error) {
+	if err := s.claimPasswordFinalization(state, flow); err != nil {
+		return passwordOutcome{}, err
+	}
+	closeErr := s.closeOwnedCaptchaBrowser(flow)
+	if captchaBrowserMayBeRunning(closeErr) {
+		out = passwordOutcome{err: fmt.Errorf("captcha Chrome could not be closed: %w", closeErr)}
+	}
+	published, publishErr := s.publishPasswordOutcome(state, flow, out)
+	if publishErr != nil && captchaBrowserMayBeRunning(closeErr) {
+		return passwordOutcome{}, errors.Join(publishErr, out.err)
+	}
+	return published, publishErr
+}
+
+func (s *Server) claimPasswordAccountCommit(state string, flow *passwordFlow) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending, ok := s.passwordPending[state]
+	current := s.passwordOutcomes[state]
+	if !ok || pending.flow != flow || !flow.sealed || flow.commitClaimed || current.done ||
+		flow.ctx.Err() != nil || time.Now().After(pending.expiresAt) {
+		return errPasswordFlowClosed
+	}
+	// This short transition is the irreversible persistence linearization
+	// point. Cleanup that acquires Server.mu first cancels and removes the
+	// flow; cleanup after this point records a request and lets commit finish.
+	flow.commitClaimed = true
+	return nil
+}
+
+func (s *Server) publishCommittedPasswordOutcome(state string, flow *passwordFlow, out passwordOutcome) (passwordOutcome, error) {
+	out.done = true
+	s.mu.Lock()
+	pending, ok := s.passwordPending[state]
+	current := s.passwordOutcomes[state]
+	if !ok || pending.flow != flow || !flow.sealed || !flow.commitClaimed || current.done {
+		s.mu.Unlock()
+		return passwordOutcome{}, errPasswordFlowClosed
+	}
+	flow.commitClaimed = false
+	cleanupRequested := flow.cleanupRequested
+	s.passwordOutcomes[state] = out
+	if ready := s.passwordReady[state]; ready != nil {
+		close(ready)
+		delete(s.passwordReady, state)
+	}
+	s.mu.Unlock()
+	if cleanupRequested {
+		go s.cleanupPasswordState(state)
+	}
+	return out, nil
+}
+
+func passwordSession(tokens riot.PasswordTokens) string {
+	if tokens.SessionCookie != "" {
+		return tokens.SessionCookie
+	}
+	return "access_token=" + tokens.AccessToken
+}
+
+func (s *Server) finishPasswordAccount(ctx context.Context, state string, pending passwordPending, tokens riot.PasswordTokens) (passwordOutcome, error) {
+	flow := pending.flow
+	if err := s.claimPasswordFinalization(state, flow); err != nil {
+		return passwordOutcome{}, err
+	}
+	closeErr := s.closeOwnedCaptchaBrowser(flow)
+	if captchaBrowserMayBeRunning(closeErr) {
+		out := passwordOutcome{err: fmt.Errorf("captcha Chrome could not be closed: %w", closeErr)}
+		published, publishErr := s.publishPasswordOutcome(state, flow, out)
+		if publishErr != nil {
+			return passwordOutcome{}, errors.Join(publishErr, out.err)
+		}
+		return published, nil
+	}
+
+	prepared, err := s.prepareAccountLink(ctx, pending.discordUserID, tokens.AccessToken, tokens.IDToken, passwordSession(tokens), "")
+	if err != nil {
+		return s.publishPasswordOutcome(state, flow, passwordOutcome{err: err})
+	}
+	if err := s.claimPasswordAccountCommit(state, flow); err != nil {
+		return passwordOutcome{}, err
+	}
+	commitErr := s.commitAccountLink(prepared)
+	out := passwordOutcome{display: prepared.display, err: commitErr}
+	if commitErr != nil {
+		out.display = ""
+	}
+	return s.publishCommittedPasswordOutcome(state, flow, out)
+}
+
+func (s *Server) finishPasswordMFA(state string, pending passwordPending, mfaState string, challenge *riot.MFAChallenge, hint string) (passwordOutcome, error) {
+	flow := pending.flow
+	if err := s.claimPasswordFinalization(state, flow); err != nil {
+		return passwordOutcome{}, err
+	}
+	closeErr := s.closeOwnedCaptchaBrowser(flow)
+	if captchaBrowserMayBeRunning(closeErr) {
+		out := passwordOutcome{err: fmt.Errorf("captcha Chrome could not be closed: %w", closeErr)}
+		published, publishErr := s.publishPasswordOutcome(state, flow, out)
+		if publishErr != nil {
+			return passwordOutcome{}, errors.Join(publishErr, out.err)
+		}
+		return published, nil
+	}
+
+	out := passwordOutcome{done: true, mfaState: mfaState, mfaHint: hint}
+	s.mu.Lock()
+	current, ok := s.passwordPending[state]
+	published := s.passwordOutcomes[state]
+	if !ok || current.flow != flow || !flow.sealed || flow.commitClaimed || published.done ||
+		flow.ctx.Err() != nil || time.Now().After(current.expiresAt) {
+		s.mu.Unlock()
+		return passwordOutcome{}, errPasswordFlowClosed
+	}
+	mfaCtx, mfaCancel := context.WithCancel(context.Background())
+	s.mfaPending[mfaState] = mfaPending{
+		discordUserID: pending.discordUserID,
+		challenge:     challenge,
+		flow:          &mfaFlow{ctx: mfaCtx, cancel: mfaCancel},
+		expiresAt:     time.Now().Add(s.pendingTTL),
+	}
+	s.passwordOutcomes[state] = out
+	if ready := s.passwordReady[state]; ready != nil {
+		close(ready)
+		delete(s.passwordReady, state)
+	}
+	s.mu.Unlock()
+	go s.expireMFAState(mfaState)
 	return out, nil
 }
 
@@ -211,40 +329,34 @@ func passwordOutcomeFailure(out passwordOutcome, publishErr error) error {
 func (s *Server) cleanupPasswordState(state string) {
 	s.mu.Lock()
 	pending, ok := s.passwordPending[state]
-	var flow *passwordFlow
-	if ok {
-		flow = pending.flow
+	if !ok {
+		s.mu.Unlock()
+		return
 	}
+	flow := pending.flow
+	if flow != nil && flow.commitClaimed {
+		// The commit claim won. Do not cancel the context underneath an
+		// irreversible store/notifier operation; request cleanup and return
+		// immediately. Publication schedules the actual cleanup afterward.
+		flow.cleanupRequested = true
+		s.mu.Unlock()
+		return
+	}
+	if flow != nil {
+		flow.sealed = true
+	}
+	scrubPasswordCredentials(&pending)
+	delete(s.passwordPending, state)
+	delete(s.passwordOutcomes, state)
+	delete(s.passwordReady, state)
 	s.mu.Unlock()
 
 	if flow != nil {
-		flow.finishMu.Lock()
-	}
-
-	s.mu.Lock()
-	pending, ok = s.passwordPending[state]
-	if ok && pending.flow != flow {
-		ok = false
-	}
-	if ok {
-		if flow != nil {
-			flow.sealed = true
-		}
-		scrubPasswordCredentials(&pending)
-		delete(s.passwordPending, state)
-		delete(s.passwordOutcomes, state)
-		delete(s.passwordReady, state)
-	}
-	s.mu.Unlock()
-	if ok && flow != nil {
 		flow.cancel()
 		if closeErr := s.closeOwnedCaptchaBrowser(flow); closeErr != nil {
 			log.Printf("captcha Chrome cleanup remains incomplete: %v", closeErr)
 		}
-		flow.finishMu.Unlock()
 		flow.wg.Wait()
-	} else if flow != nil {
-		flow.finishMu.Unlock()
 	}
 	if ok && pending.sessionID != "" && s.passwordAuth != nil {
 		s.passwordAuth.CancelCaptcha(pending.sessionID)
@@ -586,9 +698,7 @@ func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Printf("captcha submit failed: %v", err)
-		published, publishErr := s.setPasswordOutcome(req.State, pending.flow, func() passwordOutcome {
-			return passwordOutcome{err: err}
-		})
+		published, publishErr := s.setPasswordOutcome(req.State, pending.flow, passwordOutcome{err: err})
 		outcomeErr := passwordOutcomeFailure(published, publishErr)
 		if outcomeErr == nil {
 			outcomeErr = errPasswordFlowClosed
@@ -599,9 +709,7 @@ func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 	if challenge != nil {
 		mfaState, err := newState()
 		if err != nil {
-			published, publishErr := s.setPasswordOutcome(req.State, pending.flow, func() passwordOutcome {
-				return passwordOutcome{err: err}
-			})
+			published, publishErr := s.setPasswordOutcome(req.State, pending.flow, passwordOutcome{err: err})
 			outcomeErr := passwordOutcomeFailure(published, publishErr)
 			if outcomeErr == nil {
 				outcomeErr = errPasswordFlowClosed
@@ -609,44 +717,17 @@ func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": outcomeErr.Error()})
 			return
 		}
-		s.mu.Lock()
-		current, stillLive := s.passwordPending[req.State]
-		out := s.passwordOutcomes[req.State]
-		if !stillLive || current.flow != pending.flow || current.flow.sealed || out.done || current.flow.ctx.Err() != nil ||
-			current.sessionID != pending.sessionID || !time.Now().Before(current.expiresAt) {
-			s.mu.Unlock()
-			http.Error(w, `{"ok":false,"error":"expired"}`, http.StatusBadRequest)
-			return
-		}
-		mfaCtx, mfaCancel := context.WithCancel(context.Background())
-		s.mfaPending[mfaState] = mfaPending{
-			discordUserID: pending.discordUserID,
-			challenge:     challenge,
-			flow:          &mfaFlow{ctx: mfaCtx, cancel: mfaCancel},
-			expiresAt:     time.Now().Add(s.pendingTTL),
-		}
-		s.mu.Unlock()
 		hint := formatMFAHint(challenge)
-		published, publishErr := s.setPasswordOutcome(req.State, pending.flow, func() passwordOutcome {
-			return passwordOutcome{mfaState: mfaState, mfaHint: hint}
-		})
+		published, publishErr := s.finishPasswordMFA(req.State, pending, mfaState, challenge, hint)
 		if outcomeErr := passwordOutcomeFailure(published, publishErr); outcomeErr != nil {
-			s.cleanupMFAState(mfaState)
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": outcomeErr.Error()})
 			return
 		}
-		go s.expireMFAState(mfaState)
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mfa": true})
 		return
 	}
 
-	published, publishErr := s.setPasswordOutcome(req.State, pending.flow, func() passwordOutcome {
-		display, completeErr := s.completePasswordTokens(ctx, pending.discordUserID, tokens)
-		if completeErr != nil {
-			return passwordOutcome{err: completeErr}
-		}
-		return passwordOutcome{display: display}
-	})
+	published, publishErr := s.finishPasswordAccount(ctx, req.State, pending, tokens)
 	if outcomeErr := passwordOutcomeFailure(published, publishErr); outcomeErr != nil {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": outcomeErr.Error()})
 		return
