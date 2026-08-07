@@ -513,6 +513,11 @@ func TestCaptchaWidgetPage_ExecutesInvisibleChallengeWithRQData(t *testing.T) {
 	if !strings.Contains(body, `id="verify"`) {
 		t.Fatal("invisible captcha needs an explicit user verification control")
 	}
+	if !strings.Contains(body, "async function refreshCaptchaChallenge") ||
+		!strings.Contains(body, "await refreshCaptchaChallenge()") ||
+		!strings.Contains(body, "renderWidget(false)") {
+		t.Fatal("a lost submit response must reload the current challenge instead of reusing its token")
+	}
 	if strings.Contains(body, "host !== 'auth.riotgames.com'") {
 		t.Fatal("widget must reject the legacy Riot OAuth hostname")
 	}

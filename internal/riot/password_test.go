@@ -372,10 +372,15 @@ func TestPasswordCompleteCaptcha_AuthFailureWithCaptchaIsRetry(t *testing.T) {
 
 func TestPasswordCompleteCaptcha_RetryKeepsSession(t *testing.T) {
 	puts := 0
+	var sessionBaggage string
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
+			sessionBaggage = r.Header.Get("baggage")
+			if !strings.HasPrefix(sessionBaggage, "sdksid=") || strings.TrimPrefix(sessionBaggage, "sdksid=") == "" {
+				t.Fatalf("captcha begin baggage = %q, want a non-empty sdksid", sessionBaggage)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"type": "auth",
 				"captcha": map[string]any{
@@ -383,6 +388,9 @@ func TestPasswordCompleteCaptcha_RetryKeepsSession(t *testing.T) {
 				},
 			})
 		case http.MethodPut:
+			if got := r.Header.Get("baggage"); got != sessionBaggage {
+				t.Fatalf("captcha retry baggage = %q, want %q", got, sessionBaggage)
+			}
 			puts++
 			if puts == 1 {
 				http.SetCookie(w, &http.Cookie{Name: "retry.sid", Value: "retry-session"})

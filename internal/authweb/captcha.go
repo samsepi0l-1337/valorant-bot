@@ -657,6 +657,31 @@ function beginVerify() {
   }
 }
 
+async function refreshCaptchaChallenge() {
+  setStatus('Riot 응답을 확인하지 못했습니다. 현재 세션을 다시 확인하는 중…', 'err');
+  try {
+    const res = await fetch('/api/auth/captcha/challenge?state=' + encodeURIComponent(state), {
+      cache: 'no-store',
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) {
+      setStatus((data && data.error) || '세션 확인에 실패했습니다. Discord를 확인하고 /auth 를 다시 실행하세요.', 'err');
+      return;
+    }
+    sitekey = data.sitekey || '';
+    rqdata = data.rqdata || '';
+    challengeVersion = Number(data.version || 0);
+    if (!sitekey || !rqdata || !challengeVersion) {
+      setStatus('현재 Riot 캡차 데이터를 복구하지 못했습니다. /auth 를 다시 실행하세요.', 'err');
+      return;
+    }
+    renderWidget(false);
+    setStatus('응답이 유실되어 새 사람 확인이 필요합니다.\n「사람 확인 시작」을 다시 누르세요.', 'err');
+  } catch (refreshError) {
+    setStatus('세션 복구 네트워크 오류: ' + refreshError + '\n연결이 복구되면 이 페이지를 새로고침하세요.', 'err');
+  }
+}
+
 async function boot() {
   const host = (location.hostname || '').toLowerCase();
   if (host !== 'authenticate.riotgames.com') {
@@ -686,7 +711,7 @@ async function boot() {
     return;
   }
 
-	setStatus('사람 확인 로딩 중…', '');
+  setStatus('사람 확인 로딩 중…', '');
   try {
     await Promise.race([
       loadScript('https://hcaptcha.com/1/api.js?render=explicit&hl=ko'),
@@ -738,7 +763,7 @@ async function onSolved(token) {
     }
     setTimeout(() => { try { window.close(); } catch (e) {} }, 800);
   } catch (e) {
-    setStatus('네트워크 오류: ' + e, 'err');
+    await refreshCaptchaChallenge();
   }
 }
 
