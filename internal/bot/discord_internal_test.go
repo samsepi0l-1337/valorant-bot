@@ -10,13 +10,17 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 )
 
 type acknowledgementCheckingAuth struct {
-	acknowledged   *atomic.Bool
-	beginBeforeACK atomic.Bool
+	acknowledged    *atomic.Bool
+	beginBeforeACK  atomic.Bool
+	launchBeforeACK atomic.Bool
+	launchStarted   chan<- struct{}
+	launchRelease   <-chan struct{}
 }
 
 func (a *acknowledgementCheckingAuth) BeginQRAuth(context.Context, string) (string, string, error) {
@@ -34,7 +38,16 @@ func (*acknowledgementCheckingAuth) BeginPasswordLogin(context.Context, string, 
 	return "", "", nil
 }
 
-func (*acknowledgementCheckingAuth) LaunchPasswordCaptcha(context.Context, string, string) error {
+func (a *acknowledgementCheckingAuth) LaunchPasswordCaptcha(context.Context, string, string) error {
+	if !a.acknowledged.Load() {
+		a.launchBeforeACK.Store(true)
+	}
+	if a.launchStarted != nil {
+		a.launchStarted <- struct{}{}
+	}
+	if a.launchRelease != nil {
+		<-a.launchRelease
+	}
 	return nil
 }
 
@@ -177,5 +190,97 @@ func TestAuthQRComponent_AcknowledgesThenEditsWithMappedAttachment(t *testing.T)
 	}
 	if _, format, err := image.Decode(bytes.NewReader(gotFileBody)); err != nil || format != "png" {
 		t.Fatalf("QR upload is not a decodable PNG: format=%q err=%v", format, err)
+	}
+}
+
+func TestAuthCaptchaComponentAcknowledgesBeforeLaunchingChrome(t *testing.T) {
+	var (
+		acknowledged atomic.Bool
+		callbackType atomic.Int64
+		editCalls    atomic.Int64
+	)
+	launchStarted := make(chan struct{}, 1)
+	launchRelease := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/callback":
+			var response discordgo.InteractionResponse
+			if err := json.NewDecoder(r.Body).Decode(&response); err != nil {
+				t.Errorf("decode callback: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			callbackType.Store(int64(response.Type))
+			if response.Type == discordgo.InteractionResponseDeferredMessageUpdate {
+				acknowledged.Store(true)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case "/original":
+			editCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	originalCallbackEndpoint := discordgo.EndpointInteractionResponse
+	originalWebhookEndpoint := discordgo.EndpointWebhookMessage
+	discordgo.EndpointInteractionResponse = func(_, _ string) string { return srv.URL + "/callback" }
+	discordgo.EndpointWebhookMessage = func(_, _, _ string) string { return srv.URL + "/original" }
+	t.Cleanup(func() {
+		discordgo.EndpointInteractionResponse = originalCallbackEndpoint
+		discordgo.EndpointWebhookMessage = originalWebhookEndpoint
+	})
+
+	session, err := discordgo.New("Bot test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := &acknowledgementCheckingAuth{
+		acknowledged:  &acknowledged,
+		launchStarted: launchStarted,
+		launchRelease: launchRelease,
+	}
+	h := &Handlers{Auth: auth}
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-captcha",
+		AppID: "application-1",
+		Token: "token-captcha",
+		Type:  discordgo.InteractionMessageComponent,
+		Data: discordgo.MessageComponentInteractionData{
+			CustomID: customIDAuthCaptchaPref + "state-1",
+		},
+		User: &discordgo.User{ID: "discord-1"},
+	}}
+
+	done := make(chan struct{})
+	go func() {
+		h.onComponent(session, interaction)
+		close(done)
+	}()
+	select {
+	case <-launchStarted:
+	case <-time.After(time.Second):
+		close(launchRelease)
+		t.Fatal("LaunchPasswordCaptcha did not start")
+	}
+	ackedBeforeLaunchCompleted := acknowledged.Load()
+	close(launchRelease)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("captcha component handler did not finish")
+	}
+
+	if auth.launchBeforeACK.Load() || !ackedBeforeLaunchCompleted {
+		t.Error("LaunchPasswordCaptcha ran before Discord acknowledged the component interaction")
+	}
+	if got := discordgo.InteractionResponseType(callbackType.Load()); got != discordgo.InteractionResponseDeferredMessageUpdate {
+		t.Fatalf("callback type = %d, want deferred message update (%d)", got, discordgo.InteractionResponseDeferredMessageUpdate)
+	}
+	if editCalls.Load() != 1 {
+		t.Fatalf("original-message edit calls = %d, want 1", editCalls.Load())
 	}
 }

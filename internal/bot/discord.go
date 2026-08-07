@@ -201,6 +201,24 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 		}
 		return
 	}
+	if strings.HasPrefix(data.CustomID, customIDAuthCaptchaPref) {
+		if err := deferComponentUpdate(s, i); err != nil {
+			log.Printf("interaction: defer captcha component: %v", err)
+			return
+		}
+		state := strings.TrimPrefix(data.CustomID, customIDAuthCaptchaPref)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		resp, err := h.HandlePasswordCaptchaLaunch(ctx, state, userID, lang)
+		if err != nil {
+			log.Printf("interaction: captcha component error: %v", err)
+			resp = Response{Content: i18n.T(lang, "error.prefix") + err.Error()}
+		}
+		if rerr := editInteraction(s, i, resp); rerr != nil {
+			log.Printf("interaction: captcha component edit failed: %v", rerr)
+		}
+		return
+	}
 
 	var (
 		resp           Response
@@ -208,12 +226,6 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 		keepComponents bool
 	)
 	switch {
-	case strings.HasPrefix(data.CustomID, customIDAuthCaptchaPref):
-		state := strings.TrimPrefix(data.CustomID, customIDAuthCaptchaPref)
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-		defer cancel()
-		resp, err = h.HandlePasswordCaptchaLaunch(ctx, state, userID, lang)
-		keepComponents = true
 	case strings.HasPrefix(data.CustomID, customIDShopPagePrefix):
 		owner, page, noop, ok := parseShopPageCustomID(data.CustomID)
 		if !ok {

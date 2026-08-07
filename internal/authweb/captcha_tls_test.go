@@ -4,9 +4,11 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGenerateCaptchaSelfSigned(t *testing.T) {
@@ -152,4 +154,27 @@ func TestCaptchaChromeProfilesAreIsolatedPerState(t *testing.T) {
 	if firstJoined == secondJoined {
 		t.Fatalf("concurrent captcha launches use identical flags: %v", firstFlags)
 	}
+}
+
+func TestStartChromeLoggedDoesNotWaitForBrowserExit(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=TestChromeLaunchHelperProcess", "--")
+	cmd.Env = append(os.Environ(), "VALORANT_CHROME_LAUNCH_HELPER=1")
+	started := time.Now()
+	if err := startChromeLogged(cmd); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(started)
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	if elapsed >= time.Second {
+		t.Fatalf("Chrome launcher waited %s for the browser process; Discord launch must return immediately", elapsed)
+	}
+}
+
+func TestChromeLaunchHelperProcess(t *testing.T) {
+	if os.Getenv("VALORANT_CHROME_LAUNCH_HELPER") != "1" {
+		return
+	}
+	time.Sleep(2 * time.Second)
 }

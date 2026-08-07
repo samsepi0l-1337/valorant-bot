@@ -3,6 +3,7 @@ package authweb
 import (
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"os"
@@ -32,72 +33,58 @@ func launchSystemChrome(widgetURL string) error {
 }
 
 func launchMacChrome(chromeArgs []string) error {
-	desktop := desktopUser()
-	app := macChromeApp()
-	openArgs := append([]string{"-na", app, "--args"}, chromeArgs...)
-
-	var cmd *exec.Cmd
-	if desktop != "" && desktop != "root" && os.Geteuid() == 0 {
-		if uid, err := userUID(desktop); err == nil {
-			args := append([]string{"asuser", uid, "sudo", "-u", desktop, "open"}, openArgs...)
-			cmd = exec.Command("launchctl", args...)
-			cmd.Env = desktopEnv(desktop)
-		} else {
-			cmd = exec.Command("sudo", append([]string{"-u", desktop, "open"}, openArgs...)...)
-			cmd.Env = desktopEnv(desktop)
-		}
-	} else {
-		cmd = exec.Command("open", openArgs...)
+	bin := findChromeBinary()
+	if bin == "" {
+		return fmt.Errorf("Chrome/Chromium not found — install Google Chrome on the bot machine, or use Riot Mobile QR")
 	}
-	if err := startChromeLogged(cmd); err != nil {
-		// Fallback: exec the binary inside the user's GUI session.
-		bin := findChromeBinary()
-		if bin == "" {
-			return err
-		}
-		log.Printf("captcha chrome open failed (%v); falling back to direct binary", err)
-		return startChromeLogged(chromeCommand(bin, chromeArgs))
-	}
-	return nil
-}
-
-func macChromeApp() string {
-	for _, app := range []string{
-		"/Applications/Google Chrome.app",
-		"/Applications/Chromium.app",
-		"/Applications/Microsoft Edge.app",
-		"Google Chrome",
-	} {
-		if strings.HasSuffix(app, ".app") {
-			if st, err := os.Stat(app); err == nil && st.IsDir() {
-				return app
-			}
-			continue
-		}
-		return app
-	}
-	return "Google Chrome"
+	return startChromeLogged(chromeCommand(bin, chromeArgs))
 }
 
 func startChromeLogged(cmd *exec.Cmd) error {
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		msg := strings.TrimSpace(string(out))
-		if msg == "" {
-			msg = err.Error()
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		log.Printf("captcha chrome start failed: %v", err)
+		return fmt.Errorf("start chrome: %w", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	report := func(err error) error {
+		if err != nil {
+			log.Printf("captcha chrome start failed: %v", err)
+			return fmt.Errorf("start chrome: %w", err)
 		}
-		log.Printf("captcha chrome start failed: %s", msg)
-		return fmt.Errorf("start chrome: %s", msg)
+		return nil
 	}
-	if msg := strings.TrimSpace(string(out)); msg != "" {
-		log.Printf("captcha chrome start: %s", msg)
+
+	timer := time.NewTimer(250 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return report(err)
+	case <-timer.C:
+		go func() {
+			_ = report(<-done)
+		}()
+		return nil
 	}
-	return nil
 }
 
 // chromeCommand runs Chrome as the real desktop user when the bot was started with sudo.
 func chromeCommand(bin string, args []string) *exec.Cmd {
 	if u := desktopUser(); u != "" && u != "root" && os.Geteuid() == 0 {
+		if runtime.GOOS == "darwin" {
+			if uid, err := userUID(u); err == nil {
+				full := append([]string{"asuser", uid, "sudo", "-u", u, bin}, args...)
+				cmd := exec.Command("launchctl", full...)
+				cmd.Env = desktopEnv(u)
+				return cmd
+			}
+		}
 		full := append([]string{"-u", u, bin}, args...)
 		cmd := exec.Command("sudo", full...)
 		cmd.Env = desktopEnv(u)
