@@ -121,6 +121,84 @@ func TestPasswordBeginAndCompleteCaptcha_UsesBrowserSession(t *testing.T) {
 	}
 }
 
+func TestPasswordBeginCaptchaSeedsRiotSessionFromDiscovery(t *testing.T) {
+	var discoveryCalls atomic.Int32
+	var loginSawDiscoveryCookie atomic.Bool
+	var loginSawOutOfScopeCookie atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		discoveryCalls.Add(1)
+		http.SetCookie(w, &http.Cookie{
+			Name:     "__cf_bm",
+			Value:    "cloudflare-session",
+			Domain:   "riotgames.com",
+			Path:     "/",
+			Secure:   true,
+			HttpOnly: true,
+			SameSite: http.SameSiteNoneMode,
+		})
+		http.SetCookie(w, &http.Cookie{Name: "tracking", Value: "not-allowlisted", Domain: "riotgames.com", Path: "/", Secure: true})
+		http.SetCookie(w, &http.Cookie{Name: "tdid", Value: "host-only", Path: "/", Secure: true, HttpOnly: true})
+		http.SetCookie(w, &http.Cookie{Name: "authenticator.sid", Value: "wrong-path", Domain: "riotgames.com", Path: "/discovery-only", Secure: true, HttpOnly: true})
+		http.SetCookie(w, &http.Cookie{Name: "__cflb", Value: "not-secure", Domain: "riotgames.com", Path: "/", HttpOnly: true})
+		_ = json.NewEncoder(w).Encode(map[string]any{"issuer": "riot"})
+	})
+	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
+		if cookie, err := r.Cookie("__cf_bm"); err == nil && cookie.Value == "cloudflare-session" {
+			loginSawDiscoveryCookie.Store(true)
+		}
+		for _, name := range []string{"tracking", "tdid", "authenticator.sid", "__cflb"} {
+			if _, err := r.Cookie(name); err == nil {
+				loginSawOutOfScopeCookie.Store(true)
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"captcha": map[string]any{
+				"hcaptcha": map[string]string{"key": "site-key", "data": "rq-data"},
+			},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := &riot.PasswordClient{
+		HTTPClient:          srv.Client(),
+		AuthBaseURL:         srv.URL,
+		AuthenticateBaseURL: srv.URL,
+	}
+	challenge, err := c.BeginCaptcha(context.Background(), "user", "secret", riot.CaptchaBrowserSession{
+		UserAgent: captchaBrowserUserAgent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := discoveryCalls.Load(); got != 1 {
+		t.Fatalf("discovery calls = %d, want 1 before captcha login", got)
+	}
+	if !loginSawDiscoveryCookie.Load() {
+		t.Fatal("captcha login did not receive the Riot discovery session cookie")
+	}
+	if loginSawOutOfScopeCookie.Load() {
+		t.Fatal("captcha login received an out-of-scope discovery cookie")
+	}
+	var browserCookie *http.Cookie
+	for _, cookie := range challenge.BrowserCookies {
+		if cookie != nil && cookie.Name == "__cf_bm" && cookie.Value != "" {
+			browserCookie = cookie
+		}
+		if cookie != nil && cookie.Value != "" && cookie.Name != "__cf_bm" {
+			t.Fatalf("browser received out-of-scope discovery cookie: %#v", cookie)
+		}
+	}
+	if browserCookie == nil {
+		t.Fatal("browser did not receive the discovery __cf_bm cookie")
+	}
+	if browserCookie.Domain != "riotgames.com" || browserCookie.Path != "/" ||
+		!browserCookie.Secure || !browserCookie.HttpOnly || browserCookie.SameSite != http.SameSiteNoneMode {
+		t.Fatalf("browser discovery cookie attributes changed: %#v", browserCookie)
+	}
+}
+
 func TestPasswordCompleteCaptchaRejectsDifferentBrowserSession(t *testing.T) {
 	var puts atomic.Int32
 	mux := http.NewServeMux()
@@ -139,7 +217,7 @@ func TestPasswordCompleteCaptchaRejectsDifferentBrowserSession(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	c := &riot.PasswordClient{HTTPClient: srv.Client(), AuthenticateBaseURL: srv.URL}
+	c := &riot.PasswordClient{HTTPClient: srv.Client(), AuthBaseURL: srv.URL, AuthenticateBaseURL: srv.URL}
 	ch, err := c.BeginCaptcha(context.Background(), "user", "secret", riot.CaptchaBrowserSession{UserAgent: captchaBrowserUserAgent})
 	if err != nil {
 		t.Fatal(err)
@@ -186,7 +264,7 @@ func TestPasswordBeginCaptchaClearsStaleBrowserCookies(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	c := &riot.PasswordClient{HTTPClient: srv.Client(), AuthenticateBaseURL: srv.URL}
+	c := &riot.PasswordClient{HTTPClient: srv.Client(), AuthBaseURL: srv.URL, AuthenticateBaseURL: srv.URL}
 	ch, err := c.BeginCaptcha(context.Background(), "user", "secret", riot.CaptchaBrowserSession{
 		UserAgent: captchaBrowserUserAgent,
 		Cookies:   map[string]string{"tdid": "stale-browser-value"},
@@ -383,7 +461,7 @@ func TestPasswordCancelCaptchaDeletesSession(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	c := &riot.PasswordClient{HTTPClient: srv.Client(), AuthenticateBaseURL: srv.URL}
+	c := &riot.PasswordClient{HTTPClient: srv.Client(), AuthBaseURL: srv.URL, AuthenticateBaseURL: srv.URL}
 	ch, err := c.BeginCaptcha(context.Background(), "user", "secret", riot.CaptchaBrowserSession{UserAgent: captchaBrowserUserAgent})
 	if err != nil {
 		t.Fatal(err)
@@ -501,6 +579,7 @@ func TestPasswordCompleteCaptcha_AuthFailure(t *testing.T) {
 
 	c := &riot.PasswordClient{
 		HTTPClient:          srv.Client(),
+		AuthBaseURL:         srv.URL,
 		AuthenticateBaseURL: srv.URL,
 	}
 	ch, err := c.BeginCaptcha(context.Background(), "u", "p", riot.CaptchaBrowserSession{UserAgent: captchaBrowserUserAgent})
@@ -540,6 +619,7 @@ func TestPasswordCompleteCaptcha_AuthFailureWithCaptchaIsRetry(t *testing.T) {
 
 	c := &riot.PasswordClient{
 		HTTPClient:          srv.Client(),
+		AuthBaseURL:         srv.URL,
 		AuthenticateBaseURL: srv.URL,
 	}
 	ch, err := c.BeginCaptcha(context.Background(), "u", "p", riot.CaptchaBrowserSession{UserAgent: captchaBrowserUserAgent})

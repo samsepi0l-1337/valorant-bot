@@ -139,6 +139,20 @@ func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password st
 
 	cookies := map[string]string{}
 	sdkSID := randomHex(16)
+	// Match the Riot Client login bootstrap used by the working QR flow. The
+	// discovery response seeds Cloudflare's .riotgames.com session cookie,
+	// which must be present for both the captcha challenge and its submission.
+	discoveryState := map[string]string{}
+	discovery, err := c.doJSON(ctx, http.MethodGet, c.authBase()+"/.well-known/openid-configuration", nil, discoveryState, sdkSID, userAgent)
+	if err != nil {
+		return CaptchaChallenge{}, fmt.Errorf("captcha discovery: %w", err)
+	}
+	discoveryCookies := captchaDiscoveryCookies(discovery.Cookies())
+	discovery.Body.Close()
+	for _, cookie := range discoveryCookies {
+		cookies[cookie.Name] = cookie.Value
+	}
+
 	body := map[string]any{
 		"clientId":   "riot-client",
 		"language":   "",
@@ -172,7 +186,8 @@ func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password st
 		return CaptchaChallenge{}, errors.New("captcha begin: missing hcaptcha challenge")
 	}
 	setCookies := resp.Cookies()
-	browserCookies := mergeCaptchaBrowserCookies(nil, setCookies)
+	browserCookies := mergeCaptchaBrowserCookies(nil, discoveryCookies)
+	browserCookies = mergeCaptchaBrowserCookies(browserCookies, setCookies)
 	browserCookieSync := captchaBrowserCookieSync(browserCookies, setCookies, browser.Cookies, cookies, true)
 
 	sessionID := randomHex(16)
@@ -669,6 +684,40 @@ var captchaBrowserCookieAllowlist = map[string]struct{}{
 	"tdid":              {},
 	"__cflb":            {},
 	"__cf_bm":           {},
+}
+
+// captchaDiscoveryCookies keeps only cookies that a browser would send from
+// auth.riotgames.com discovery to the authenticate.riotgames.com login path.
+// Requiring explicit parent-domain, root-path, and Secure scope prevents a
+// host-only or unrelated discovery cookie from being widened by our map jar.
+func captchaDiscoveryCookies(setCookies []*http.Cookie) []*http.Cookie {
+	out := make([]*http.Cookie, 0, len(setCookies))
+	for _, cookie := range setCookies {
+		if cookie == nil || captchaCookieDeletes(cookie) || !cookie.Secure {
+			continue
+		}
+		if _, allowed := captchaBrowserCookieAllowlist[cookie.Name]; !allowed {
+			continue
+		}
+		domain := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(cookie.Domain)), ".")
+		if domain != "riotgames.com" || !captchaCookiePathMatches("/api/v1/login", cookie.Path) {
+			continue
+		}
+		clone := *cookie
+		out = append(out, &clone)
+	}
+	return out
+}
+
+func captchaCookiePathMatches(requestPath, cookiePath string) bool {
+	if cookiePath == requestPath {
+		return true
+	}
+	if cookiePath == "" || !strings.HasPrefix(requestPath, cookiePath) {
+		return false
+	}
+	return strings.HasSuffix(cookiePath, "/") ||
+		(len(requestPath) > len(cookiePath) && requestPath[len(cookiePath)] == '/')
 }
 
 func mergeCaptchaBrowserCookies(current map[string]*http.Cookie, setCookies []*http.Cookie) map[string]*http.Cookie {
