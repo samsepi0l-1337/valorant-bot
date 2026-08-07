@@ -100,7 +100,7 @@ INVITE="https://discord.com/oauth2/authorize?client_id=${DISCORD_APP_ID}"
 echo
 echo "local setup complete"
 echo "  invite: $INVITE"
-echo "  /auth uses Riot Mobile QR (no port 80 helper)"
+echo "  /auth uses Riot Mobile QR or bot-host Chrome password captcha (no inbound auth port)"
 echo "  run:    make run   or   ./scripts/setup-local.sh --run"
 
 if [[ "$DO_RUN" -eq 1 ]]; then

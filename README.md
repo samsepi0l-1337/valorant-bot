@@ -4,10 +4,11 @@ Discord에서 Valorant 일일 상점 조회, Riot 계정 연동, 위시리스트
 제공하는 봇입니다. Go로 작성되었고 macOS · Windows · Linux · Raspberry Pi ·
 Docker에서 실행할 수 있습니다.
 
-`/auth`는 **Riot Mobile QR 스캔**으로 처리합니다. 브라우저 로그인·URL 붙여넣기·
-포트 80 도우미가 필요 없습니다. 연동 전에
-[Riot Mobile](https://www.riotgames.com/en/riot-mobile)에 해당 Riot 계정으로
-로그인해 두세요.
+`/auth`는 **Riot Mobile QR 스캔** 또는 **아이디/비밀번호 로그인**을 제공합니다.
+별도 프로그램 설치, URL 붙여넣기, 사용자 측 localhost/포트 80은 필요 없습니다.
+비밀번호 로그인은 봇이 실행 중인 데스크톱의 Chrome에서 Riot 캡차를 열고, Riot이
+요구할 때만 Discord 모달로 MFA 코드를 받습니다. 디스플레이가 없는 Raspberry Pi는
+QR 방식을 사용하세요.
 
 ## 빠른 시작 (원샷 스크립트)
 
@@ -75,7 +76,7 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID
 | `DISCORD_TOKEN`    | 예     | 봇 토큰                                              |
 | `DISCORD_APP_ID`   | 예     | 애플리케이션 ID                                      |
 | `BOT_SECRET`       | 예     | 세션 암호화 키 (**32자 이상**, 스크립트가 생성 가능) |
-| `AUTH_BASE_URL`    | 예     | `/invite`·예비 로그인 페이지 주소                    |
+| `AUTH_BASE_URL`    | 예     | `/invite`·선택적 보조 페이지 주소                     |
 | `AUTH_PORT`        | 아니오 | HTTP 포트 (기본 `8787`)                              |
 | `DATABASE_PATH`    | 아니오 | SQLite 경로                                          |
 | `STORE_RESET_CRON` | 아니오 | 레거시 크론 문자열 (일일 시각은 `/channel time`)     |
@@ -83,7 +84,7 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID
 템플릿: `deploy/env.local.example`, `deploy/env.pi.example`,
 `deploy/env.server.example`, `.env.example`
 
-`/auth`(QR)는 `AUTH_BASE_URL`과 무관합니다. 이 값은 `/invite` 등용입니다.
+`/auth`(QR·아이디 로그인)는 `AUTH_BASE_URL`과 무관합니다. 이 값은 `/invite` 등용입니다.
 
 ---
 
@@ -128,9 +129,12 @@ systemd 위치: `/usr/local/bin/valorant-bot`, `/etc/valorant-bot/env`,
 
 ## Riot 계정 연동 (`/auth`)
 
-1. Discord에서 `/auth` → ephemeral 메시지에 QR 표시
-2. Riot Mobile에서 스캔(또는 **Riot Mobile로 열기** 버튼)
-3. 앱에서 승인 → 봇이 세션 저장 → 연동 완료
+Discord에서 `/auth`를 실행한 뒤 원하는 방식을 선택합니다.
+
+- **Riot Mobile QR**: QR을 스캔(또는 **Riot Mobile로 열기**)하고 앱에서 승인합니다.
+- **아이디/비밀번호**: Discord 모달에 계정 정보를 입력하고, 봇 호스트에서 열린
+  Chrome의 「로봇이 아닙니다」를 완료합니다. Riot이 MFA를 요구하면 Discord 모달에
+  이메일 또는 인증 앱 코드를 입력합니다.
 
 QR은 약 3분 후 만료됩니다. 여러 Riot 계정은 `/auth`를 계정마다 반복하면 됩니다.
 
@@ -140,7 +144,7 @@ QR은 약 3분 후 만료됩니다. 여러 Riot 계정은 `/auth`를 계정마�
 
 | 명령                          | 설명                            |
 | ----------------------------- | ------------------------------- |
-| `/auth`                       | Riot Mobile QR로 계정 연동      |
+| `/auth`                       | QR 또는 아이디/비밀번호로 연동  |
 | `/accounts`                   | 연결된 계정 목록                |
 | `/unlink`                     | 계정 연결 해제                  |
 | `/shop`                       | 오늘 상점                       |

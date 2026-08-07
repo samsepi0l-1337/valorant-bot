@@ -12,23 +12,30 @@ import (
 	"testing"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/dosfsociety/valorant-bot/internal/authweb"
 	"github.com/dosfsociety/valorant-bot/internal/bot"
 	"github.com/dosfsociety/valorant-bot/internal/i18n"
 	"github.com/dosfsociety/valorant-bot/internal/store"
 )
 
 type fakeAuth struct {
-	url        string
-	state      string
-	err        error
-	display    string
-	waitErr    error
-	pwDisplay  string
-	pwMFA      string
-	pwHint     string
-	pwErr      error
-	mfaDisplay string
-	mfaErr     error
+	url         string
+	state       string
+	err         error
+	display     string
+	waitErr     error
+	captchaURL  string
+	pwState     string
+	pwErr       error
+	waitDisp    string
+	waitMFA     string
+	waitHint    string
+	waitPWErr   error
+	mfaDisplay  string
+	mfaErr      error
+	launchErr   error
+	launchState string
+	launchUser  string
 }
 
 func (f *fakeAuth) BeginQRAuth(ctx context.Context, discordUserID string) (string, string, error) {
@@ -45,11 +52,32 @@ func (f *fakeAuth) WaitQRLogin(ctx context.Context, state string) (string, error
 	return f.display, nil
 }
 
-func (f *fakeAuth) LoginWithPassword(ctx context.Context, discordUserID, username, password string) (string, string, string, error) {
+func (f *fakeAuth) BeginPasswordLogin(ctx context.Context, discordUserID, username, password string) (string, string, error) {
 	if f.pwErr != nil {
-		return "", "", "", f.pwErr
+		return "", "", f.pwErr
 	}
-	return f.pwDisplay, f.pwMFA, f.pwHint, nil
+	url := f.captchaURL
+	if url == "" {
+		url = "http://127.0.0.1:8787/captcha?state=s1"
+	}
+	st := f.pwState
+	if st == "" {
+		st = "pw-state"
+	}
+	return url, st, nil
+}
+
+func (f *fakeAuth) WaitPasswordLogin(ctx context.Context, state string) (string, string, string, error) {
+	if f.waitPWErr != nil {
+		return "", "", "", f.waitPWErr
+	}
+	return f.waitDisp, f.waitMFA, f.waitHint, nil
+}
+
+func (f *fakeAuth) LaunchPasswordCaptcha(ctx context.Context, state, discordUserID string) error {
+	f.launchState = state
+	f.launchUser = discordUserID
+	return f.launchErr
 }
 
 func (f *fakeAuth) CompletePasswordMFA(ctx context.Context, mfaState, code string) (string, error) {
@@ -197,55 +225,110 @@ func TestHandleAuthQR_Error(t *testing.T) {
 	}
 }
 
-func TestHandlePasswordLogin_Success(t *testing.T) {
-	h := &bot.Handlers{Auth: &fakeAuth{pwDisplay: "Ace#KR1"}}
-	resp, err := h.HandlePasswordLogin(context.Background(), "u1", "user", "pass", "", i18n.KO)
+func TestHandlePasswordLogin_CaptchaServerSideButton(t *testing.T) {
+	h := &bot.Handlers{Auth: &fakeAuth{captchaURL: "http://127.0.0.1:8787/captcha/open?state=abc", pwState: "abc"}}
+	resp, state, err := h.HandlePasswordLogin(context.Background(), "u1", "user", "pass", i18n.KO)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(resp.Content, "Ace#KR1") {
+	if state != "abc" {
+		t.Fatalf("state %q", state)
+	}
+	if !strings.Contains(resp.Content, "캡차 창") {
+		t.Fatalf("content %q", resp.Content)
+	}
+	row := resp.Components[0].(discordgo.ActionsRow)
+	btn := row.Components[0].(discordgo.Button)
+	if btn.URL != "" || btn.CustomID != "auth:captcha:abc" || btn.Style == discordgo.LinkButton {
+		t.Fatalf("button %+v", btn)
+	}
+}
+
+func TestHandlePasswordCaptchaLaunch(t *testing.T) {
+	auth := &fakeAuth{}
+	h := &bot.Handlers{Auth: auth}
+	resp, err := h.HandlePasswordCaptchaLaunch(context.Background(), "captcha-state", "owner-1", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth.launchState != "captcha-state" || auth.launchUser != "owner-1" {
+		t.Fatalf("launch state/user = %q/%q", auth.launchState, auth.launchUser)
+	}
+	if !resp.Ephemeral || !strings.Contains(resp.Content, "Chrome") {
+		t.Fatalf("response = %+v", resp)
+	}
+}
+
+func TestHandlePasswordCaptchaLaunchDenied(t *testing.T) {
+	h := &bot.Handlers{Auth: &fakeAuth{launchErr: authweb.ErrCaptchaOwner}}
+	resp, err := h.HandlePasswordCaptchaLaunch(context.Background(), "captcha-state", "intruder", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.Ephemeral || !strings.Contains(resp.Content, "본인") {
+		t.Fatalf("response = %+v", resp)
+	}
+}
+
+func TestHandlePasswordLogin_NeedChrome(t *testing.T) {
+	h := &bot.Handlers{Auth: &fakeAuth{pwErr: errors.New("Chrome/Chromium not found — install Google Chrome")}}
+	resp, state, err := h.HandlePasswordLogin(context.Background(), "u1", "user", "pass", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != "" {
+		t.Fatalf("state %q", state)
+	}
+	if !strings.Contains(resp.Content, "Chrome") {
 		t.Fatalf("content %q", resp.Content)
 	}
 }
 
-func TestHandlePasswordLogin_MFAButton(t *testing.T) {
-	h := &bot.Handlers{Auth: &fakeAuth{pwMFA: "mfa-1", pwHint: "a***@ex.com"}}
-	resp, err := h.HandlePasswordLogin(context.Background(), "u1", "user", "pass", "", i18n.KO)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(resp.Content, "a***@ex.com") {
+func TestHandlePasswordCaptchaComplete_CaptchaRejected(t *testing.T) {
+	h := &bot.Handlers{}
+	resp := h.HandlePasswordCaptchaComplete("", "", "", errors.New("riot captcha rejected; solve the new captcha"), i18n.KO)
+	if !strings.Contains(resp.Content, "캡차") {
 		t.Fatalf("content %q", resp.Content)
 	}
-	if !strings.Contains(resp.Content, "Riot Mobile") {
-		t.Fatalf("expected Riot Mobile hint in %q", resp.Content)
+	if strings.Contains(resp.Content, "아이디/비밀번호를 확인") {
+		t.Fatalf("should not blame password: %q", resp.Content)
+	}
+}
+
+func TestHandlePasswordCaptchaComplete_MFA(t *testing.T) {
+	h := &bot.Handlers{}
+	resp := h.HandlePasswordCaptchaComplete("", "mfa-1", "a***@ex.com", nil, i18n.KO)
+	if !strings.Contains(resp.Content, "a***@ex.com") {
+		t.Fatalf("content %q", resp.Content)
 	}
 	row := resp.Components[0].(discordgo.ActionsRow)
 	btn := row.Components[0].(discordgo.Button)
 	if btn.CustomID != "auth:mfaopen:mfa-1" {
 		t.Fatalf("customID %q", btn.CustomID)
 	}
-}
-
-func TestHandlePasswordLogin_MFACodeInline(t *testing.T) {
-	h := &bot.Handlers{Auth: &fakeAuth{pwMFA: "mfa-1", mfaDisplay: "Ace#KR1"}}
-	resp, err := h.HandlePasswordLogin(context.Background(), "u1", "user", "pass", "123456", i18n.KO)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(resp.Content, "Ace#KR1") {
-		t.Fatalf("content %q", resp.Content)
+	modal := bot.MFALoginModal("mfa-1", "authenticator", i18n.KO)
+	input := modal.Components[0].(discordgo.ActionsRow).Components[0].(discordgo.TextInput)
+	if !strings.Contains(input.Label, "2FA") && !strings.Contains(input.Label, "Riot Mobile") {
+		t.Fatalf("app modal label %q", input.Label)
 	}
 }
 
-func TestHandlePasswordLogin_MFAAuthenticatorPrompt(t *testing.T) {
-	h := &bot.Handlers{Auth: &fakeAuth{pwMFA: "mfa-1", pwHint: "authenticator"}}
-	resp, err := h.HandlePasswordLogin(context.Background(), "u1", "user", "pass", "", i18n.KO)
+func TestHandlePasswordMFA_InvalidCodeKeepsRetry(t *testing.T) {
+	h := &bot.Handlers{Auth: &fakeAuth{mfaErr: errors.New("invalid multifactor code")}}
+	resp, err := h.HandlePasswordMFA(context.Background(), "mfa-1", "000000", i18n.KO)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(resp.Content, "Riot Mobile") {
+	if !strings.Contains(resp.Content, "올바르지 않습니다") {
 		t.Fatalf("content %q", resp.Content)
+	}
+	if strings.Contains(resp.Content, "invalid riot") || strings.Contains(resp.Content, "아이디/비밀번호를 확인") {
+		t.Fatalf("MFA failure should not look like password failure: %q", resp.Content)
+	}
+	row := resp.Components[0].(discordgo.ActionsRow)
+	btn := row.Components[0].(discordgo.Button)
+	if btn.CustomID != "auth:mfaopen:mfa-1" {
+		t.Fatalf("customID %q", btn.CustomID)
 	}
 }
 

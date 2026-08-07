@@ -51,9 +51,11 @@ type QRAuthClient interface {
 	ExchangeLoginToken(ctx context.Context, loginToken string) (riot.QRTokens, error)
 }
 
-// PasswordAuthClient drives Discord modal username/password login.
+// PasswordAuthClient drives Discord modal username/password login with browser captcha.
 type PasswordAuthClient interface {
-	LoginWithPassword(ctx context.Context, username, password string) (riot.PasswordTokens, *riot.MFAChallenge, error)
+	BeginCaptcha(ctx context.Context, username, password string) (riot.CaptchaChallenge, error)
+	CompleteCaptcha(ctx context.Context, sessionID, captchaToken string) (riot.PasswordTokens, *riot.MFAChallenge, error)
+	CancelCaptcha(sessionID string)
 	SubmitMFA(ctx context.Context, challenge *riot.MFAChallenge, code string) (riot.PasswordTokens, error)
 }
 
@@ -76,6 +78,8 @@ type Deps struct {
 	QRPollInterval time.Duration
 	Boxer          Boxer
 	OnLinked       LinkedNotifier
+	// CaptchaTLSPort serves the Riot-host captcha widget on 127.0.0.1 (default 8443).
+	CaptchaTLSPort int
 }
 
 type authOutcome struct {
@@ -88,7 +92,15 @@ type authOutcome struct {
 type mfaPending struct {
 	discordUserID string
 	challenge     *riot.MFAChallenge
+	flow          *mfaFlow
 	expiresAt     time.Time
+}
+
+type mfaFlow struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
+	submitMu sync.Mutex
 }
 
 // Server serves login redirect + Riot callback catcher.
@@ -104,10 +116,16 @@ type Server struct {
 	onLinked       LinkedNotifier
 	mux            *http.ServeMux
 
-	mu         sync.Mutex
-	outcomes   map[string]authOutcome
-	qrSessions map[string]*riot.QRSession
-	mfaPending map[string]mfaPending
+	mu                   sync.Mutex
+	outcomes             map[string]authOutcome
+	qrSessions           map[string]*riot.QRSession
+	mfaPending           map[string]mfaPending
+	passwordPending      map[string]passwordPending
+	passwordOutcomes     map[string]passwordOutcome
+	passwordReady        map[string]chan struct{}
+	captchaLaunched      map[string]time.Time
+	captchaTLSPort       int
+	launchCaptchaBrowser func(string) error
 }
 
 // New builds an auth web Server.
@@ -120,20 +138,30 @@ func New(d Deps) *Server {
 	if poll <= 0 {
 		poll = defaultQRPollInterval
 	}
+	tlsPort := d.CaptchaTLSPort
+	if tlsPort <= 0 {
+		tlsPort = defaultCaptchaTLSPort
+	}
 	s := &Server{
-		authBaseURL:    strings.TrimRight(d.AuthBaseURL, "/"),
-		pendingTTL:     ttl,
-		store:          d.Store,
-		riot:           d.Riot,
-		qrAuth:         d.QRAuth,
-		passwordAuth:   d.PasswordAuth,
-		qrPollInterval: poll,
-		boxer:          d.Boxer,
-		onLinked:       d.OnLinked,
-		mux:            http.NewServeMux(),
-		outcomes:       make(map[string]authOutcome),
-		qrSessions:     make(map[string]*riot.QRSession),
-		mfaPending:     make(map[string]mfaPending),
+		authBaseURL:          strings.TrimRight(d.AuthBaseURL, "/"),
+		pendingTTL:           ttl,
+		store:                d.Store,
+		riot:                 d.Riot,
+		qrAuth:               d.QRAuth,
+		passwordAuth:         d.PasswordAuth,
+		qrPollInterval:       poll,
+		boxer:                d.Boxer,
+		onLinked:             d.OnLinked,
+		mux:                  http.NewServeMux(),
+		outcomes:             make(map[string]authOutcome),
+		qrSessions:           make(map[string]*riot.QRSession),
+		mfaPending:           make(map[string]mfaPending),
+		passwordPending:      make(map[string]passwordPending),
+		passwordOutcomes:     make(map[string]passwordOutcome),
+		passwordReady:        make(map[string]chan struct{}),
+		captchaLaunched:      make(map[string]time.Time),
+		captchaTLSPort:       tlsPort,
+		launchCaptchaBrowser: launchSystemChrome,
 	}
 	s.mux.HandleFunc("GET /login", s.handleLogin)
 	s.mux.HandleFunc("GET /redirect", s.handleRedirectCatcher)
@@ -142,7 +170,11 @@ func New(d Deps) *Server {
 	s.mux.HandleFunc("OPTIONS /api/auth/callback", s.handleCallbackCORS)
 	s.mux.HandleFunc("GET /api/auth/wait", s.handleWait)
 	s.mux.HandleFunc("GET /install-catcher.sh", s.handleInstallCatcher)
-	s.mux.HandleFunc("GET /", s.handleIndex)
+	s.mux.HandleFunc("GET /captcha/widget", s.handleCaptchaWidgetPage)
+	s.mux.HandleFunc("GET /api/auth/captcha/challenge", s.handleCaptchaChallenge)
+	s.mux.HandleFunc("POST /api/auth/captcha", s.handleCaptchaSubmit)
+	s.mux.HandleFunc("OPTIONS /api/auth/captcha", s.handleCaptchaSubmit)
+	s.mux.HandleFunc("GET /{$}", s.handleIndex)
 	return s
 }
 
@@ -252,79 +284,103 @@ func (s *Server) completeQRLogin(ctx context.Context, state string, tokens riot.
 	return s.linkAccount(ctx, discordUserID, tokens.AccessToken, tokens.IDToken, session, "")
 }
 
-// LoginWithPassword authenticates via Discord modal credentials and links the account.
-// When MFA is required, mfaState is non-empty for CompletePasswordMFA.
-func (s *Server) LoginWithPassword(ctx context.Context, discordUserID, username, password string) (displayName, mfaState, mfaHint string, err error) {
-	if s.passwordAuth == nil {
-		return "", "", "", fmt.Errorf("password auth not configured")
-	}
-	tokens, challenge, err := s.passwordAuth.LoginWithPassword(ctx, username, password)
-	if err != nil {
-		return "", "", "", err
-	}
-	if challenge != nil {
-		state, err := newState()
-		if err != nil {
-			return "", "", "", err
-		}
-		s.mu.Lock()
-		s.mfaPending[state] = mfaPending{
-			discordUserID: discordUserID,
-			challenge:     challenge,
-			expiresAt:     time.Now().Add(s.pendingTTL),
-		}
-		s.mu.Unlock()
-		return "", state, formatMFAHint(challenge), nil
-	}
-	display, err := s.completePasswordTokens(ctx, discordUserID, tokens)
-	return display, "", "", err
-}
-
-func formatMFAHint(challenge *riot.MFAChallenge) string {
-	if challenge == nil {
-		return ""
-	}
-	if email := strings.TrimSpace(challenge.Email); email != "" {
-		return email
-	}
-	method := strings.ToLower(strings.TrimSpace(challenge.Method))
-	if method == "" {
-		for _, m := range challenge.Methods {
-			if method = strings.ToLower(strings.TrimSpace(m)); method != "" {
-				break
-			}
-		}
-	}
-	switch method {
-	case "email":
-		return "email"
-	case "authenticator", "otp", "otpauth", "riot_mobile", "mobile":
-		return "authenticator"
-	default:
-		return method
-	}
-}
-
 // CompletePasswordMFA finishes a password login after the Discord MFA modal.
 func (s *Server) CompletePasswordMFA(ctx context.Context, mfaState, code string) (displayName string, err error) {
 	if s.passwordAuth == nil {
 		return "", fmt.Errorf("password auth not configured")
 	}
-	s.mu.Lock()
-	pending, ok := s.mfaPending[mfaState]
-	s.mu.Unlock()
-	if !ok || time.Now().After(pending.expiresAt) {
+	pending, done, ok := s.beginMFAOperation(mfaState)
+	if !ok {
 		return "", fmt.Errorf("unknown or expired mfa session")
 	}
-	tokens, err := s.passwordAuth.SubmitMFA(ctx, pending.challenge, code)
+	defer done()
+	pending.flow.submitMu.Lock()
+	defer pending.flow.submitMu.Unlock()
+
+	pending, ok = s.liveMFAState(mfaState, pending.flow)
+	if !ok {
+		return "", fmt.Errorf("unknown or expired mfa session")
+	}
+	requestCtx, requestCancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(pending.flow.ctx, requestCancel)
+	tokens, err := s.passwordAuth.SubmitMFA(requestCtx, pending.challenge, code)
+	stop()
+	requestCancel()
+	pending, live := s.liveMFAState(mfaState, pending.flow)
+	if !live {
+		return "", fmt.Errorf("unknown or expired mfa session")
+	}
 	if err != nil {
 		// Keep pending so the user can retry email / Riot Mobile codes.
 		return "", err
 	}
+
+	// Atomically claim this one-time MFA state before linking. Any concurrent
+	// modal submission will observe the missing state after submitMu unlocks.
 	s.mu.Lock()
+	current, stillLive := s.mfaPending[mfaState]
+	stillLive = stillLive && current.flow == pending.flow && current.flow.ctx.Err() == nil &&
+		time.Now().Before(current.expiresAt)
+	if stillLive {
+		delete(s.mfaPending, mfaState)
+	}
+	s.mu.Unlock()
+	if !stillLive {
+		return "", fmt.Errorf("unknown or expired mfa session")
+	}
+	defer pending.flow.cancel()
+	return s.completePasswordTokens(ctx, pending.discordUserID, tokens)
+}
+
+func (s *Server) beginMFAOperation(mfaState string) (mfaPending, func(), bool) {
+	s.mu.Lock()
+	pending, ok := s.mfaPending[mfaState]
+	if !ok || pending.flow == nil || pending.flow.ctx.Err() != nil || time.Now().After(pending.expiresAt) {
+		s.mu.Unlock()
+		return mfaPending{}, nil, false
+	}
+	pending.flow.wg.Add(1)
+	s.mu.Unlock()
+	return pending, pending.flow.wg.Done, true
+}
+
+func (s *Server) liveMFAState(mfaState string, flow *mfaFlow) (mfaPending, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending, ok := s.mfaPending[mfaState]
+	if !ok || pending.flow != flow || flow.ctx.Err() != nil || time.Now().After(pending.expiresAt) {
+		return mfaPending{}, false
+	}
+	return pending, true
+}
+
+func (s *Server) cleanupMFAState(mfaState string) {
+	s.mu.Lock()
+	pending, ok := s.mfaPending[mfaState]
 	delete(s.mfaPending, mfaState)
 	s.mu.Unlock()
-	return s.completePasswordTokens(ctx, pending.discordUserID, tokens)
+	if ok && pending.flow != nil {
+		pending.flow.cancel()
+		pending.flow.wg.Wait()
+	}
+}
+
+func (s *Server) expireMFAState(mfaState string) {
+	for {
+		s.mu.Lock()
+		pending, ok := s.mfaPending[mfaState]
+		s.mu.Unlock()
+		if !ok {
+			return
+		}
+		wait := time.Until(pending.expiresAt)
+		if wait <= 0 {
+			s.cleanupMFAState(mfaState)
+			return
+		}
+		timer := time.NewTimer(wait)
+		<-timer.C
+	}
 }
 
 func (s *Server) completePasswordTokens(ctx context.Context, discordUserID string, tokens riot.PasswordTokens) (string, error) {
@@ -430,6 +486,9 @@ func (s *Server) linkAccount(ctx context.Context, discordUserID, accessToken, id
 	} else if nerr != nil {
 		return "", fmt.Errorf("player names: %w", nerr)
 	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 
 	cipherText, err := s.boxer.Encrypt([]byte(session))
 	if err != nil {
@@ -444,6 +503,9 @@ func (s *Server) linkAccount(ctx context.Context, discordUserID, accessToken, id
 		Region:            region,
 		Shard:             shard,
 		CookiesCiphertext: cipherText,
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	if err := s.store.UpsertRiotAccount(acc); err != nil {
 		return "", err

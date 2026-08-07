@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"sync"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/dosfsociety/valorant-bot/internal/skins"
@@ -12,7 +13,10 @@ import (
 type AuthStarter interface {
 	BeginQRAuth(ctx context.Context, discordUserID string) (loginURL string, state string, err error)
 	WaitQRLogin(ctx context.Context, state string) (displayName string, err error)
-	LoginWithPassword(ctx context.Context, discordUserID, username, password string) (displayName, mfaState, mfaHint string, err error)
+	// BeginPasswordLogin starts bot-host Chrome; the URL result is retained for compatibility and is normally empty.
+	BeginPasswordLogin(ctx context.Context, discordUserID, username, password string) (captchaURL, state string, err error)
+	LaunchPasswordCaptcha(ctx context.Context, state, discordUserID string) error
+	WaitPasswordLogin(ctx context.Context, state string) (displayName, mfaState, mfaHint string, err error)
 	CompletePasswordMFA(ctx context.Context, mfaState, code string) (displayName string, err error)
 }
 
@@ -84,6 +88,9 @@ type Handlers struct {
 	Lang     LanguageStore
 
 	shopCache *shopPageCache
+
+	mfaHintMu sync.Mutex
+	mfaHints  map[string]string // mfaState → email hint or "authenticator"
 }
 
 // Response is a Discord reply shape tests can assert without the gateway.

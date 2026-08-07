@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/dosfsociety/valorant-bot/internal/authweb"
 	"github.com/dosfsociety/valorant-bot/internal/i18n"
 	"github.com/dosfsociety/valorant-bot/internal/riot"
 	"github.com/dosfsociety/valorant-bot/internal/skins"
@@ -21,11 +23,13 @@ const qrAttachmentName = "riot-qr.png"
 // qrImageSize is the QR PNG edge length in pixels; large enough to scan from a
 // desktop screen without dominating the ephemeral message.
 const qrImageSize = 320
+const mfaHintTTL = 15 * time.Minute
 
 const (
 	customIDAuthQR          = "auth:qr"
 	customIDAuthPassword    = "auth:password"
 	customIDAuthPWModal     = "auth:pw"
+	customIDAuthCaptchaPref = "auth:captcha:"
 	customIDAuthMFAPref     = "auth:mfa:"
 	customIDAuthMFAOpenPref = "auth:mfaopen:"
 )
@@ -96,8 +100,8 @@ func (h *Handlers) HandleAuthQR(ctx context.Context, discordUserID string, lang 
 	}, state, nil
 }
 
-// PasswordLoginModal is the Discord modal for Riot username/password.
-// Optional MFA code lets users submit email / Riot Mobile OTP in one step.
+// PasswordLoginModal is step 1: Riot username/password only.
+// Step 2 (email or authenticator OTP) opens after Riot challenges MFA.
 func PasswordLoginModal(lang i18n.Lang) *discordgo.InteractionResponseData {
 	return &discordgo.InteractionResponseData{
 		CustomID: customIDAuthPWModal,
@@ -127,28 +131,18 @@ func PasswordLoginModal(lang i18n.Lang) *discordgo.InteractionResponseData {
 					},
 				},
 			},
-			discordgo.ActionsRow{
-				Components: []discordgo.MessageComponent{
-					discordgo.TextInput{
-						CustomID:    "mfa_code",
-						Label:       i18n.T(lang, "auth.password.mfa_code"),
-						Style:       discordgo.TextInputShort,
-						Placeholder: "000000",
-						Required:    false,
-						MinLength:   0,
-						MaxLength:   8,
-					},
-				},
-			},
 		},
 	}
 }
 
-// MFALoginModal asks for an email or Riot Mobile OTP after password MFA.
+// MFALoginModal is step 2: email or authenticator / Riot Mobile OTP.
 func MFALoginModal(mfaState string, hint string, lang i18n.Lang) *discordgo.InteractionResponseData {
-	placeholder := "000000"
-	if strings.Contains(hint, "@") {
-		placeholder = hint
+	label := i18n.T(lang, "auth.mfa.code")
+	switch {
+	case strings.Contains(hint, "@"), hint == "email":
+		label = i18n.T(lang, "auth.mfa.code_email")
+	case hint == "authenticator", hint == "otp", hint == "otpauth", hint == "riot_mobile", hint == "mobile":
+		label = i18n.T(lang, "auth.mfa.code_app")
 	}
 	return &discordgo.InteractionResponseData{
 		CustomID: customIDAuthMFAPref + mfaState,
@@ -158,9 +152,9 @@ func MFALoginModal(mfaState string, hint string, lang i18n.Lang) *discordgo.Inte
 				Components: []discordgo.MessageComponent{
 					discordgo.TextInput{
 						CustomID:    "code",
-						Label:       i18n.T(lang, "auth.mfa.code"),
+						Label:       label,
 						Style:       discordgo.TextInputShort,
-						Placeholder: placeholder,
+						Placeholder: "000000",
 						Required:    true,
 						MinLength:   6,
 						MaxLength:   8,
@@ -175,6 +169,8 @@ func mfaPrompt(lang i18n.Lang, hint string) string {
 	switch {
 	case strings.Contains(hint, "@"):
 		return fmt.Sprintf(i18n.T(lang, "auth.mfa.prompt_email"), hint)
+	case hint == "email":
+		return i18n.T(lang, "auth.mfa.prompt_email_generic")
 	case hint == "authenticator", hint == "otp", hint == "otpauth", hint == "riot_mobile", hint == "mobile":
 		return i18n.T(lang, "auth.mfa.prompt_app")
 	default:
@@ -182,75 +178,178 @@ func mfaPrompt(lang i18n.Lang, hint string) string {
 	}
 }
 
-// HandlePasswordLogin links an account from Discord modal credentials.
-// mfaCode is optional; when Riot challenges MFA and a code was provided, it is submitted immediately.
-func (h *Handlers) HandlePasswordLogin(ctx context.Context, discordUserID, username, password, mfaCode string, lang i18n.Lang) (Response, error) {
+func (h *Handlers) rememberMFAHint(state, hint string) {
+	if state == "" {
+		return
+	}
+	h.mfaHintMu.Lock()
+	defer h.mfaHintMu.Unlock()
+	if h.mfaHints == nil {
+		h.mfaHints = make(map[string]string)
+	}
+	h.mfaHints[state] = hint
+	go func() {
+		timer := time.NewTimer(mfaHintTTL)
+		defer timer.Stop()
+		<-timer.C
+		h.clearMFAHint(state)
+	}()
+}
+
+func (h *Handlers) mfaHintFor(state string) string {
+	h.mfaHintMu.Lock()
+	defer h.mfaHintMu.Unlock()
+	if h.mfaHints == nil {
+		return ""
+	}
+	return h.mfaHints[state]
+}
+
+func (h *Handlers) clearMFAHint(state string) {
+	h.mfaHintMu.Lock()
+	defer h.mfaHintMu.Unlock()
+	if h.mfaHints != nil {
+		delete(h.mfaHints, state)
+	}
+}
+
+func mfaRetryComponents(mfaState string, lang i18n.Lang) []discordgo.MessageComponent {
+	return []discordgo.MessageComponent{
+		discordgo.ActionsRow{
+			Components: []discordgo.MessageComponent{
+				discordgo.Button{
+					Label:    i18n.T(lang, "auth.mfa.button"),
+					Style:    discordgo.PrimaryButton,
+					CustomID: customIDAuthMFAOpenPref + mfaState,
+				},
+			},
+		},
+	}
+}
+
+// HandlePasswordLogin is step 1: start bot-host Chrome after username/password.
+func (h *Handlers) HandlePasswordLogin(ctx context.Context, discordUserID, username, password string, lang i18n.Lang) (Response, string, error) {
 	if h.Auth == nil {
-		return Response{}, fmt.Errorf("auth not configured")
+		return Response{}, "", fmt.Errorf("auth not configured")
 	}
-	display, mfaState, mfaHint, err := h.Auth.LoginWithPassword(ctx, discordUserID, username, password)
+	_, state, err := h.Auth.BeginPasswordLogin(ctx, discordUserID, username, password)
 	if err != nil {
-		return Response{
-			Ephemeral: true,
-			Content:   fmt.Sprintf(i18n.T(lang, "auth.password.failed"), err),
-		}, nil
-	}
-	if mfaState != "" {
-		if code := strings.TrimSpace(mfaCode); code != "" {
-			return h.HandlePasswordMFA(ctx, mfaState, code, lang)
+		errText := strings.ToLower(err.Error())
+		if strings.Contains(errText, "chrome") || strings.Contains(errText, "chromium") {
+			return Response{
+				Ephemeral: true,
+				Content:   i18n.T(lang, "auth.captcha.need_chrome"),
+			}, "", nil
 		}
 		return Response{
 			Ephemeral: true,
-			Content:   mfaPrompt(lang, mfaHint),
-			Components: []discordgo.MessageComponent{
-				discordgo.ActionsRow{
-					Components: []discordgo.MessageComponent{
-						discordgo.Button{
-							Label:    i18n.T(lang, "auth.mfa.button"),
-							Style:    discordgo.PrimaryButton,
-							CustomID: customIDAuthMFAOpenPref + mfaState,
-						},
+			Content:   fmt.Sprintf(i18n.T(lang, "auth.password.failed"), err),
+		}, "", nil
+	}
+	resp := Response{
+		Ephemeral: true,
+		Content:   i18n.T(lang, "auth.captcha.prompt"),
+		Components: []discordgo.MessageComponent{
+			discordgo.ActionsRow{
+				Components: []discordgo.MessageComponent{
+					discordgo.Button{
+						Label:    i18n.T(lang, "auth.captcha.button"),
+						Style:    discordgo.SecondaryButton,
+						CustomID: customIDAuthCaptchaPref + state,
 					},
 				},
 			},
-		}, nil
+		},
+	}
+	return resp, state, nil
+}
+
+// HandlePasswordCaptchaLaunch handles the Discord custom-ID button by opening
+// Chrome on the bot host after validating the login owner.
+func (h *Handlers) HandlePasswordCaptchaLaunch(ctx context.Context, state, discordUserID string, lang i18n.Lang) (Response, error) {
+	if h.Auth == nil {
+		return Response{}, fmt.Errorf("auth not configured")
+	}
+	err := h.Auth.LaunchPasswordCaptcha(ctx, state, discordUserID)
+	if err == nil {
+		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.launched")}, nil
+	}
+	if errors.Is(err, authweb.ErrCaptchaOwner) {
+		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.denied")}, nil
+	}
+	errText := strings.ToLower(err.Error())
+	if strings.Contains(errText, "chrome") || strings.Contains(errText, "chromium") {
+		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.need_chrome")}, nil
+	}
+	if strings.Contains(errText, "expired") {
+		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.expired")}, nil
+	}
+	return Response{Ephemeral: true, Content: fmt.Sprintf(i18n.T(lang, "auth.captcha.launch_failed"), err)}, nil
+}
+
+// HandlePasswordCaptchaComplete builds the Discord reply after browser captcha finishes.
+func (h *Handlers) HandlePasswordCaptchaComplete(display, mfaState, mfaHint string, err error, lang i18n.Lang) Response {
+	if err != nil {
+		msg := fmt.Sprintf(i18n.T(lang, "auth.password.failed"), err)
+		errText := strings.ToLower(err.Error())
+		switch {
+		case strings.Contains(errText, "deadline exceeded"), strings.Contains(errText, "context canceled"):
+			msg = i18n.T(lang, "auth.captcha.timeout")
+		case strings.Contains(errText, "chrome"), strings.Contains(errText, "chromium"):
+			msg = i18n.T(lang, "auth.captcha.need_chrome")
+		case strings.Contains(errText, "unknown or expired captcha"),
+			strings.Contains(errText, "captcha session expired"):
+			msg = i18n.T(lang, "auth.captcha.expired")
+		case strings.Contains(errText, "invalid_request"),
+			strings.Contains(errText, "captcha"),
+			errors.Is(err, riot.ErrPasswordCaptcha):
+			msg = i18n.T(lang, "auth.captcha.rejected")
+		}
+		return Response{
+			Ephemeral:  true,
+			Content:    msg,
+			Embeds:     []*discordgo.MessageEmbed{},
+			Components: []discordgo.MessageComponent{},
+		}
+	}
+	if mfaState != "" {
+		h.rememberMFAHint(mfaState, mfaHint)
+		return Response{
+			Ephemeral:  true,
+			Content:    mfaPrompt(lang, mfaHint),
+			Embeds:     []*discordgo.MessageEmbed{},
+			Components: mfaRetryComponents(mfaState, lang),
+		}
 	}
 	return Response{
 		Ephemeral:  true,
 		Content:    fmt.Sprintf(i18n.T(lang, "auth.qr.done"), display),
 		Embeds:     []*discordgo.MessageEmbed{},
 		Components: []discordgo.MessageComponent{},
-	}, nil
+	}
 }
 
-// HandlePasswordMFA completes MFA for a pending password login.
+// HandlePasswordMFA is step 2: submit email or authenticator OTP.
 func (h *Handlers) HandlePasswordMFA(ctx context.Context, mfaState, code string, lang i18n.Lang) (Response, error) {
 	if h.Auth == nil {
 		return Response{}, fmt.Errorf("auth not configured")
 	}
 	display, err := h.Auth.CompletePasswordMFA(ctx, mfaState, code)
 	if err != nil {
-		msg := fmt.Sprintf(i18n.T(lang, "auth.password.failed"), err)
-		if strings.Contains(strings.ToLower(err.Error()), "invalid multifactor") ||
-			strings.Contains(strings.ToLower(err.Error()), "invalid_code") {
-			msg = i18n.T(lang, "auth.mfa.invalid")
+		msg := i18n.T(lang, "auth.mfa.invalid")
+		errText := strings.ToLower(err.Error())
+		if !strings.Contains(errText, "invalid multifactor") &&
+			!strings.Contains(errText, "invalid_code") &&
+			!strings.Contains(errText, "invalid riot username") {
+			msg = fmt.Sprintf(i18n.T(lang, "auth.mfa.failed"), err)
 		}
 		return Response{
-			Ephemeral: true,
-			Content:   msg,
-			Components: []discordgo.MessageComponent{
-				discordgo.ActionsRow{
-					Components: []discordgo.MessageComponent{
-						discordgo.Button{
-							Label:    i18n.T(lang, "auth.mfa.button"),
-							Style:    discordgo.PrimaryButton,
-							CustomID: customIDAuthMFAOpenPref + mfaState,
-						},
-					},
-				},
-			},
+			Ephemeral:  true,
+			Content:    msg,
+			Components: mfaRetryComponents(mfaState, lang),
 		}, nil
 	}
+	h.clearMFAHint(mfaState)
 	return Response{
 		Ephemeral:  true,
 		Content:    fmt.Sprintf(i18n.T(lang, "auth.qr.done"), display),

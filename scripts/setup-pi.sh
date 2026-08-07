@@ -27,7 +27,8 @@ Usage: ./scripts/setup-pi.sh [options]
   --skip-start      Install only; do not start systemd
   -h, --help        Show help
 
-/auth is Riot Mobile QR — the Pi needs no inbound port 80 and no browser.
+/auth needs no inbound port. Password login requires a Pi desktop session with
+Chrome/Chromium; headless Pi installations should use Riot Mobile QR.
 EOF
 }
 
@@ -137,7 +138,7 @@ if [[ -n "$HOST" ]]; then
 
   echo
   echo "Pi setup complete on $HOST"
-  echo "  AUTH_BASE_URL=${AUTH_BASE_URL}  (/invite only; /auth is QR)"
+  echo "  AUTH_BASE_URL=${AUTH_BASE_URL}  (/invite only; /auth needs no inbound URL)"
   echo "  invite: https://discord.com/oauth2/authorize?client_id=${DISCORD_APP_ID}"
   echo "  logs:   ssh $HOST 'sudo journalctl -u valorant-bot -f'"
   exit 0

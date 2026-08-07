@@ -1,3 +1,5 @@
+# AGENTS.md
+
 ## Learned User Preferences
 
 - Build a Discord bot in the jettbot style: `/auth` offers Riot Mobile QR or
@@ -14,9 +16,10 @@
 - Bot invite must use a Discord OAuth authorize URL so users pick the server; do
   not require configuring a Guild ID.
 - Auth must need no user-installed helper and no user-side localhost: keep Riot
-  Mobile QR, and Discord modal username/password where the Raspberry Pi bot
-  authenticates directly to Riot with those credentials; MFA uses a Discord
-  modal when needed; skip captcha (fall back to QR if Riot requires it).
+  Mobile QR, and Discord modal username/password then a bot-host Chrome「I'm not
+  a robot」 window (tokens must be minted as `authenticate.riotgames.com`, not on
+  trycloudflare.com); MFA uses a Discord modal only when Riot requires it.
+  Headless Pi without a display should use QR (or a future captcha solver).
 - Communicate in Korean for product and setup explanations unless asked
   otherwise; bot language settings should localize UI and skin display names.
 - `/shop` and daily store messages should show resolved skin names and images
@@ -45,9 +48,14 @@
   `qrlogin.riotgames.com/riotmobile?...` → poll until `type:"success"` → POST
   `auth.riotgames.com/api/v1/login-token` (`persist_login:true`, yields `ssid`)
   → authorization for the token URI.
-- The bot never binds port 80 and needs no inbound port for `/auth`;
-  `AUTH_BASE_URL` / `AUTH_PORT` only serve `/invite` and optional pages
-  (`authcatcher` is not the primary auth path).
+- The bot never binds port 80 and needs no inbound port for either `/auth`
+  method. `AUTH_BASE_URL` / `AUTH_PORT` serve `/invite` and optional local
+  helper pages. The Discord captcha re-open button invokes the bot host directly
+  (it is not a localhost link on the user's device). Password captcha opens
+  local Chrome with `--host-resolver-rules` against loopback TLS (port 443 when
+  available, otherwise 8443) so hCaptcha tokens use host
+  `authenticate.riotgames.com`. Tunnel-domain captcha tokens are rejected by
+  Riot as `auth_failure`. `authcatcher` is not the primary auth path.
 - QR and password logins store the `ssid` cookie (encrypted) so
   `ShopFetcher.resolveAccessToken` can `CookieReauth` for daily store checks.
 - Multi-account `/shop` uses `BuildShopEmbeds` (one embed per account) plus

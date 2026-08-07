@@ -169,7 +169,7 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 		mfaState := strings.TrimPrefix(data.CustomID, customIDAuthMFAOpenPref)
 		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseModal,
-			Data: MFALoginModal(mfaState, "", lang),
+			Data: MFALoginModal(mfaState, h.mfaHintFor(mfaState), lang),
 		}); err != nil {
 			log.Printf("interaction: mfa modal: %v", err)
 		}
@@ -185,6 +185,12 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 	switch {
 	case data.CustomID == customIDAuthQR:
 		resp, qrState, err = h.HandleAuthQR(context.Background(), userID, lang)
+		keepComponents = true
+	case strings.HasPrefix(data.CustomID, customIDAuthCaptchaPref):
+		state := strings.TrimPrefix(data.CustomID, customIDAuthCaptchaPref)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		resp, err = h.HandlePasswordCaptchaLaunch(ctx, state, userID, lang)
 		keepComponents = true
 	case strings.HasPrefix(data.CustomID, customIDShopPagePrefix):
 		owner, page, noop, ok := parseShopPageCustomID(data.CustomID)
@@ -276,12 +282,17 @@ func (h *Handlers) onModal(s *discordgo.Session, i *discordgo.InteractionCreate)
 
 	switch {
 	case data.CustomID == customIDAuthPWModal:
-		resp, err := h.HandlePasswordLogin(ctx, userID, modalValue(data, "username"), modalValue(data, "password"), modalValue(data, "mfa_code"), lang)
+		resp, captchaState, err := h.HandlePasswordLogin(ctx, userID, modalValue(data, "username"), modalValue(data, "password"), lang)
 		if err != nil {
 			_ = respondEphemeral(s, i, i18n.T(lang, "error.prefix")+err.Error())
 			return
 		}
-		_ = respondEphemeralWithComponents(s, i, resp)
+		if rerr := respondEphemeralWithComponents(s, i, resp); rerr != nil {
+			log.Printf("interaction: password captcha reply: %v", rerr)
+		}
+		if captchaState != "" {
+			go h.watchPasswordCaptcha(s, i, captchaState, lang)
+		}
 	case strings.HasPrefix(data.CustomID, customIDAuthMFAPref):
 		mfaState := strings.TrimPrefix(data.CustomID, customIDAuthMFAPref)
 		resp, err := h.HandlePasswordMFA(ctx, mfaState, modalValue(data, "code"), lang)
@@ -481,6 +492,9 @@ func (h *Handlers) onAppCommand(s *discordgo.Session, i *discordgo.InteractionCr
 // qrLoginTimeout bounds how long the bot waits for a Riot Mobile approval.
 const qrLoginTimeout = 3 * time.Minute
 
+// passwordCaptchaTimeout bounds how long the bot waits for the local Chrome captcha.
+const passwordCaptchaTimeout = 10 * time.Minute
+
 // shopTimeout bounds /shop's multi-account fetch so the deferred interaction
 // edit always fires instead of hanging forever on a stuck upstream request.
 const shopTimeout = 45 * time.Second
@@ -497,6 +511,21 @@ func (h *Handlers) watchQRLogin(s *discordgo.Session, i *discordgo.InteractionCr
 	}
 	if rerr := editInteraction(s, i, h.HandleAuthComplete(display, err, lang)); rerr != nil {
 		log.Printf("interaction: qr login edit failed: %v", rerr)
+	}
+}
+
+// watchPasswordCaptcha waits for the browser captcha page, then shows MFA step 2 or success.
+func (h *Handlers) watchPasswordCaptcha(s *discordgo.Session, i *discordgo.InteractionCreate, state string, lang i18n.Lang) {
+	ctx, cancel := context.WithTimeout(context.Background(), passwordCaptchaTimeout)
+	defer cancel()
+
+	display, mfaState, mfaHint, err := h.Auth.WaitPasswordLogin(ctx, state)
+	if err != nil {
+		log.Printf("interaction: password captcha state=%s: %v", state, err)
+	}
+	resp := h.HandlePasswordCaptchaComplete(display, mfaState, mfaHint, err, lang)
+	if rerr := editInteraction(s, i, resp); rerr != nil {
+		log.Printf("interaction: password captcha edit failed: %v", rerr)
 	}
 }
 

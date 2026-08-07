@@ -1,8 +1,12 @@
 package valorantbot
 
-import "testing"
+import (
+	"testing"
 
-func TestIsLoopbackAuthBase(t *testing.T) {
+	"github.com/dosfsociety/valorant-bot/internal/netutil"
+)
+
+func TestIsPrivateOrLocalAuthBaseURL_ForPublicPages(t *testing.T) {
 	cases := []struct {
 		url  string
 		want bool
@@ -10,15 +14,15 @@ func TestIsLoopbackAuthBase(t *testing.T) {
 		{"http://127.0.0.1:8787", true},
 		{"http://localhost:8787", true},
 		{"http://[::1]:8787", true},
-		{"http://192.168.0.10:8787", false},
-		{"http://raspberrypi.local:8787", false},
+		{"http://192.168.0.10:8787", true},
+		{"http://raspberrypi.local:8787", true},
 		{"https://bot.example.com", false},
-		{"", false},
-		{"not a url", false},
+		{"https://abc.trycloudflare.com", false},
+		{"", true},
 	}
 	for _, tc := range cases {
-		if got := isLoopbackAuthBase(tc.url); got != tc.want {
-			t.Errorf("isLoopbackAuthBase(%q) = %v, want %v", tc.url, got, tc.want)
+		if got := netutil.IsPrivateOrLocalAuthBaseURL(tc.url); got != tc.want {
+			t.Errorf("IsPrivateOrLocalAuthBaseURL(%q) = %v, want %v", tc.url, got, tc.want)
 		}
 	}
 }

@@ -29,7 +29,8 @@ Usage: ./scripts/setup-cloud.sh [options]
   -h, --help        Show help
 
 Writes env, installs the bot (systemd or Docker), and starts it when secrets
-are present. /auth is Riot Mobile QR — no inbound auth ports required.
+are present. /auth needs no inbound auth port. Password login additionally
+requires a desktop session with Chrome/Chromium on the bot host; otherwise use QR.
 EOF
 }
 
