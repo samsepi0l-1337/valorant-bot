@@ -53,6 +53,19 @@ type passwordOutcome struct {
 	err      error
 }
 
+type passwordStateCleanup struct {
+	pending passwordPending
+	flow    *passwordFlow
+	claimed bool
+}
+
+type passwordWaitDecision struct {
+	outcome passwordOutcome
+	ready   <-chan struct{}
+	cleanup passwordStateCleanup
+	done    bool
+}
+
 var errPasswordFlowClosed = errors.New("captcha session closed; run /auth again")
 
 // BeginPasswordLogin stores credentials and prepares a button-launched
@@ -125,29 +138,50 @@ func (s *Server) WaitPasswordLogin(ctx context.Context, state string) (displayNa
 	ticker := time.NewTicker(s.qrPollInterval)
 	defer ticker.Stop()
 	for {
-		s.mu.Lock()
-		out, ok := s.passwordOutcomes[state]
-		ready := s.passwordReady[state]
-		s.mu.Unlock()
-		if ok && out.done {
-			s.cleanupPasswordState(state)
+		decision := s.claimPasswordWait(state, nil)
+		if decision.done {
+			s.finishPasswordStateCleanup(decision.cleanup)
+			out := decision.outcome
 			return out.display, out.mfaState, out.mfaHint, out.err
 		}
 		select {
 		case <-ctx.Done():
-			s.mu.Lock()
-			out, ok := s.passwordOutcomes[state]
-			s.mu.Unlock()
-			if ok && out.done {
-				s.cleanupPasswordState(state)
-				return out.display, out.mfaState, out.mfaHint, out.err
-			}
-			s.cleanupPasswordState(state)
-			return "", "", "", ctx.Err()
-		case <-ready:
+			decision = s.claimPasswordWait(state, ctx.Err())
+			s.finishPasswordStateCleanup(decision.cleanup)
+			out := decision.outcome
+			return out.display, out.mfaState, out.mfaHint, out.err
+		case <-decision.ready:
 		case <-ticker.C:
 		}
 	}
+}
+
+// claimPasswordWait is the single short linearization point between a
+// completed password outcome and waiter cancellation. A completed outcome is
+// captured before the password state is detached; otherwise cancelErr claims
+// the state so no later publisher can revive it.
+func (s *Server) claimPasswordWait(state string, cancelErr error) passwordWaitDecision {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if out, ok := s.passwordOutcomes[state]; ok && out.done {
+		return passwordWaitDecision{
+			outcome: out,
+			cleanup: s.claimPasswordStateCleanupLocked(state),
+			done:    true,
+		}
+	}
+	if cancelErr != nil {
+		if hook := s.beforePasswordWaitCancellationClaim; hook != nil {
+			hook()
+		}
+		return passwordWaitDecision{
+			outcome: passwordOutcome{done: true, err: cancelErr},
+			cleanup: s.claimPasswordStateCleanupLocked(state),
+			done:    true,
+		}
+	}
+	return passwordWaitDecision{ready: s.passwordReady[state]}
 }
 
 func (s *Server) claimPasswordFinalization(state string, flow *passwordFlow) error {
@@ -328,10 +362,17 @@ func passwordOutcomeFailure(out passwordOutcome, publishErr error) error {
 
 func (s *Server) cleanupPasswordState(state string) {
 	s.mu.Lock()
+	cleanup := s.claimPasswordStateCleanupLocked(state)
+	s.mu.Unlock()
+	s.finishPasswordStateCleanup(cleanup)
+}
+
+// claimPasswordStateCleanupLocked detaches a password state while Server.mu is
+// held. Slow controller and operation cleanup is returned to the caller.
+func (s *Server) claimPasswordStateCleanupLocked(state string) passwordStateCleanup {
 	pending, ok := s.passwordPending[state]
 	if !ok {
-		s.mu.Unlock()
-		return
+		return passwordStateCleanup{}
 	}
 	flow := pending.flow
 	if flow != nil && flow.commitClaimed {
@@ -339,8 +380,7 @@ func (s *Server) cleanupPasswordState(state string) {
 		// irreversible store/notifier operation; request cleanup and return
 		// immediately. Publication schedules the actual cleanup afterward.
 		flow.cleanupRequested = true
-		s.mu.Unlock()
-		return
+		return passwordStateCleanup{}
 	}
 	if flow != nil {
 		flow.sealed = true
@@ -349,17 +389,22 @@ func (s *Server) cleanupPasswordState(state string) {
 	delete(s.passwordPending, state)
 	delete(s.passwordOutcomes, state)
 	delete(s.passwordReady, state)
-	s.mu.Unlock()
+	return passwordStateCleanup{pending: pending, flow: flow, claimed: true}
+}
 
-	if flow != nil {
-		flow.cancel()
-		if closeErr := s.closeOwnedCaptchaBrowser(flow); closeErr != nil {
+func (s *Server) finishPasswordStateCleanup(cleanup passwordStateCleanup) {
+	if !cleanup.claimed {
+		return
+	}
+	if cleanup.flow != nil {
+		cleanup.flow.cancel()
+		if closeErr := s.closeOwnedCaptchaBrowser(cleanup.flow); closeErr != nil {
 			log.Printf("captcha Chrome cleanup remains incomplete: %v", closeErr)
 		}
-		flow.wg.Wait()
+		cleanup.flow.wg.Wait()
 	}
-	if ok && pending.sessionID != "" && s.passwordAuth != nil {
-		s.passwordAuth.CancelCaptcha(pending.sessionID)
+	if cleanup.pending.sessionID != "" && s.passwordAuth != nil {
+		s.passwordAuth.CancelCaptcha(cleanup.pending.sessionID)
 	}
 }
 

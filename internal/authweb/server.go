@@ -132,6 +132,8 @@ type Server struct {
 	captchaCloseFailures map[*passwordFlow]captchaBrowserCloseFailure
 	captchaTLSPort       int
 	launchCaptchaBrowser func(string) (captchaBrowserController, error)
+	// Test-only synchronization seam for the cancellation claim critical section.
+	beforePasswordWaitCancellationClaim func()
 }
 
 // New builds an auth web Server.

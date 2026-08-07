@@ -76,6 +76,32 @@ type cancelBlockingRiot struct {
 	namesRelease <-chan struct{}
 }
 
+type callbackCanceledContext struct {
+	context.Context
+	done    chan struct{}
+	onErr   func()
+	errOnce sync.Once
+}
+
+func newCallbackCanceledContext(onErr func()) *callbackCanceledContext {
+	done := make(chan struct{})
+	close(done)
+	return &callbackCanceledContext{
+		Context: context.Background(),
+		done:    done,
+		onErr:   onErr,
+	}
+}
+
+func (c *callbackCanceledContext) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c *callbackCanceledContext) Err() error {
+	c.errOnce.Do(c.onErr)
+	return context.Canceled
+}
+
 func (r *cancelBlockingRiot) GetPlayerNames(ctx context.Context, accessToken, entitlementsToken, shard string, puuids []string) ([]riot.PlayerName, error) {
 	select {
 	case r.namesStarted <- struct{}{}:
@@ -1800,6 +1826,172 @@ func TestWaitPasswordLoginCancellationClearsCredentialsAndRiotSession(t *testing
 	}
 	if got, _ := pw.canceledSession.Load().(string); got != "sess-to-cancel" {
 		t.Fatalf("canceled Riot session = %q", got)
+	}
+}
+
+func TestWaitPasswordLoginOutcomeWinsConcurrentCancellationAndKeepsMFAUsable(t *testing.T) {
+	pw := &fakePasswordAuth{
+		tokens: riot.PasswordTokens{AccessToken: "at-1", IDToken: "id-1", SessionCookie: "ssid=s1"},
+	}
+	s := newCaptchaServer(pw)
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "secret-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	pending := s.passwordPending[state]
+	s.mu.Unlock()
+
+	const wantMFAState = "mfa-outcome-won"
+	challenge := &riot.MFAChallenge{Email: "a***@example.com", Method: "email"}
+	var published passwordOutcome
+	var publishErr error
+	ctx := newCallbackCanceledContext(func() {
+		published, publishErr = s.finishPasswordMFA(state, pending, wantMFAState, challenge, challenge.Email)
+	})
+
+	display, mfaState, mfaHint, waitErr := s.WaitPasswordLogin(ctx, state)
+	if publishErr != nil {
+		t.Fatalf("MFA outcome publication error = %v", publishErr)
+	}
+	if !published.done || published.mfaState != wantMFAState {
+		t.Fatalf("published outcome = %+v", published)
+	}
+	if waitErr != nil || display != "" || mfaState != wantMFAState || mfaHint != challenge.Email {
+		t.Fatalf("wait display=%q mfaState=%q hint=%q err=%v", display, mfaState, mfaHint, waitErr)
+	}
+
+	s.mu.Lock()
+	_, passwordPending := s.passwordPending[state]
+	_, passwordOutcome := s.passwordOutcomes[state]
+	continuation, continuationExists := s.mfaPending[wantMFAState]
+	mfaCount := len(s.mfaPending)
+	s.mu.Unlock()
+	if passwordPending || passwordOutcome {
+		t.Fatalf("consumed password state retained: pending=%v outcome=%v", passwordPending, passwordOutcome)
+	}
+	if !continuationExists || mfaCount != 1 || continuation.flow == nil || continuation.flow.ctx.Err() != nil {
+		t.Fatalf("MFA continuation exists=%v count=%d value=%+v", continuationExists, mfaCount, continuation)
+	}
+
+	linkedDisplay, err := s.CompletePasswordMFA(context.Background(), wantMFAState, "123456")
+	if err != nil || linkedDisplay != "Player#KR1" {
+		t.Fatalf("usable MFA continuation display=%q err=%v", linkedDisplay, err)
+	}
+	if accounts := s.store.(*mockStore).accounts; len(accounts) != 1 {
+		t.Fatalf("MFA continuation linked accounts=%+v", accounts)
+	}
+}
+
+func TestWaitPasswordLoginCancellationWinsBeforeLaterPublishers(t *testing.T) {
+	pw := &fakePasswordAuth{
+		tokens: riot.PasswordTokens{AccessToken: "at-1", IDToken: "id-1", SessionCookie: "ssid=s1"},
+	}
+	s := newCaptchaServer(pw)
+	releaseClose := make(chan struct{})
+	var releaseCloseOnce sync.Once
+	releaseBrowser := func() { releaseCloseOnce.Do(func() { close(releaseClose) }) }
+	defer releaseBrowser()
+	controller := newTestCaptchaBrowserController()
+	controller.closeRelease = releaseClose
+	s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) { return controller, nil }
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "secret-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	pending := s.passwordPending[state]
+	s.mu.Unlock()
+	claimReached := make(chan struct{})
+	allowClaim := make(chan struct{})
+	var allowClaimOnce sync.Once
+	releaseClaim := func() { allowClaimOnce.Do(func() { close(allowClaim) }) }
+	defer releaseClaim()
+	s.beforePasswordWaitCancellationClaim = func() {
+		close(claimReached)
+		<-allowClaim
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	waitDone := make(chan error, 1)
+	go func() {
+		_, _, _, waitErr := s.WaitPasswordLogin(ctx, state)
+		waitDone <- waitErr
+	}()
+	select {
+	case <-claimReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not reach the cancellation claim")
+	}
+	if s.mu.TryLock() {
+		s.mu.Unlock()
+		t.Fatal("cancellation outcome check and state detach do not share Server.mu")
+	}
+
+	type publishErrors struct {
+		mfa     error
+		account error
+	}
+	publishDone := make(chan publishErrors, 1)
+	go func() {
+		_, mfaErr := s.finishPasswordMFA(state, pending, "late-mfa", &riot.MFAChallenge{Email: "late@example.com"}, "late@example.com")
+		_, accountErr := s.finishPasswordAccount(context.Background(), state, pending, pw.tokens)
+		publishDone <- publishErrors{mfa: mfaErr, account: accountErr}
+	}()
+	releaseClaim()
+	select {
+	case <-controller.closeStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("controller close did not start after cancellation claimed state")
+	}
+
+	s.mu.Lock()
+	_, passwordPending := s.passwordPending[state]
+	_, passwordOutcome := s.passwordOutcomes[state]
+	s.mu.Unlock()
+	if passwordPending || passwordOutcome {
+		t.Fatalf("cancellation claim retained state while controller close blocked: pending=%v outcome=%v", passwordPending, passwordOutcome)
+	}
+	select {
+	case <-pending.flow.ctx.Done():
+	default:
+		t.Fatal("cancellation claim did not cancel the flow before controller close")
+	}
+
+	var publisherErrors publishErrors
+	select {
+	case publisherErrors = <-publishDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("late publishers remained blocked while controller close ran outside Server.mu")
+	}
+	if !errors.Is(publisherErrors.mfa, errPasswordFlowClosed) {
+		t.Fatalf("late MFA publisher error = %v, want closed flow", publisherErrors.mfa)
+	}
+	if !errors.Is(publisherErrors.account, errPasswordFlowClosed) {
+		t.Fatalf("late account publisher error = %v, want closed flow", publisherErrors.account)
+	}
+	s.mu.Lock()
+	mfaCount := len(s.mfaPending)
+	s.mu.Unlock()
+	if mfaCount != 0 || len(s.store.(*mockStore).accounts) != 0 {
+		t.Fatalf("late publishers produced mfa=%d accounts=%+v", mfaCount, s.store.(*mockStore).accounts)
+	}
+
+	releaseBrowser()
+	select {
+	case waitErr := <-waitDone:
+		if !errors.Is(waitErr, context.Canceled) {
+			t.Fatalf("wait error = %v, want context cancellation", waitErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not return after controller close")
+	}
+	if controller.closeCalls.Load() != 1 {
+		t.Fatalf("browser closes=%d, want 1", controller.closeCalls.Load())
 	}
 }
 
