@@ -37,7 +37,9 @@ type passwordFlow struct {
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 	launchMu sync.Mutex
+	finishMu sync.Mutex
 	submitMu sync.Mutex
+	browser  captchaBrowserController
 }
 
 type passwordOutcome struct {
@@ -109,7 +111,6 @@ func (s *Server) LaunchPasswordCaptcha(ctx context.Context, state, discordUserID
 	if err := s.waitCaptchaTLS(3 * time.Second); err != nil {
 		return err
 	}
-	s.resetCaptchaLaunch(state)
 	return s.ensureCaptchaLaunched(state)
 }
 
@@ -140,7 +141,36 @@ func (s *Server) WaitPasswordLogin(ctx context.Context, state string) (displayNa
 func (s *Server) setPasswordOutcome(state string, out passwordOutcome) {
 	out.done = true
 	s.mu.Lock()
-	if _, ok := s.passwordPending[state]; !ok {
+	pending, ok := s.passwordPending[state]
+	if !ok || pending.flow == nil {
+		s.mu.Unlock()
+		return
+	}
+	flow := pending.flow
+	s.mu.Unlock()
+
+	flow.finishMu.Lock()
+	defer flow.finishMu.Unlock()
+
+	s.mu.Lock()
+	pending, ok = s.passwordPending[state]
+	if !ok || pending.flow != flow {
+		s.mu.Unlock()
+		return
+	}
+	if current, ok := s.passwordOutcomes[state]; ok && current.done {
+		s.mu.Unlock()
+		return
+	}
+	scrubPasswordCredentials(&pending)
+	s.passwordPending[state] = pending
+	s.mu.Unlock()
+
+	_ = detachAndCloseCaptchaBrowser(flow)
+
+	s.mu.Lock()
+	pending, ok = s.passwordPending[state]
+	if !ok || pending.flow != flow {
 		s.mu.Unlock()
 		return
 	}
@@ -159,20 +189,30 @@ func (s *Server) setPasswordOutcome(state string, out passwordOutcome) {
 func (s *Server) cleanupPasswordState(state string) {
 	s.mu.Lock()
 	pending, ok := s.passwordPending[state]
+	if ok {
+		scrubPasswordCredentials(&pending)
+		s.passwordPending[state] = pending
+	}
 	delete(s.passwordPending, state)
 	delete(s.passwordOutcomes, state)
 	delete(s.passwordReady, state)
-	delete(s.captchaLaunched, state)
 	s.mu.Unlock()
 	if ok && pending.flow != nil {
 		pending.flow.cancel()
-		pending.flow.launchMu.Lock()
-		pending.flow.launchMu.Unlock()
+		_ = detachAndCloseCaptchaBrowser(pending.flow)
 		pending.flow.wg.Wait()
 	}
 	if ok && pending.sessionID != "" && s.passwordAuth != nil {
 		s.passwordAuth.CancelCaptcha(pending.sessionID)
 	}
+}
+
+func scrubPasswordCredentials(pending *passwordPending) {
+	if pending == nil {
+		return
+	}
+	pending.username = ""
+	pending.password = ""
 }
 
 func (s *Server) beginPasswordOperation(state string) (passwordPending, func(), bool) {

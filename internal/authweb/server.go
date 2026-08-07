@@ -123,9 +123,8 @@ type Server struct {
 	passwordPending      map[string]passwordPending
 	passwordOutcomes     map[string]passwordOutcome
 	passwordReady        map[string]chan struct{}
-	captchaLaunched      map[string]time.Time
 	captchaTLSPort       int
-	launchCaptchaBrowser func(string) error
+	launchCaptchaBrowser func(string) (captchaBrowserController, error)
 }
 
 // New builds an auth web Server.
@@ -159,7 +158,6 @@ func New(d Deps) *Server {
 		passwordPending:      make(map[string]passwordPending),
 		passwordOutcomes:     make(map[string]passwordOutcome),
 		passwordReady:        make(map[string]chan struct{}),
-		captchaLaunched:      make(map[string]time.Time),
 		captchaTLSPort:       tlsPort,
 		launchCaptchaBrowser: launchSystemChrome,
 	}
