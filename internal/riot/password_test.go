@@ -97,10 +97,15 @@ func TestPasswordBeginCaptchaMetadataFailureUsesFallbackOnce(t *testing.T) {
 }
 
 func TestPasswordBeginAndCompleteCaptcha_Success(t *testing.T) {
+	var beginBaggage string
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
+			beginBaggage = r.Header.Get("baggage")
+			if !strings.HasPrefix(beginBaggage, "sdksid=") || strings.TrimPrefix(beginBaggage, "sdksid=") == "" {
+				t.Fatalf("captcha begin baggage = %q, want a non-empty sdksid", beginBaggage)
+			}
 			http.SetCookie(w, &http.Cookie{Name: "authenticator.sid", Value: "s1"})
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"type": "auth",
@@ -113,12 +118,28 @@ func TestPasswordBeginAndCompleteCaptcha_Success(t *testing.T) {
 				},
 			})
 		case http.MethodPut:
+			if got := r.Header.Get("baggage"); got != beginBaggage {
+				t.Fatalf("captcha completion baggage = %q, want %q", got, beginBaggage)
+			}
 			if cookie, err := r.Cookie("authenticator.sid"); err != nil || cookie.Value != "s1" {
 				t.Fatalf("captcha completion missing begin-session cookie: cookie=%v err=%v", cookie, err)
 			}
-			body, _ := io.ReadAll(r.Body)
-			if !strings.Contains(string(body), `"user1"`) || !strings.Contains(string(body), "hcaptcha tok") {
-				t.Fatalf("body %s", body)
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body["language"] != "ko_KR" || body["remember"] != false {
+				t.Fatalf("top-level language/remember = %#v/%#v, body=%#v", body["language"], body["remember"], body)
+			}
+			identity, ok := body["riot_identity"].(map[string]any)
+			if !ok || identity["username"] != "user1" || identity["captcha"] != "hcaptcha tok" {
+				t.Fatalf("riot_identity = %#v", body["riot_identity"])
+			}
+			if _, exists := identity["language"]; exists {
+				t.Fatalf("language must not be nested under riot_identity: %#v", identity)
+			}
+			if _, exists := identity["remember"]; exists {
+				t.Fatalf("remember must not be nested under riot_identity: %#v", identity)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"type": "success",
@@ -194,16 +215,24 @@ func TestPasswordCancelCaptchaDeletesSession(t *testing.T) {
 }
 
 func TestPasswordCompleteCaptcha_MFA(t *testing.T) {
+	var sessionBaggage string
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost:
+			sessionBaggage = r.Header.Get("baggage")
+			if !strings.HasPrefix(sessionBaggage, "sdksid=") || strings.TrimPrefix(sessionBaggage, "sdksid=") == "" {
+				t.Fatalf("captcha begin baggage = %q, want a non-empty sdksid", sessionBaggage)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"captcha": map[string]any{
 					"hcaptcha": map[string]string{"key": "k", "data": "d"},
 				},
 			})
 		case http.MethodPut:
+			if got := r.Header.Get("baggage"); got != sessionBaggage {
+				t.Fatalf("captcha/MFA baggage = %q, want %q", got, sessionBaggage)
+			}
 			body, _ := io.ReadAll(r.Body)
 			if strings.Contains(string(body), `"type":"multifactor"`) {
 				_ = json.NewEncoder(w).Encode(map[string]any{

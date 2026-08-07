@@ -482,7 +482,7 @@ func TestCaptchaPreparationFailureFinishesWait(t *testing.T) {
 	}
 }
 
-func TestCaptchaWidgetPage_HasCheckbox(t *testing.T) {
+func TestCaptchaWidgetPage_ExecutesInvisibleChallengeWithRQData(t *testing.T) {
 	s := newCaptchaServer(&fakePasswordAuth{
 		ch: riot.CaptchaChallenge{SessionID: "s", SiteKey: "k", RQData: "d"},
 	})
@@ -501,8 +501,17 @@ func TestCaptchaWidgetPage_HasCheckbox(t *testing.T) {
 	if !strings.Contains(body, "/api/auth/captcha/challenge") {
 		t.Fatalf("widget should fetch challenge")
 	}
-	if !strings.Contains(body, "로봇이 아닙니다") {
-		t.Fatalf("widget should use checkbox copy")
+	if !strings.Contains(body, "size: 'invisible'") {
+		t.Fatal("widget must match Riot's invisible hCaptcha mode")
+	}
+	if !strings.Contains(body, "hcaptcha.execute(widgetId, {rqdata: rqdata})") {
+		t.Fatal("widget must attach the current rqdata when executing hCaptcha")
+	}
+	if strings.Contains(body, "hcaptcha.setData") || strings.Contains(body, "size: 'normal'") {
+		t.Fatal("widget must not use the rejected checkbox/setData flow")
+	}
+	if !strings.Contains(body, `id="verify"`) {
+		t.Fatal("invisible captcha needs an explicit user verification control")
 	}
 	if strings.Contains(body, "host !== 'auth.riotgames.com'") {
 		t.Fatal("widget must reject the legacy Riot OAuth hostname")

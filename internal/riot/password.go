@@ -66,6 +66,7 @@ type MFAChallenge struct {
 	Method  string
 	Methods []string
 	cookies map[string]string
+	sdkSID  string
 	// authenticate is true when MFA must be submitted to authenticate.riotgames.com.
 	authenticate bool
 }
@@ -74,6 +75,7 @@ type captchaSession struct {
 	username string
 	password string
 	cookies  map[string]string
+	sdkSID   string
 	siteKey  string
 	rqData   string
 	expires  time.Time
@@ -118,6 +120,7 @@ func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password st
 	c.refreshClientMeta(ctx)
 
 	cookies := map[string]string{}
+	sdkSID := randomHex(16)
 	body := map[string]any{
 		"clientId":   "riot-client",
 		"language":   "",
@@ -130,7 +133,7 @@ func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password st
 			"state":    "auth",
 		},
 	}
-	resp, err := c.doJSON(ctx, http.MethodPost, c.authenticateBase()+"/api/v1/login", body, cookies)
+	resp, err := c.doJSON(ctx, http.MethodPost, c.authenticateBase()+"/api/v1/login", body, cookies, sdkSID)
 	if err != nil {
 		return CaptchaChallenge{}, fmt.Errorf("captcha begin: %w", err)
 	}
@@ -161,6 +164,7 @@ func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password st
 		username: username,
 		password: password,
 		cookies:  cookies,
+		sdkSID:   sdkSID,
 		siteKey:  siteKey,
 		rqData:   rqData,
 		expires:  time.Now().Add(captchaSessionTTL),
@@ -193,6 +197,7 @@ func (c *PasswordClient) CompleteCaptcha(ctx context.Context, sessionID, captcha
 	username := sess.username
 	password := sess.password
 	cookies := copyCookies(sess.cookies)
+	sdkSID := sess.sdkSID
 	c.mu.Unlock()
 
 	token := captchaToken
@@ -202,16 +207,16 @@ func (c *PasswordClient) CompleteCaptcha(ctx context.Context, sessionID, captcha
 
 	// Match working Riot Client / community clients (authenticate.riotgames.com).
 	body := map[string]any{
-		"type": "auth",
+		"type":     "auth",
+		"language": "ko_KR",
+		"remember": false,
 		"riot_identity": map[string]any{
 			"captcha":  token,
-			"language": "ko_KR",
 			"password": password,
-			"remember": false,
 			"username": username,
 		},
 	}
-	resp, err := c.doJSON(ctx, http.MethodPut, c.authenticateBase()+"/api/v1/login", body, cookies)
+	resp, err := c.doJSON(ctx, http.MethodPut, c.authenticateBase()+"/api/v1/login", body, cookies, sdkSID)
 	if err != nil {
 		return PasswordTokens{}, nil, fmt.Errorf("captcha complete: %w", err)
 	}
@@ -225,7 +230,7 @@ func (c *PasswordClient) CompleteCaptcha(ctx context.Context, sessionID, captcha
 		return PasswordTokens{}, nil, ErrPasswordRateLimit
 	}
 
-	tokens, mfa, perr := c.parseAuthenticateLogin(ctx, raw, cookies, true)
+	tokens, mfa, perr := c.parseAuthenticateLogin(ctx, raw, cookies, true, sdkSID)
 	if perr == nil {
 		c.deleteSession(sessionID)
 		return tokens, mfa, nil
@@ -238,7 +243,15 @@ func (c *PasswordClient) CompleteCaptcha(ctx context.Context, sessionID, captcha
 	for name := range cookies {
 		cookieNames = append(cookieNames, name)
 	}
-	log.Printf("riot captcha complete reason=%s hasChallenge=%v cookies=%v", reason, hasChallenge, cookieNames)
+	log.Printf(
+		"riot captcha complete status=%d reason=%s hasChallenge=%v errorID=%q cfRay=%q cookies=%v",
+		resp.StatusCode,
+		reason,
+		hasChallenge,
+		resp.Header.Get("X-RSO-Error-Id"),
+		resp.Header.Get("CF-Ray"),
+		cookieNames,
+	)
 
 	// Riot often returns auth_failure both for bad passwords AND bad captcha tokens.
 	// When a fresh captcha blob is attached, prefer retry over blaming the password.
@@ -315,9 +328,9 @@ func (c *PasswordClient) SubmitMFA(ctx context.Context, challenge *MFAChallenge,
 			err    error
 		)
 		if challenge.authenticate {
-			tokens, mfa, err = c.putAuthenticate(ctx, challenge.cookies, body)
+			tokens, mfa, err = c.putAuthenticate(ctx, challenge.cookies, body, challenge.sdkSID)
 		} else {
-			tokens, mfa, err = c.putAuth(ctx, challenge.cookies, body)
+			tokens, mfa, err = c.putAuth(ctx, challenge.cookies, body, challenge.sdkSID)
 		}
 		if err == nil && mfa == nil {
 			return tokens, nil
@@ -337,8 +350,8 @@ func (c *PasswordClient) SubmitMFA(ctx context.Context, challenge *MFAChallenge,
 	return PasswordTokens{}, lastErr
 }
 
-func (c *PasswordClient) putAuthenticate(ctx context.Context, cookies map[string]string, body map[string]any) (PasswordTokens, *MFAChallenge, error) {
-	resp, err := c.doJSON(ctx, http.MethodPut, c.authenticateBase()+"/api/v1/login", body, cookies)
+func (c *PasswordClient) putAuthenticate(ctx context.Context, cookies map[string]string, body map[string]any, sdkSID string) (PasswordTokens, *MFAChallenge, error) {
+	resp, err := c.doJSON(ctx, http.MethodPut, c.authenticateBase()+"/api/v1/login", body, cookies, sdkSID)
 	if err != nil {
 		return PasswordTokens{}, nil, fmt.Errorf("authenticate put: %w", err)
 	}
@@ -347,14 +360,14 @@ func (c *PasswordClient) putAuthenticate(ctx context.Context, cookies map[string
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return PasswordTokens{}, nil, ErrPasswordRateLimit
 	}
-	tokens, mfa, perr := c.parseAuthenticateLogin(ctx, raw, cookies, true)
+	tokens, mfa, perr := c.parseAuthenticateLogin(ctx, raw, cookies, true, sdkSID)
 	if perr != nil && resp.StatusCode != http.StatusOK {
 		return PasswordTokens{}, nil, perr
 	}
 	return tokens, mfa, perr
 }
 
-func (c *PasswordClient) parseAuthenticateLogin(ctx context.Context, raw []byte, cookies map[string]string, authenticateMFA bool) (PasswordTokens, *MFAChallenge, error) {
+func (c *PasswordClient) parseAuthenticateLogin(ctx context.Context, raw []byte, cookies map[string]string, authenticateMFA bool, sdkSID string) (PasswordTokens, *MFAChallenge, error) {
 	var out struct {
 		Type    string `json:"type"`
 		Error   string `json:"error"`
@@ -385,6 +398,7 @@ func (c *PasswordClient) parseAuthenticateLogin(ctx context.Context, raw []byte,
 			Method:       method,
 			Methods:      append([]string(nil), out.Multifactor.Methods...),
 			cookies:      copyCookies(cookies),
+			sdkSID:       sdkSID,
 			authenticate: authenticateMFA,
 		}
 		if out.Error == "invalid_code" {
@@ -412,8 +426,8 @@ func (c *PasswordClient) parseAuthenticateLogin(ctx context.Context, raw []byte,
 	}
 }
 
-func (c *PasswordClient) putAuth(ctx context.Context, cookies map[string]string, body map[string]any) (PasswordTokens, *MFAChallenge, error) {
-	resp, err := c.doJSON(ctx, http.MethodPut, c.authBase()+"/api/v1/authorization", body, cookies)
+func (c *PasswordClient) putAuth(ctx context.Context, cookies map[string]string, body map[string]any, sdkSID string) (PasswordTokens, *MFAChallenge, error) {
+	resp, err := c.doJSON(ctx, http.MethodPut, c.authBase()+"/api/v1/authorization", body, cookies, sdkSID)
 	if err != nil {
 		return PasswordTokens{}, nil, fmt.Errorf("auth put: %w", err)
 	}
@@ -461,6 +475,7 @@ func (c *PasswordClient) putAuth(ctx context.Context, cookies map[string]string,
 			Method:  method,
 			Methods: append([]string(nil), out.Multifactor.Methods...),
 			cookies: copyCookies(cookies),
+			sdkSID:  sdkSID,
 		}
 		if out.Error == "invalid_code" {
 			return PasswordTokens{}, ch, ErrPasswordInvalidCode
@@ -510,7 +525,7 @@ func (c *PasswordClient) exchangeLoginToken(ctx context.Context, loginToken stri
 	}, nil
 }
 
-func (c *PasswordClient) doJSON(ctx context.Context, method, rawURL string, body any, cookies map[string]string) (*http.Response, error) {
+func (c *PasswordClient) doJSON(ctx context.Context, method, rawURL string, body any, cookies map[string]string, sdkSID string) (*http.Response, error) {
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
@@ -527,6 +542,9 @@ func (c *PasswordClient) doJSON(ctx context.Context, method, rawURL string, body
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("User-Agent", c.userAgent())
+	if sdkSID != "" {
+		req.Header.Set("baggage", "sdksid="+sdkSID)
+	}
 	if h := cookieHeader(cookies); h != "" {
 		req.Header.Set("Cookie", h)
 	}

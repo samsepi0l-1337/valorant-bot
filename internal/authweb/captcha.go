@@ -580,12 +580,16 @@ const captchaWidgetHTML = `<!DOCTYPE html>
   .ok { color:#7cf5a0; }
   .err { color:#fd4553; }
   #captcha { min-height:78px; display:flex; justify-content:center; }
+  #verify { appearance:none; border:0; border-radius:.25rem; padding:.8rem 1.25rem; font-size:1rem;
+    font-weight:700; color:#fff; background:#d1363a; cursor:pointer; }
+  #verify:disabled { opacity:.55; cursor:wait; }
 </style>
 </head>
 <body>
   <h1>로봇이 아닙니다</h1>
-  <p>아래 체크만 완료하세요.<br/>2차 인증이 없는 계정이면 여기서 연동이 끝납니다.<br/>2FA가 있으면 Discord로 돌아가 코드를 입력합니다.</p>
+  <p>아래 버튼을 눌러 사람 확인을 완료하세요.<br/>2차 인증이 없는 계정이면 여기서 연동이 끝납니다.<br/>2FA가 있으면 Discord로 돌아가 코드를 입력합니다.</p>
   <div id="captcha"></div>
+  <button id="verify" type="button" disabled>사람 확인 시작</button>
   <div id="status">준비 중…</div>
 <script>
 const state = %s;
@@ -594,18 +598,11 @@ let rqdata = '';
 let challengeVersion = 0;
 let widgetId = null;
 const statusEl = document.getElementById('status');
+const verifyEl = document.getElementById('verify');
 
 function setStatus(msg, cls) {
   statusEl.textContent = msg || '';
   statusEl.className = cls || '';
-}
-
-function bindRqdata() {
-  try {
-    if (typeof hcaptcha === 'undefined' || !hcaptcha.setData) return;
-    if (widgetId != null) hcaptcha.setData(widgetId, { rqdata: rqdata });
-    else hcaptcha.setData({ rqdata: rqdata });
-  } catch (e) {}
 }
 
 function loadScript(src) {
@@ -621,20 +618,42 @@ function loadScript(src) {
 
 function renderWidget(resetStatus) {
   const el = document.getElementById('captcha');
+  if (widgetId != null) {
+    try { hcaptcha.remove(widgetId); } catch (e) {}
+  }
   el.innerHTML = '';
   widgetId = hcaptcha.render(el, {
     sitekey: sitekey,
-    size: 'normal',
+    size: 'invisible',
     theme: 'dark',
     callback: onSolved,
-    'expired-callback': () => setStatus('만료되었습니다. 다시 체크하세요.', 'err'),
-    'error-callback': (err) => setStatus('캡차 오류 (' + (err || '?') + '). 새로고침 후 다시 시도하세요.', 'err'),
+    'expired-callback': () => captchaReady('만료되었습니다. 다시 시도하세요.', 'err'),
+    'chalexpired-callback': () => captchaReady('확인 시간이 만료되었습니다. 다시 시도하세요.', 'err'),
+    'close-callback': () => captchaReady('사람 확인 창이 닫혔습니다. 다시 시도하세요.', 'err'),
+    'error-callback': (err) => captchaReady('캡차 오류 (' + (err || '?') + '). 다시 시도하세요.', 'err'),
   });
-  // Enterprise rqdata must be bound after render, before the user clicks.
-  bindRqdata();
-  setTimeout(bindRqdata, 50);
+  verifyEl.disabled = false;
   if (resetStatus !== false) {
-    setStatus('host=' + location.hostname + '\n「로봇이 아닙니다」를 체크하세요.', '');
+    setStatus('host=' + location.hostname + '\n「사람 확인 시작」을 누르세요.', '');
+  }
+}
+
+function captchaReady(message, cls) {
+  verifyEl.disabled = false;
+  setStatus(message, cls);
+}
+
+function beginVerify() {
+  if (widgetId == null || !rqdata || verifyEl.disabled) return;
+  verifyEl.disabled = true;
+  setStatus('사람 확인 중…', '');
+  try {
+    const execution = hcaptcha.execute(widgetId, {rqdata: rqdata});
+    if (execution && typeof execution.catch === 'function') {
+      execution.catch((err) => captchaReady('캡차 실행 오류: ' + err, 'err'));
+    }
+  } catch (e) {
+    captchaReady('캡차 실행 오류: ' + e, 'err');
   }
 }
 
@@ -667,10 +686,10 @@ async function boot() {
     return;
   }
 
-  setStatus('체크박스 로딩 중…', '');
+	setStatus('사람 확인 로딩 중…', '');
   try {
     await Promise.race([
-      loadScript('https://js.hcaptcha.com/1/api.js?render=explicit&hl=ko'),
+      loadScript('https://hcaptcha.com/1/api.js?render=explicit&hl=ko'),
       new Promise((_, reject) => setTimeout(() => reject(new Error('hCaptcha 로딩 시간 초과 (15s)')), 15000)),
     ]);
   } catch (e) {
@@ -681,8 +700,6 @@ async function boot() {
     setStatus('hCaptcha가 로드되지 않았습니다.', 'err');
     return;
   }
-  // Bind rqdata globally before first render (enterprise).
-  bindRqdata();
   renderWidget();
 }
 
@@ -699,9 +716,7 @@ async function onSolved(token) {
       sitekey = data.sitekey || sitekey;
       rqdata = data.rqdata || rqdata;
       challengeVersion = Number(data.version || challengeVersion);
-      setStatus('캡차 토큰이 거절되어 새 체크가 필요합니다.\n다시 「로봇이 아닙니다」를 체크하세요.\n(' + (data.error || 'retry') + ')', 'err');
-      try { if (widgetId != null) hcaptcha.reset(widgetId); } catch (e) {}
-      bindRqdata();
+      setStatus('캡차 토큰이 거절되어 새 확인이 필요합니다.\n다시 「사람 확인 시작」을 누르세요.\n(' + (data.error || 'retry') + ')', 'err');
       renderWidget(false);
       return;
     }
@@ -713,6 +728,7 @@ async function onSolved(token) {
         setStatus(errMsg, 'err');
       }
       try { if (widgetId != null) hcaptcha.reset(widgetId); } catch (e) {}
+      verifyEl.disabled = false;
       return;
     }
     if (data.mfa) {
@@ -726,6 +742,7 @@ async function onSolved(token) {
   }
 }
 
+verifyEl.addEventListener('click', beginVerify);
 boot();
 </script>
 </body>
