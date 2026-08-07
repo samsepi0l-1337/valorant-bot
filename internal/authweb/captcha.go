@@ -40,6 +40,7 @@ type passwordFlow struct {
 	finishMu sync.Mutex
 	submitMu sync.Mutex
 	browser  captchaBrowserController
+	sealed   bool
 }
 
 type passwordOutcome struct {
@@ -138,13 +139,13 @@ func (s *Server) WaitPasswordLogin(ctx context.Context, state string) (displayNa
 	}
 }
 
-func (s *Server) setPasswordOutcome(state string, out passwordOutcome) {
+func (s *Server) setPasswordOutcome(state string, out passwordOutcome) error {
 	out.done = true
 	s.mu.Lock()
 	pending, ok := s.passwordPending[state]
 	if !ok || pending.flow == nil {
 		s.mu.Unlock()
-		return
+		return nil
 	}
 	flow := pending.flow
 	s.mu.Unlock()
@@ -156,27 +157,33 @@ func (s *Server) setPasswordOutcome(state string, out passwordOutcome) {
 	pending, ok = s.passwordPending[state]
 	if !ok || pending.flow != flow {
 		s.mu.Unlock()
-		return
+		return nil
 	}
 	if current, ok := s.passwordOutcomes[state]; ok && current.done {
 		s.mu.Unlock()
-		return
+		return nil
 	}
+	flow.sealed = true
 	scrubPasswordCredentials(&pending)
 	s.passwordPending[state] = pending
 	s.mu.Unlock()
 
-	_ = detachAndCloseCaptchaBrowser(flow)
+	closeErr := s.closeOwnedCaptchaBrowser(flow)
+	var terminalCloseErr error
+	if captchaBrowserMayBeRunning(closeErr) {
+		terminalCloseErr = fmt.Errorf("captcha Chrome could not be closed: %w", closeErr)
+		out = passwordOutcome{done: true, err: errors.Join(out.err, terminalCloseErr)}
+	}
 
 	s.mu.Lock()
 	pending, ok = s.passwordPending[state]
 	if !ok || pending.flow != flow {
 		s.mu.Unlock()
-		return
+		return terminalCloseErr
 	}
 	if current, ok := s.passwordOutcomes[state]; ok && current.done {
 		s.mu.Unlock()
-		return
+		return terminalCloseErr
 	}
 	s.passwordOutcomes[state] = out
 	if ready := s.passwordReady[state]; ready != nil {
@@ -184,12 +191,16 @@ func (s *Server) setPasswordOutcome(state string, out passwordOutcome) {
 		delete(s.passwordReady, state)
 	}
 	s.mu.Unlock()
+	return terminalCloseErr
 }
 
 func (s *Server) cleanupPasswordState(state string) {
 	s.mu.Lock()
 	pending, ok := s.passwordPending[state]
 	if ok {
+		if pending.flow != nil {
+			pending.flow.sealed = true
+		}
 		scrubPasswordCredentials(&pending)
 		s.passwordPending[state] = pending
 	}
@@ -199,7 +210,9 @@ func (s *Server) cleanupPasswordState(state string) {
 	s.mu.Unlock()
 	if ok && pending.flow != nil {
 		pending.flow.cancel()
-		_ = detachAndCloseCaptchaBrowser(pending.flow)
+		if closeErr := s.closeOwnedCaptchaBrowser(pending.flow); closeErr != nil {
+			log.Printf("captcha Chrome cleanup remains incomplete: %v", closeErr)
+		}
 		pending.flow.wg.Wait()
 	}
 	if ok && pending.sessionID != "" && s.passwordAuth != nil {
@@ -218,7 +231,9 @@ func scrubPasswordCredentials(pending *passwordPending) {
 func (s *Server) beginPasswordOperation(state string) (passwordPending, func(), bool) {
 	s.mu.Lock()
 	pending, ok := s.passwordPending[state]
-	if !ok || pending.flow == nil || pending.flow.ctx.Err() != nil || time.Now().After(pending.expiresAt) {
+	out := s.passwordOutcomes[state]
+	if !ok || pending.flow == nil || pending.flow.sealed || out.done ||
+		pending.flow.ctx.Err() != nil || time.Now().After(pending.expiresAt) {
 		s.mu.Unlock()
 		return passwordPending{}, nil, false
 	}
@@ -241,7 +256,7 @@ func (s *Server) livePasswordState(state, sessionID string) (passwordPending, bo
 	defer s.mu.Unlock()
 	pending, ok := s.passwordPending[state]
 	out := s.passwordOutcomes[state]
-	if !ok || pending.flow == nil || pending.flow.ctx.Err() != nil ||
+	if !ok || pending.flow == nil || pending.flow.sealed || pending.flow.ctx.Err() != nil ||
 		time.Now().After(pending.expiresAt) || pending.sessionID != sessionID || out.done {
 		return passwordPending{}, false
 	}
@@ -274,7 +289,9 @@ func (s *Server) ensureCaptchaChallenge(ctx context.Context, state string, brows
 	for {
 		s.mu.Lock()
 		pending, ok := s.passwordPending[state]
-		if !ok || pending.flow == nil || pending.flow.ctx.Err() != nil || time.Now().After(pending.expiresAt) {
+		out := s.passwordOutcomes[state]
+		if !ok || pending.flow == nil || pending.flow.sealed || out.done ||
+			pending.flow.ctx.Err() != nil || time.Now().After(pending.expiresAt) {
 			s.mu.Unlock()
 			return passwordPending{}, fmt.Errorf("captcha session expired; run /auth again")
 		}
@@ -313,6 +330,8 @@ func (s *Server) ensureCaptchaChallenge(ctx context.Context, state string, brows
 
 		s.mu.Lock()
 		cur, stillPending := s.passwordPending[state]
+		out = s.passwordOutcomes[state]
+		stillPending = stillPending && cur.flow == pending.flow && !cur.flow.sealed && !out.done
 		if stillPending && cur.challengeWait == wait {
 			cur.challengeWait = nil
 			if err == nil {
@@ -346,8 +365,9 @@ func (s *Server) handleCaptchaWidgetPage(w http.ResponseWriter, r *http.Request)
 	state := strings.TrimSpace(r.URL.Query().Get("state"))
 	s.mu.Lock()
 	pending, ok := s.passwordPending[state]
+	out := s.passwordOutcomes[state]
 	s.mu.Unlock()
-	if !ok || time.Now().After(pending.expiresAt) {
+	if !ok || pending.flow == nil || pending.flow.sealed || out.done || time.Now().After(pending.expiresAt) {
 		http.Error(w, "captcha session expired; run /auth again", http.StatusBadRequest)
 		return
 	}
@@ -391,7 +411,7 @@ func (s *Server) handleCaptchaChallenge(w http.ResponseWriter, r *http.Request) 
 
 	pending, err := s.ensureCaptchaChallenge(ctx, state, captchaBrowserSession(r))
 	if err != nil {
-		log.Printf("captcha challenge state=%s: %v", state, err)
+		log.Printf("captcha challenge failed: %v", err)
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
 		return
@@ -484,7 +504,8 @@ func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &retry) {
 			s.mu.Lock()
 			p, stillLive := s.passwordPending[req.State]
-			stillLive = stillLive && p.flow == pending.flow && p.flow.ctx.Err() == nil &&
+			out := s.passwordOutcomes[req.State]
+			stillLive = stillLive && p.flow == pending.flow && !p.flow.sealed && !out.done && p.flow.ctx.Err() == nil &&
 				p.sessionID == pending.sessionID && time.Now().Before(p.expiresAt)
 			if !stillLive {
 				s.mu.Unlock()
@@ -499,7 +520,7 @@ func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 			s.passwordPending[req.State] = p
 			s.mu.Unlock()
 			writeCaptchaBrowserCookies(w, retry.BrowserCookies)
-			log.Printf("captcha retry state=%s reason=%s", req.State, retry.Reason)
+			log.Printf("captcha retry reason=%s", retry.Reason)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"ok":      false,
 				"retry":   true,
@@ -514,7 +535,8 @@ func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 			s.passwordAuth.CancelCaptcha(pending.sessionID)
 			writeCaptchaBrowserCookieClears(w, r.Cookies())
 			s.mu.Lock()
-			if p, ok := s.passwordPending[req.State]; ok && p.flow == pending.flow && p.sessionID == pending.sessionID {
+			if p, ok := s.passwordPending[req.State]; ok && p.flow == pending.flow && !p.flow.sealed &&
+				!s.passwordOutcomes[req.State].done && p.sessionID == pending.sessionID {
 				p.sessionID = ""
 				p.siteKey = ""
 				p.rqData = ""
@@ -531,21 +553,28 @@ func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		log.Printf("captcha submit state=%s: %v", req.State, err)
-		s.setPasswordOutcome(req.State, passwordOutcome{err: err})
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+		log.Printf("captcha submit failed: %v", err)
+		outcomeErr := err
+		if closeErr := s.setPasswordOutcome(req.State, passwordOutcome{err: err}); closeErr != nil {
+			outcomeErr = closeErr
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": outcomeErr.Error()})
 		return
 	}
 	if challenge != nil {
 		mfaState, err := newState()
 		if err != nil {
-			s.setPasswordOutcome(req.State, passwordOutcome{err: err})
+			if closeErr := s.setPasswordOutcome(req.State, passwordOutcome{err: err}); closeErr != nil {
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": closeErr.Error()})
+				return
+			}
 			http.Error(w, `{"ok":false,"error":"state"}`, http.StatusInternalServerError)
 			return
 		}
 		s.mu.Lock()
 		current, stillLive := s.passwordPending[req.State]
-		if !stillLive || current.flow != pending.flow || current.flow.ctx.Err() != nil ||
+		out := s.passwordOutcomes[req.State]
+		if !stillLive || current.flow != pending.flow || current.flow.sealed || out.done || current.flow.ctx.Err() != nil ||
 			current.sessionID != pending.sessionID || !time.Now().Before(current.expiresAt) {
 			s.mu.Unlock()
 			http.Error(w, `{"ok":false,"error":"expired"}`, http.StatusBadRequest)
@@ -561,18 +590,28 @@ func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 		s.mu.Unlock()
 		go s.expireMFAState(mfaState)
 		hint := formatMFAHint(challenge)
-		s.setPasswordOutcome(req.State, passwordOutcome{mfaState: mfaState, mfaHint: hint})
+		if closeErr := s.setPasswordOutcome(req.State, passwordOutcome{mfaState: mfaState, mfaHint: hint}); closeErr != nil {
+			s.cleanupMFAState(mfaState)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": closeErr.Error()})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mfa": true})
 		return
 	}
 
 	display, err := s.completePasswordTokens(ctx, pending.discordUserID, tokens)
 	if err != nil {
-		s.setPasswordOutcome(req.State, passwordOutcome{err: err})
-		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+		outcomeErr := err
+		if closeErr := s.setPasswordOutcome(req.State, passwordOutcome{err: err}); closeErr != nil {
+			outcomeErr = closeErr
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": outcomeErr.Error()})
 		return
 	}
-	s.setPasswordOutcome(req.State, passwordOutcome{display: display})
+	if closeErr := s.setPasswordOutcome(req.State, passwordOutcome{display: display}); closeErr != nil {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": closeErr.Error()})
+		return
+	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "mfa": false, "display": display})
 }
 

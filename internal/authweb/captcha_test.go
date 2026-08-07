@@ -770,6 +770,306 @@ func TestLaunchPasswordCaptchaReplaceFailureLeavesButtonUsable(t *testing.T) {
 	}
 }
 
+func TestLaunchPasswordCaptchaQueuedDuringTerminalOutcomeIsRejected(t *testing.T) {
+	s := newCaptchaServer(&fakePasswordAuth{})
+	closeRelease := make(chan struct{})
+	first := newTestCaptchaBrowserController()
+	first.closeRelease = closeRelease
+	second := newTestCaptchaBrowserController()
+	secondLaunchCalled := make(chan struct{}, 1)
+	var launches atomic.Int32
+	s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) {
+		if launches.Add(1) == 1 {
+			return first, nil
+		}
+		secondLaunchCalled <- struct{}{}
+		return second, nil
+	}
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+
+	outcomeDone := make(chan struct{})
+	go func() {
+		s.setPasswordOutcome(state, passwordOutcome{display: "Player#KR1"})
+		close(outcomeDone)
+	}()
+	<-first.closeStarted
+	launchDone := make(chan error, 1)
+	go func() {
+		launchDone <- s.LaunchPasswordCaptcha(context.Background(), state, "owner-1")
+	}()
+
+	var queuedErr error
+	launchedWhileFinishing := false
+	select {
+	case queuedErr = <-launchDone:
+	case <-secondLaunchCalled:
+		launchedWhileFinishing = true
+	}
+	close(closeRelease)
+	<-outcomeDone
+	if launchedWhileFinishing {
+		queuedErr = <-launchDone
+	}
+	if queuedErr == nil {
+		t.Fatal("queued launch succeeded while terminal outcome was publishing")
+	}
+	if launches.Load() != 1 {
+		t.Fatalf("launcher calls=%d, want no call after terminal sealing", launches.Load())
+	}
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err == nil {
+		t.Fatal("repeated launch succeeded after terminal outcome was published")
+	}
+	if launches.Load() != 1 {
+		t.Fatalf("launcher calls=%d after repeated click, want 1", launches.Load())
+	}
+}
+
+func TestLaunchPasswordCaptchaCloseFailureRetainsOwnedBrowser(t *testing.T) {
+	s := newCaptchaServer(&fakePasswordAuth{})
+	closeFailure := errors.New("owned Chrome process may still be running")
+	first := newTestCaptchaBrowserController()
+	first.closeErr = closeFailure
+	replacement := newTestCaptchaBrowserController()
+	var launches atomic.Int32
+	s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) {
+		if launches.Add(1) == 1 {
+			return first, nil
+		}
+		return replacement, nil
+	}
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	flow := s.passwordPending[state].flow
+	s.mu.Unlock()
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); !errors.Is(err, closeFailure) {
+		t.Fatalf("reopen error=%v, want close failure", err)
+	}
+	if launches.Load() != 1 {
+		t.Fatalf("launcher calls=%d, replacement must not launch", launches.Load())
+	}
+	flow.launchMu.Lock()
+	owned := flow.browser
+	flow.launchMu.Unlock()
+	if owned != first {
+		t.Fatalf("retained controller=%T, want original controller", owned)
+	}
+}
+
+func TestCaptchaBrowserCloseFailureConvertsPublishedOutcomeToError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		out  passwordOutcome
+	}{
+		{name: "success", out: passwordOutcome{display: "Player#KR1"}},
+		{name: "mfa", out: passwordOutcome{mfaState: "mfa-state", mfaHint: "email"}},
+		{name: "terminal error", out: passwordOutcome{err: errors.New("riot rejected captcha")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newCaptchaServer(&fakePasswordAuth{})
+			closeFailure := errors.New("owned Chrome process may still be running")
+			controller := newTestCaptchaBrowserController()
+			controller.closeErr = closeFailure
+			s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) { return controller, nil }
+			_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+			if err != nil {
+				t.Fatal(err)
+			}
+			s.mu.Lock()
+			flow := s.passwordPending[state].flow
+			s.mu.Unlock()
+			if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
+				t.Fatal(err)
+			}
+			s.setPasswordOutcome(state, tc.out)
+			s.mu.Lock()
+			published := s.passwordOutcomes[state]
+			s.mu.Unlock()
+			if !published.done || !errors.Is(published.err, closeFailure) {
+				t.Fatalf("published outcome=%+v, want terminal browser-close error", published)
+			}
+			if published.display != "" || published.mfaState != "" || published.mfaHint != "" {
+				t.Fatalf("close failure exposed success/MFA outcome: %+v", published)
+			}
+			flow.launchMu.Lock()
+			owned := flow.browser
+			flow.launchMu.Unlock()
+			if owned != controller {
+				t.Fatalf("retained controller=%T, want failed controller", owned)
+			}
+		})
+	}
+}
+
+func TestCaptchaBrowserCloseFailureRemovesOrphanMFA(t *testing.T) {
+	pw := &fakePasswordAuth{
+		ch:  riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
+		mfa: &riot.MFAChallenge{Email: "a***@example.com", Method: "email"},
+	}
+	s := newCaptchaServer(pw)
+	closeFailure := errors.New("owned Chrome process may still be running")
+	controller := newTestCaptchaBrowserController()
+	controller.closeErr = closeFailure
+	s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) { return controller, nil }
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ensureCaptchaChallenge(context.Background(), state, testCaptchaBrowserSession()); err != nil {
+		t.Fatal(err)
+	}
+	req := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, req)
+	var response map[string]any
+	if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response["ok"] != false || !strings.Contains(fmt.Sprint(response["error"]), closeFailure.Error()) {
+		t.Fatalf("submit response=%+v, want browser-close failure", response)
+	}
+	s.mu.Lock()
+	mfaCount := len(s.mfaPending)
+	s.mu.Unlock()
+	if mfaCount != 0 {
+		t.Fatalf("orphan MFA states=%d, want 0", mfaCount)
+	}
+	_, mfaState, _, waitErr := s.WaitPasswordLogin(context.Background(), state)
+	if !errors.Is(waitErr, closeFailure) || mfaState != "" {
+		t.Fatalf("wait error=%v mfaState=%q", waitErr, mfaState)
+	}
+}
+
+func TestCaptchaBrowserCloseFailurePreventsSuccessOrTerminalResponse(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		complete error
+		tokens   riot.PasswordTokens
+	}{
+		{
+			name:   "success",
+			tokens: riot.PasswordTokens{AccessToken: "at-1", IDToken: "id-1", SessionCookie: "ssid=s1"},
+		},
+		{
+			name:     "terminal error",
+			complete: errors.New("riot rejected captcha"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pw := &fakePasswordAuth{
+				ch:       riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
+				tokens:   tc.tokens,
+				complete: tc.complete,
+			}
+			s := newCaptchaServer(pw)
+			closeFailure := errors.New("owned Chrome process may still be running")
+			controller := newTestCaptchaBrowserController()
+			controller.closeErr = closeFailure
+			s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) { return controller, nil }
+			_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.ensureCaptchaChallenge(context.Background(), state, testCaptchaBrowserSession()); err != nil {
+				t.Fatal(err)
+			}
+			req := newCaptchaRequest(http.MethodPost, "/api/auth/captcha", strings.NewReader(`{"state":"`+state+`","token":"token","version":1}`))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			s.Handler().ServeHTTP(rec, req)
+			var response map[string]any
+			if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+				t.Fatal(err)
+			}
+			if response["ok"] != false || !strings.Contains(fmt.Sprint(response["error"]), closeFailure.Error()) {
+				t.Fatalf("submit response=%+v, want browser-close failure", response)
+			}
+			display, mfaState, _, waitErr := s.WaitPasswordLogin(context.Background(), state)
+			if !errors.Is(waitErr, closeFailure) || display != "" || mfaState != "" {
+				t.Fatalf("display=%q mfaState=%q wait error=%v", display, mfaState, waitErr)
+			}
+		})
+	}
+}
+
+func TestCaptchaBrowserCleanupFailureRetainsOwnership(t *testing.T) {
+	s := newCaptchaServer(&fakePasswordAuth{})
+	closeFailure := errors.New("owned Chrome process may still be running")
+	controller := newTestCaptchaBrowserController()
+	controller.closeErr = closeFailure
+	s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) { return controller, nil }
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	flow := s.passwordPending[state].flow
+	s.mu.Unlock()
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	s.cleanupPasswordState(state)
+	flow.launchMu.Lock()
+	owned := flow.browser
+	flow.launchMu.Unlock()
+	if owned != controller {
+		t.Fatalf("cleanup discarded failed controller %T", owned)
+	}
+	s.mu.Lock()
+	failure, recorded := s.captchaCloseFailures[flow]
+	s.mu.Unlock()
+	if !recorded || failure.controller != controller || !errors.Is(failure.err, closeFailure) || !failure.possiblyRunning {
+		t.Fatalf("recorded close failure=%+v exists=%v", failure, recorded)
+	}
+}
+
+func TestCaptchaBrowserExitedProfileFailureDoesNotReplaceSuccess(t *testing.T) {
+	s := newCaptchaServer(&fakePasswordAuth{})
+	profileFailure := errors.New("state profile could not be removed")
+	controller := newTestCaptchaBrowserController()
+	controller.closeErr = &captchaBrowserCloseError{ProcessExited: true, Err: profileFailure}
+	s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) { return controller, nil }
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	flow := s.passwordPending[state].flow
+	s.mu.Unlock()
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	s.setPasswordOutcome(state, passwordOutcome{display: "Player#KR1"})
+	s.mu.Lock()
+	published := s.passwordOutcomes[state]
+	failure, recorded := s.captchaCloseFailures[flow]
+	s.mu.Unlock()
+	if published.err != nil || published.display != "Player#KR1" {
+		t.Fatalf("profile-only cleanup error replaced success: %+v", published)
+	}
+	if !recorded || failure.controller != controller || !errors.Is(failure.err, profileFailure) || failure.possiblyRunning {
+		t.Fatalf("recorded profile failure=%+v exists=%v", failure, recorded)
+	}
+}
+
 func TestCaptchaBrowserLaunchedAfterExpiryClosesInsteadOfInstalling(t *testing.T) {
 	s := newCaptchaServer(&fakePasswordAuth{})
 	controller := newTestCaptchaBrowserController()
@@ -809,6 +1109,53 @@ func TestCaptchaBrowserLaunchedAfterExpiryClosesInsteadOfInstalling(t *testing.T
 	flow.launchMu.Unlock()
 	if stored != nil {
 		t.Fatalf("expired state retained controller %T", stored)
+	}
+}
+
+func TestCaptchaBrowserLaunchedAfterExpiryRetainsCloseFailure(t *testing.T) {
+	s := newCaptchaServer(&fakePasswordAuth{})
+	closeFailure := errors.New("late Chrome process may still be running")
+	controller := newTestCaptchaBrowserController()
+	controller.closeErr = closeFailure
+	launchStarted := make(chan struct{})
+	releaseLaunch := make(chan struct{})
+	s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) {
+		close(launchStarted)
+		<-releaseLaunch
+		return controller, nil
+	}
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	flow := s.passwordPending[state].flow
+	s.mu.Unlock()
+	launchDone := make(chan error, 1)
+	go func() {
+		launchDone <- s.LaunchPasswordCaptcha(context.Background(), state, "owner-1")
+	}()
+	<-launchStarted
+	s.mu.Lock()
+	pending := s.passwordPending[state]
+	pending.expiresAt = time.Now().Add(-time.Second)
+	s.passwordPending[state] = pending
+	s.mu.Unlock()
+	close(releaseLaunch)
+	if err := <-launchDone; !errors.Is(err, closeFailure) {
+		t.Fatalf("launch error=%v, want actionable cleanup failure", err)
+	}
+	flow.launchMu.Lock()
+	owned := flow.browser
+	flow.launchMu.Unlock()
+	if owned != controller {
+		t.Fatalf("late failed controller=%T, want retained ownership", owned)
+	}
+	s.mu.Lock()
+	failure, recorded := s.captchaCloseFailures[flow]
+	s.mu.Unlock()
+	if !recorded || failure.controller != controller || !errors.Is(failure.err, closeFailure) || !failure.possiblyRunning {
+		t.Fatalf("recorded late close failure=%+v exists=%v", failure, recorded)
 	}
 }
 

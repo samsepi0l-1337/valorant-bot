@@ -267,8 +267,12 @@ func TestCaptchaBrowserCloseRejectsSharedProfileRoot(t *testing.T) {
 			return errors.New("DevToolsActivePort unavailable")
 		},
 	}
-	if err := controller.Close(); err == nil {
+	closeErr := controller.Close()
+	if closeErr == nil {
 		t.Fatal("shared profile root removal was not rejected")
+	}
+	if captchaBrowserMayBeRunning(closeErr) {
+		t.Fatalf("profile-only cleanup error was misclassified as a live process: %v", closeErr)
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("shared profile root contents were removed: %v", err)

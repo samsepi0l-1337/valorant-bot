@@ -33,6 +33,19 @@ type captchaBrowserController interface {
 	Close() error
 }
 
+type captchaBrowserCloseError struct {
+	ProcessExited bool
+	Err           error
+}
+
+func (e *captchaBrowserCloseError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *captchaBrowserCloseError) Unwrap() error {
+	return e.Err
+}
+
 type chromeBrowserController struct {
 	cmd           *exec.Cmd
 	profileRoot   string
@@ -130,8 +143,9 @@ func (c *chromeBrowserController) close() error {
 		cancel()
 	}
 
+	ownedProcess := c.cmd != nil && c.cmd.Process != nil
 	var terminateErr error
-	if c.cmd != nil && c.cmd.Process != nil && !waitForCaptchaProcessExit(c.exited, 0) {
+	if ownedProcess && !waitForCaptchaProcessExit(c.exited, 0) {
 		if !graceful || !waitForCaptchaProcessExit(c.exited, chromeExitTimeout) {
 			terminateErr = terminateCaptchaProcess(c.cmd.Process, c.exited)
 		}
@@ -141,7 +155,14 @@ func (c *chromeBrowserController) close() error {
 	if profileErr == nil {
 		removeErr = os.RemoveAll(c.profileDir)
 	}
-	return errors.Join(profileErr, terminateErr, removeErr)
+	closeErr := errors.Join(profileErr, terminateErr, removeErr)
+	if closeErr == nil {
+		return nil
+	}
+	return &captchaBrowserCloseError{
+		ProcessExited: !ownedProcess || waitForCaptchaProcessExit(c.exited, 0),
+		Err:           closeErr,
+	}
 }
 
 func waitForCaptchaProcessExit(exited <-chan struct{}, timeout time.Duration) bool {
@@ -521,8 +542,10 @@ func (s *Server) ensureCaptchaLaunched(state string) error {
 	}
 	s.mu.Lock()
 	pending, ok := s.passwordPending[state]
+	out := s.passwordOutcomes[state]
 	port := s.captchaTLSPort
-	if !ok || pending.flow == nil || pending.flow.ctx.Err() != nil || time.Now().After(pending.expiresAt) {
+	if !ok || pending.flow == nil || pending.flow.sealed || out.done ||
+		pending.flow.ctx.Err() != nil || time.Now().After(pending.expiresAt) {
 		s.mu.Unlock()
 		return fmt.Errorf("captcha session expired; run /auth again")
 	}
@@ -530,29 +553,33 @@ func (s *Server) ensureCaptchaLaunched(state string) error {
 	s.mu.Unlock()
 
 	flow.launchMu.Lock()
-	defer flow.launchMu.Unlock()
 	if flow.ctx.Err() != nil {
+		flow.launchMu.Unlock()
 		return fmt.Errorf("captcha session expired; run /auth again")
 	}
 	s.mu.Lock()
 	current, stillPending := s.passwordPending[state]
-	if !stillPending || current.flow != flow || time.Now().After(current.expiresAt) {
+	out = s.passwordOutcomes[state]
+	if !stillPending || current.flow != flow || flow.sealed || out.done || time.Now().After(current.expiresAt) {
 		s.mu.Unlock()
+		flow.launchMu.Unlock()
 		return fmt.Errorf("captcha session expired; run /auth again")
 	}
 	if port <= 0 {
 		s.mu.Unlock()
+		flow.launchMu.Unlock()
 		return fmt.Errorf("captcha TLS not started")
 	}
 	launcher := s.launchCaptchaBrowser
 	s.mu.Unlock()
 
-	old := flow.browser
-	flow.browser = nil
-	if old != nil {
-		_ = old.Close()
+	if old, closeErr := closeCaptchaBrowserLocked(flow); closeErr != nil {
+		flow.launchMu.Unlock()
+		s.recordCaptchaBrowserCloseResult(flow, old, closeErr)
+		return fmt.Errorf("close existing captcha Chrome before reopen: %w", closeErr)
 	}
 	if flow.ctx.Err() != nil {
+		flow.launchMu.Unlock()
 		return fmt.Errorf("captcha session expired; run /auth again")
 	}
 	if launcher == nil {
@@ -561,34 +588,93 @@ func (s *Server) ensureCaptchaLaunched(state string) error {
 	widgetURL := s.captchaWidgetURL(state)
 	controller, err := launcher(widgetURL)
 	if err != nil {
+		flow.launchMu.Unlock()
 		return err
 	}
 	if controller == nil {
+		flow.launchMu.Unlock()
 		return fmt.Errorf("captcha Chrome launcher returned no controller")
 	}
 	s.mu.Lock()
 	current, stillPending = s.passwordPending[state]
-	live := stillPending && current.flow == flow && flow.ctx.Err() == nil && time.Now().Before(current.expiresAt)
+	out = s.passwordOutcomes[state]
+	live := stillPending && current.flow == flow && !flow.sealed && !out.done &&
+		flow.ctx.Err() == nil && time.Now().Before(current.expiresAt)
 	s.mu.Unlock()
 	if !live {
-		_ = controller.Close()
-		return fmt.Errorf("captcha session expired; run /auth again")
+		flow.browser = controller
+		closedController, closeErr := closeCaptchaBrowserLocked(flow)
+		flow.launchMu.Unlock()
+		s.recordCaptchaBrowserCloseResult(flow, closedController, closeErr)
+		expiredErr := fmt.Errorf("captcha session expired; run /auth again")
+		if closeErr != nil {
+			return errors.Join(expiredErr, fmt.Errorf("close late captcha Chrome: %w", closeErr))
+		}
+		return expiredErr
 	}
 	flow.browser = controller
-	log.Printf("captcha chrome launched state=%s url=%s", state, widgetURL)
+	flow.launchMu.Unlock()
+	log.Printf("captcha Chrome launched")
 	return nil
 }
 
-func detachAndCloseCaptchaBrowser(flow *passwordFlow) error {
+func closeCaptchaBrowserLocked(flow *passwordFlow) (captchaBrowserController, error) {
+	if flow == nil {
+		return nil, nil
+	}
+	controller := flow.browser
+	if controller == nil {
+		return nil, nil
+	}
+	if err := controller.Close(); err != nil {
+		return controller, err
+	}
+	flow.browser = nil
+	return controller, nil
+}
+
+func (s *Server) closeOwnedCaptchaBrowser(flow *passwordFlow) error {
 	if flow == nil {
 		return nil
 	}
 	flow.launchMu.Lock()
-	controller := flow.browser
-	flow.browser = nil
+	controller, err := closeCaptchaBrowserLocked(flow)
 	flow.launchMu.Unlock()
-	if controller == nil {
-		return nil
+	s.recordCaptchaBrowserCloseResult(flow, controller, err)
+	return err
+}
+
+func (s *Server) recordCaptchaBrowserCloseResult(flow *passwordFlow, controller captchaBrowserController, closeErr error) {
+	if flow == nil || controller == nil {
+		return
 	}
-	return controller.Close()
+	s.mu.Lock()
+	if s.captchaCloseFailures == nil {
+		s.captchaCloseFailures = make(map[*passwordFlow]captchaBrowserCloseFailure)
+	}
+	_, alreadyRecorded := s.captchaCloseFailures[flow]
+	if closeErr == nil {
+		delete(s.captchaCloseFailures, flow)
+	} else {
+		s.captchaCloseFailures[flow] = captchaBrowserCloseFailure{
+			controller:      controller,
+			err:             closeErr,
+			possiblyRunning: captchaBrowserMayBeRunning(closeErr),
+		}
+	}
+	s.mu.Unlock()
+	if closeErr != nil && !alreadyRecorded {
+		log.Printf("captcha Chrome ownership retained after close failure: %v", closeErr)
+	}
+}
+
+func captchaBrowserMayBeRunning(closeErr error) bool {
+	if closeErr == nil {
+		return false
+	}
+	var controllerErr *captchaBrowserCloseError
+	if errors.As(closeErr, &controllerErr) {
+		return !controllerErr.ProcessExited
+	}
+	return true
 }

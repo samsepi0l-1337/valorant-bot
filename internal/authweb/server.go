@@ -103,6 +103,12 @@ type mfaFlow struct {
 	submitMu sync.Mutex
 }
 
+type captchaBrowserCloseFailure struct {
+	controller      captchaBrowserController
+	err             error
+	possiblyRunning bool
+}
+
 // Server serves login redirect + Riot callback catcher.
 type Server struct {
 	authBaseURL    string
@@ -123,6 +129,7 @@ type Server struct {
 	passwordPending      map[string]passwordPending
 	passwordOutcomes     map[string]passwordOutcome
 	passwordReady        map[string]chan struct{}
+	captchaCloseFailures map[*passwordFlow]captchaBrowserCloseFailure
 	captchaTLSPort       int
 	launchCaptchaBrowser func(string) (captchaBrowserController, error)
 }
@@ -158,6 +165,7 @@ func New(d Deps) *Server {
 		passwordPending:      make(map[string]passwordPending),
 		passwordOutcomes:     make(map[string]passwordOutcome),
 		passwordReady:        make(map[string]chan struct{}),
+		captchaCloseFailures: make(map[*passwordFlow]captchaBrowserCloseFailure),
 		captchaTLSPort:       tlsPort,
 		launchCaptchaBrowser: launchSystemChrome,
 	}
