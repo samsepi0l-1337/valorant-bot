@@ -23,7 +23,7 @@ type shopCacheEntry struct {
 }
 
 type shopPageCache struct {
-	mu    sync.Mutex
+	mu     sync.Mutex
 	byUser map[string]shopCacheEntry
 }
 
