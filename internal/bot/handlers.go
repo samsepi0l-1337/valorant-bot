@@ -268,24 +268,31 @@ func (h *Handlers) HandlePasswordLogin(ctx context.Context, discordUserID, usern
 // HandlePasswordCaptchaLaunch handles the Discord custom-ID button by opening
 // Chrome on the bot host after validating the login owner.
 func (h *Handlers) HandlePasswordCaptchaLaunch(ctx context.Context, state, discordUserID string, lang i18n.Lang) (Response, error) {
+	resp, _, err := h.handlePasswordCaptchaLaunch(ctx, state, discordUserID, lang)
+	return resp, err
+}
+
+// handlePasswordCaptchaLaunch returns whether Chrome was opened in addition to
+// the localized response used by the Discord component handler.
+func (h *Handlers) handlePasswordCaptchaLaunch(ctx context.Context, state, discordUserID string, lang i18n.Lang) (Response, bool, error) {
 	if h.Auth == nil {
-		return Response{}, fmt.Errorf("auth not configured")
+		return Response{}, false, fmt.Errorf("auth not configured")
 	}
 	err := h.Auth.LaunchPasswordCaptcha(ctx, state, discordUserID)
 	if err == nil {
-		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.launched")}, nil
+		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.launched")}, true, nil
 	}
 	if errors.Is(err, authweb.ErrCaptchaOwner) {
-		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.denied")}, nil
+		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.denied")}, false, nil
 	}
 	errText := strings.ToLower(err.Error())
 	if strings.Contains(errText, "chrome") || strings.Contains(errText, "chromium") {
-		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.need_chrome")}, nil
+		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.need_chrome")}, false, nil
 	}
 	if strings.Contains(errText, "expired") {
-		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.expired")}, nil
+		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.expired")}, false, nil
 	}
-	return Response{Ephemeral: true, Content: fmt.Sprintf(i18n.T(lang, "auth.captcha.launch_failed"), err)}, nil
+	return Response{Ephemeral: true, Content: fmt.Sprintf(i18n.T(lang, "auth.captcha.launch_failed"), err)}, false, nil
 }
 
 // HandlePasswordCaptchaComplete builds the Discord reply after browser captcha finishes.

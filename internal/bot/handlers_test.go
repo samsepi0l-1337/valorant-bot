@@ -82,7 +82,7 @@ func (f *fakeAuth) LaunchPasswordCaptcha(ctx context.Context, state, discordUser
 	f.launches++
 	f.launchState = state
 	f.launchUser = discordUserID
-	if f.launchErr == nil {
+	if !errors.Is(f.launchErr, authweb.ErrCaptchaOwner) {
 		f.browserRuns++
 	}
 	return f.launchErr
@@ -289,6 +289,9 @@ func TestHandlePasswordCaptchaLaunchDenied(t *testing.T) {
 	}
 	if auth.browserRuns != 0 {
 		t.Fatalf("wrong-owner browser launches = %d, want 0", auth.browserRuns)
+	}
+	if auth.launches != 1 {
+		t.Fatalf("wrong-owner validation calls = %d, want 1", auth.launches)
 	}
 }
 

@@ -209,10 +209,12 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 		state := strings.TrimPrefix(data.CustomID, customIDAuthCaptchaPref)
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
-		resp, err := h.HandlePasswordCaptchaLaunch(ctx, state, userID, lang)
+		resp, launched, err := h.handlePasswordCaptchaLaunch(ctx, state, userID, lang)
 		if err != nil {
 			log.Printf("interaction: captcha component error: %v", err)
 			resp = Response{Content: i18n.T(lang, "error.prefix") + err.Error()}
+		} else if launched {
+			h.startPasswordCaptchaWatcher(s, i, state, lang)
 		}
 		if rerr := editInteraction(s, i, resp); rerr != nil {
 			log.Printf("interaction: captcha component edit failed: %v", rerr)
@@ -307,16 +309,13 @@ func (h *Handlers) onModal(s *discordgo.Session, i *discordgo.InteractionCreate)
 
 	switch {
 	case data.CustomID == customIDAuthPWModal:
-		resp, captchaState, err := h.HandlePasswordLogin(ctx, userID, modalValue(data, "username"), modalValue(data, "password"), lang)
+		resp, _, err := h.HandlePasswordLogin(ctx, userID, modalValue(data, "username"), modalValue(data, "password"), lang)
 		if err != nil {
 			_ = respondEphemeral(s, i, i18n.T(lang, "error.prefix")+err.Error())
 			return
 		}
 		if rerr := respondEphemeralWithComponents(s, i, resp); rerr != nil {
 			log.Printf("interaction: password captcha reply: %v", rerr)
-		}
-		if captchaState != "" {
-			go h.watchPasswordCaptcha(s, i, captchaState, lang)
 		}
 	case strings.HasPrefix(data.CustomID, customIDAuthMFAPref):
 		mfaState := strings.TrimPrefix(data.CustomID, customIDAuthMFAPref)
@@ -555,6 +554,30 @@ func (h *Handlers) watchQRLogin(s *discordgo.Session, i *discordgo.InteractionCr
 	if rerr := editInteraction(s, i, h.HandleAuthComplete(display, err, lang)); rerr != nil {
 		log.Printf("interaction: qr login edit failed: %v", rerr)
 	}
+}
+
+// startPasswordCaptchaWatcher starts at most one watcher for a live CAPTCHA state.
+// Reopening Chrome uses the existing watcher rather than creating another waiter.
+func (h *Handlers) startPasswordCaptchaWatcher(s *discordgo.Session, i *discordgo.InteractionCreate, state string, lang i18n.Lang) {
+	h.captchaWatchMu.Lock()
+	if h.captchaWatches == nil {
+		h.captchaWatches = make(map[string]struct{})
+	}
+	if _, watching := h.captchaWatches[state]; watching {
+		h.captchaWatchMu.Unlock()
+		return
+	}
+	h.captchaWatches[state] = struct{}{}
+	h.captchaWatchMu.Unlock()
+
+	go func() {
+		defer func() {
+			h.captchaWatchMu.Lock()
+			delete(h.captchaWatches, state)
+			h.captchaWatchMu.Unlock()
+		}()
+		h.watchPasswordCaptcha(s, i, state, lang)
+	}()
 }
 
 // watchPasswordCaptcha waits for the browser captcha page, then shows MFA step 2 or success.

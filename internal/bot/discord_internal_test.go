@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"image"
 	"io"
 	"net/http"
@@ -21,10 +22,16 @@ type acknowledgementCheckingAuth struct {
 	launchBeforeACK atomic.Bool
 	launchStarted   chan<- struct{}
 	launchRelease   <-chan struct{}
+	waitStarted     chan<- struct{}
+	waitRelease     <-chan struct{}
+	waitDone        chan<- struct{}
 }
 
 type passwordButtonAuth struct {
+	launchErr   error
 	launches    atomic.Int32
+	waits       atomic.Int32
+	waitStarted chan<- struct{}
 	waitRelease <-chan struct{}
 	waitDone    chan<- struct{}
 }
@@ -43,10 +50,14 @@ func (*passwordButtonAuth) BeginPasswordLogin(context.Context, string, string, s
 
 func (a *passwordButtonAuth) LaunchPasswordCaptcha(context.Context, string, string) error {
 	a.launches.Add(1)
-	return nil
+	return a.launchErr
 }
 
 func (a *passwordButtonAuth) WaitPasswordLogin(context.Context, string) (string, string, string, error) {
+	a.waits.Add(1)
+	if a.waitStarted != nil {
+		a.waitStarted <- struct{}{}
+	}
 	<-a.waitRelease
 	if a.waitDone != nil {
 		a.waitDone <- struct{}{}
@@ -86,8 +97,17 @@ func (a *acknowledgementCheckingAuth) LaunchPasswordCaptcha(context.Context, str
 	return nil
 }
 
-func (*acknowledgementCheckingAuth) WaitPasswordLogin(context.Context, string) (string, string, string, error) {
-	return "", "", "", nil
+func (a *acknowledgementCheckingAuth) WaitPasswordLogin(context.Context, string) (string, string, string, error) {
+	if a.waitStarted != nil {
+		a.waitStarted <- struct{}{}
+	}
+	if a.waitRelease != nil {
+		<-a.waitRelease
+	}
+	if a.waitDone != nil {
+		a.waitDone <- struct{}{}
+	}
+	return "", "", "", context.Canceled
 }
 
 func (*acknowledgementCheckingAuth) CompletePasswordMFA(context.Context, string, string) (string, error) {
@@ -236,6 +256,9 @@ func TestAuthCaptchaComponentAcknowledgesBeforeLaunchingChrome(t *testing.T) {
 	)
 	launchStarted := make(chan struct{}, 1)
 	launchRelease := make(chan struct{})
+	waitStarted := make(chan struct{}, 1)
+	waitRelease := make(chan struct{})
+	waitDone := make(chan struct{}, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/callback":
@@ -277,6 +300,9 @@ func TestAuthCaptchaComponentAcknowledgesBeforeLaunchingChrome(t *testing.T) {
 		acknowledged:  &acknowledged,
 		launchStarted: launchStarted,
 		launchRelease: launchRelease,
+		waitStarted:   waitStarted,
+		waitRelease:   waitRelease,
+		waitDone:      waitDone,
 	}
 	h := &Handlers{Auth: auth}
 	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
@@ -318,9 +344,27 @@ func TestAuthCaptchaComponentAcknowledgesBeforeLaunchingChrome(t *testing.T) {
 	if editCalls.Load() != 1 {
 		t.Fatalf("original-message edit calls = %d, want 1", editCalls.Load())
 	}
+	select {
+	case <-waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("successful captcha launch did not start its watcher")
+	}
+	close(waitRelease)
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("captcha watcher did not finish")
+	}
+	deadline := time.Now().Add(time.Second)
+	for editCalls.Load() != 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if editCalls.Load() != 2 {
+		t.Fatalf("original-message edit calls = %d, want 2 including watcher completion", editCalls.Load())
+	}
 }
 
-func TestPasswordModalWaitsForOwnerCaptchaButtonBeforeLaunchingChrome(t *testing.T) {
+func TestPasswordModalStartsOneWatcherAfterOwnerCaptchaButton(t *testing.T) {
 	type component struct {
 		CustomID   string      `json:"custom_id"`
 		Components []component `json:"components"`
@@ -332,7 +376,7 @@ func TestPasswordModalWaitsForOwnerCaptchaButtonBeforeLaunchingChrome(t *testing
 		} `json:"data"`
 	}
 	modalResponse := make(chan modalResponsePayload, 1)
-	originalEdits := make(chan struct{}, 2)
+	originalEdits := make(chan struct{}, 3)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/callback":
@@ -370,8 +414,9 @@ func TestPasswordModalWaitsForOwnerCaptchaButtonBeforeLaunchingChrome(t *testing
 		t.Fatal(err)
 	}
 	waitRelease := make(chan struct{})
+	waitStarted := make(chan struct{}, 2)
 	waitDone := make(chan struct{}, 1)
-	auth := &passwordButtonAuth{waitRelease: waitRelease, waitDone: waitDone}
+	auth := &passwordButtonAuth{waitStarted: waitStarted, waitRelease: waitRelease, waitDone: waitDone}
 	h := &Handlers{Auth: auth}
 	modal := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
 		ID:    "interaction-password-modal",
@@ -408,16 +453,23 @@ func TestPasswordModalWaitsForOwnerCaptchaButtonBeforeLaunchingChrome(t *testing
 	if got := auth.launches.Load(); got != 0 {
 		t.Fatalf("modal Chrome launches = %d, want 0", got)
 	}
+	select {
+	case <-waitStarted:
+		t.Error("password modal started its captcha watcher before the button click")
+	case <-time.After(100 * time.Millisecond):
+	}
 
-	captchaComponent := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
-		ID:    "interaction-captcha-button",
-		AppID: "application-1",
-		Token: "token-captcha-button",
-		Type:  discordgo.InteractionMessageComponent,
-		Data:  discordgo.MessageComponentInteractionData{CustomID: customIDAuthCaptchaPref + "captcha-state"},
-		User:  &discordgo.User{ID: "owner-1"},
-	}}
-	h.onComponent(session, captchaComponent)
+	captchaComponent := func(id string) *discordgo.InteractionCreate {
+		return &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+			ID:    id,
+			AppID: "application-1",
+			Token: id + "-token",
+			Type:  discordgo.InteractionMessageComponent,
+			Data:  discordgo.MessageComponentInteractionData{CustomID: customIDAuthCaptchaPref + "captcha-state"},
+			User:  &discordgo.User{ID: "owner-1"},
+		}}
+	}
+	h.onComponent(session, captchaComponent("interaction-captcha-button"))
 	if got := auth.launches.Load(); got != 1 {
 		t.Fatalf("owner button Chrome launches = %d, want 1", got)
 	}
@@ -425,6 +477,29 @@ func TestPasswordModalWaitsForOwnerCaptchaButtonBeforeLaunchingChrome(t *testing
 	case <-originalEdits:
 	case <-time.After(time.Second):
 		t.Fatal("captcha button response did not finish editing")
+	}
+	select {
+	case <-waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first successful captcha launch did not start its watcher")
+	}
+
+	h.onComponent(session, captchaComponent("interaction-captcha-reopen"))
+	if got := auth.launches.Load(); got != 2 {
+		t.Fatalf("reopen Chrome launches = %d, want 2", got)
+	}
+	select {
+	case <-originalEdits:
+	case <-time.After(time.Second):
+		t.Fatal("captcha reopen response did not finish editing")
+	}
+	select {
+	case <-waitStarted:
+		t.Error("captcha reopen started a second watcher")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := auth.waits.Load(); got != 1 {
+		t.Fatalf("captcha watchers = %d, want 1", got)
 	}
 	close(waitRelease)
 	select {
@@ -437,4 +512,93 @@ func TestPasswordModalWaitsForOwnerCaptchaButtonBeforeLaunchingChrome(t *testing
 	case <-time.After(time.Second):
 		t.Fatal("captcha watcher did not finish editing")
 	}
+}
+
+func TestPasswordCaptchaLaunchFailureDoesNotStartWatcher(t *testing.T) {
+	originalEdits := make(chan struct{}, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/callback":
+			w.WriteHeader(http.StatusNoContent)
+		case "/original":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+			originalEdits <- struct{}{}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	originalCallbackEndpoint := discordgo.EndpointInteractionResponse
+	originalWebhookEndpoint := discordgo.EndpointWebhookMessage
+	discordgo.EndpointInteractionResponse = func(_, _ string) string { return srv.URL + "/callback" }
+	discordgo.EndpointWebhookMessage = func(_, _, _ string) string { return srv.URL + "/original" }
+	t.Cleanup(func() {
+		discordgo.EndpointInteractionResponse = originalCallbackEndpoint
+		discordgo.EndpointWebhookMessage = originalWebhookEndpoint
+	})
+
+	session, err := discordgo.New("Bot test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRelease := make(chan struct{})
+	waitStarted := make(chan struct{}, 1)
+	waitDone := make(chan struct{}, 1)
+	auth := &passwordButtonAuth{
+		launchErr:   errors.New("Chrome/Chromium not found"),
+		waitStarted: waitStarted,
+		waitRelease: waitRelease,
+		waitDone:    waitDone,
+	}
+	h := &Handlers{Auth: auth}
+	modal := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-password-failed-modal",
+		AppID: "application-1",
+		Token: "token-password-failed-modal",
+		Type:  discordgo.InteractionModalSubmit,
+		Data: discordgo.ModalSubmitInteractionData{
+			CustomID: customIDAuthPWModal,
+			Components: []discordgo.MessageComponent{discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+				discordgo.TextInput{CustomID: "username", Value: "user"},
+				discordgo.TextInput{CustomID: "password", Value: "pass"},
+			}}},
+		},
+		User: &discordgo.User{ID: "owner-1"},
+	}}
+	h.onModal(session, modal)
+	h.onComponent(session, &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-captcha-failed-button",
+		AppID: "application-1",
+		Token: "token-captcha-failed-button",
+		Type:  discordgo.InteractionMessageComponent,
+		Data:  discordgo.MessageComponentInteractionData{CustomID: customIDAuthCaptchaPref + "captcha-state"},
+		User:  &discordgo.User{ID: "owner-1"},
+	}})
+	select {
+	case <-originalEdits:
+	case <-time.After(time.Second):
+		t.Fatal("failed captcha launch did not return its component response")
+	}
+	select {
+	case <-waitStarted:
+		close(waitRelease)
+		select {
+		case <-waitDone:
+		case <-time.After(time.Second):
+			t.Fatal("unexpected captcha watcher did not finish")
+		}
+		select {
+		case <-originalEdits:
+		case <-time.After(time.Second):
+			t.Fatal("unexpected captcha watcher did not finish editing")
+		}
+		t.Fatal("failed captcha launch started a watcher")
+	case <-time.After(100 * time.Millisecond):
+	}
+	if got := auth.waits.Load(); got != 0 {
+		t.Fatalf("failed captcha launch watchers = %d, want 0", got)
+	}
+	close(waitRelease)
 }

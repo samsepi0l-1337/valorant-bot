@@ -90,6 +90,9 @@ type Handlers struct {
 
 	shopCache *shopPageCache
 
+	captchaWatchMu sync.Mutex
+	captchaWatches map[string]struct{}
+
 	mfaHintMu sync.Mutex
 	mfaHints  map[string]string // mfaState → email hint or "authenticator"
 }
