@@ -88,6 +88,11 @@ func (s *Server) listenCaptchaTLS(port int, dataDir string) error {
 	}
 	done := make(chan struct{})
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = tlsLn.Close()
+		return ErrServerClosed
+	}
 	if s.captchaTLSListener != nil {
 		s.mu.Unlock()
 		_ = tlsLn.Close()
@@ -143,10 +148,14 @@ func (s *Server) waitCaptchaTLS(timeout time.Duration) error {
 		return nil
 	}
 	s.mu.Lock()
+	closed := s.closed
 	port := s.captchaTLSPort
 	listener := s.captchaTLSListener
 	serveErr := s.captchaTLSServeErr
 	s.mu.Unlock()
+	if closed {
+		return ErrServerClosed
+	}
 	if listener == nil || port <= 0 {
 		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
 			return fmt.Errorf("captcha TLS unavailable: %w", serveErr)

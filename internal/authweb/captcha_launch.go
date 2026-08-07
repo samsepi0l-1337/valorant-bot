@@ -47,14 +47,16 @@ func (e *captchaBrowserCloseError) Unwrap() error {
 }
 
 type chromeBrowserController struct {
-	cmd           *exec.Cmd
-	profileRoot   string
-	profileDir    string
-	exited        chan struct{}
-	waitErr       error
-	closeDevTools func(context.Context, string) error
-	closeOnce     sync.Once
-	closeErr      error
+	cmd              *exec.Cmd
+	profileRoot      string
+	profileDir       string
+	exited           chan struct{}
+	waitErr          error
+	closeDevTools    func(context.Context, string) error
+	terminateProcess func(*os.Process, <-chan struct{}) error
+	removeProfile    func(string, string) error
+	closeMu          sync.Mutex
+	closed           bool
 }
 
 func launchSystemChrome(widgetURL string) (captchaBrowserController, error) {
@@ -123,10 +125,16 @@ func (c *chromeBrowserController) Close() error {
 	if c == nil {
 		return nil
 	}
-	c.closeOnce.Do(func() {
-		c.closeErr = c.close()
-	})
-	return c.closeErr
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	if c.closed {
+		return nil
+	}
+	if err := c.close(); err != nil {
+		return err
+	}
+	c.closed = true
+	return nil
 }
 
 func (c *chromeBrowserController) close() error {
@@ -147,20 +155,32 @@ func (c *chromeBrowserController) close() error {
 	var terminateErr error
 	if ownedProcess && !waitForCaptchaProcessExit(c.exited, 0) {
 		if !graceful || !waitForCaptchaProcessExit(c.exited, chromeExitTimeout) {
-			terminateErr = terminateCaptchaProcess(c.cmd.Process, c.exited)
+			terminate := c.terminateProcess
+			if terminate == nil {
+				terminate = terminateCaptchaProcess
+			}
+			terminateErr = terminate(c.cmd.Process, c.exited)
 		}
 	}
 
+	processExited := !ownedProcess || waitForCaptchaProcessExit(c.exited, 0)
+	if ownedProcess && !processExited && terminateErr == nil {
+		terminateErr = fmt.Errorf("captcha Chrome process did not exit")
+	}
 	var removeErr error
-	if profileErr == nil {
-		removeErr = os.RemoveAll(c.profileDir)
+	if profileErr == nil && processExited {
+		removeProfile := c.removeProfile
+		if removeProfile == nil {
+			removeProfile = removeCaptchaChromeProfile
+		}
+		removeErr = removeProfile(c.profileRoot, c.profileDir)
 	}
 	closeErr := errors.Join(profileErr, terminateErr, removeErr)
 	if closeErr == nil {
 		return nil
 	}
 	return &captchaBrowserCloseError{
-		ProcessExited: !ownedProcess || waitForCaptchaProcessExit(c.exited, 0),
+		ProcessExited: processExited,
 		Err:           closeErr,
 	}
 }
@@ -653,6 +673,7 @@ func (s *Server) recordCaptchaBrowserCloseResult(flow *passwordFlow, controller 
 		s.captchaCloseFailures = make(map[*passwordFlow]captchaBrowserCloseFailure)
 	}
 	_, alreadyRecorded := s.captchaCloseFailures[flow]
+	startReaper := false
 	if closeErr == nil {
 		delete(s.captchaCloseFailures, flow)
 	} else {
@@ -661,10 +682,60 @@ func (s *Server) recordCaptchaBrowserCloseResult(flow *passwordFlow, controller 
 			err:             closeErr,
 			possiblyRunning: captchaBrowserMayBeRunning(closeErr),
 		}
+		if !s.closed && !s.captchaReaperRunning {
+			s.captchaReaperRunning = true
+			s.lifecycleWG.Add(1)
+			startReaper = true
+		}
 	}
 	s.mu.Unlock()
+	if startReaper {
+		go s.reapRetainedCaptchaBrowsers()
+	}
 	if closeErr != nil && !alreadyRecorded {
 		log.Printf("captcha Chrome ownership retained after close failure: %v", closeErr)
+	}
+}
+
+func (s *Server) reapRetainedCaptchaBrowsers() {
+	defer s.lifecycleWG.Done()
+	defer func() {
+		s.mu.Lock()
+		s.captchaReaperRunning = false
+		s.mu.Unlock()
+	}()
+	const maxAttempts = 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-timer.C:
+		case <-s.lifecycleCtx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
+		s.mu.Lock()
+		flows := make([]*passwordFlow, 0, len(s.captchaCloseFailures))
+		for failedFlow := range s.captchaCloseFailures {
+			flows = append(flows, failedFlow)
+		}
+		s.mu.Unlock()
+		if len(flows) == 0 {
+			return
+		}
+		for _, failedFlow := range flows {
+			_ = s.closeOwnedCaptchaBrowser(failedFlow)
+		}
+		s.mu.Lock()
+		remaining := len(s.captchaCloseFailures)
+		s.mu.Unlock()
+		if remaining == 0 {
+			return
+		}
 	}
 }
 

@@ -27,6 +27,8 @@ const (
 )
 
 var (
+	// ErrServerClosed is returned when an auth operation is canceled by server shutdown.
+	ErrServerClosed = errors.New("auth server is shutting down")
 	// ErrMFAOwner means a Discord user tried to control another user's MFA continuation.
 	ErrMFAOwner = errors.New("only the login owner can continue this mfa session")
 	// ErrMFAExpired covers missing, expired, and already-consumed MFA continuations.
@@ -147,6 +149,13 @@ type Server struct {
 	captchaMux     *http.ServeMux
 
 	mu                       serverMutex
+	closed                   bool
+	lifecycleCtx             context.Context
+	lifecycleCancel          context.CancelFunc
+	lifecycleWG              sync.WaitGroup
+	shutdownOnce             sync.Once
+	shutdownDone             chan struct{}
+	shutdownErr              error
 	outcomes                 map[string]authOutcome
 	qrSessions               map[string]*riot.QRSession
 	mfaPending               map[string]mfaPending
@@ -154,6 +163,7 @@ type Server struct {
 	passwordOutcomes         map[string]passwordOutcome
 	passwordReady            map[string]chan struct{}
 	captchaCloseFailures     map[*passwordFlow]captchaBrowserCloseFailure
+	captchaReaperRunning     bool
 	captchaTLSConfiguredPort int
 	captchaTLSPort           int
 	captchaTLSServer         *http.Server
@@ -175,6 +185,7 @@ func New(d Deps) *Server {
 	if poll <= 0 {
 		poll = defaultQRPollInterval
 	}
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	s := &Server{
 		authBaseURL:              strings.TrimRight(d.AuthBaseURL, "/"),
 		pendingTTL:               ttl,
@@ -194,6 +205,9 @@ func New(d Deps) *Server {
 		passwordOutcomes:         make(map[string]passwordOutcome),
 		passwordReady:            make(map[string]chan struct{}),
 		captchaCloseFailures:     make(map[*passwordFlow]captchaBrowserCloseFailure),
+		lifecycleCtx:             lifecycleCtx,
+		lifecycleCancel:          lifecycleCancel,
+		shutdownDone:             make(chan struct{}),
 		captchaTLSConfiguredPort: d.CaptchaTLSPort,
 		launchCaptchaBrowser:     launchSystemChrome,
 	}
@@ -260,10 +274,15 @@ func (s *Server) BeginAuth(discordUserID string) (loginURL, state string, err er
 // BeginQRAuth starts a Riot Mobile QR login and returns the URL the user scans.
 // The caller then blocks on WaitQRLogin with the returned state.
 func (s *Server) BeginQRAuth(ctx context.Context, discordUserID string) (loginURL, state string, err error) {
+	opCtx, done, err := s.beginLifecycleOperation(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	defer done()
 	if s.qrAuth == nil {
 		return "", "", fmt.Errorf("qr auth not configured")
 	}
-	sess, err := s.qrAuth.StartQRSession(ctx)
+	sess, err := s.qrAuth.StartQRSession(opCtx)
 	if err != nil {
 		return "", "", err
 	}
@@ -275,6 +294,10 @@ func (s *Server) BeginQRAuth(ctx context.Context, discordUserID string) (loginUR
 		return "", "", err
 	}
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return "", "", ErrServerClosed
+	}
 	s.qrSessions[state] = sess
 	s.mu.Unlock()
 	return sess.LoginURL, state, nil
@@ -283,6 +306,11 @@ func (s *Server) BeginQRAuth(ctx context.Context, discordUserID string) (loginUR
 // WaitQRLogin polls Riot until the QR code is approved, then links the account.
 // It returns once the account is stored, ctx expires, or the QR session dies.
 func (s *Server) WaitQRLogin(ctx context.Context, state string) (displayName string, err error) {
+	opCtx, done, err := s.beginLifecycleOperation(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer done()
 	s.mu.Lock()
 	sess, ok := s.qrSessions[state]
 	s.mu.Unlock()
@@ -299,22 +327,31 @@ func (s *Server) WaitQRLogin(ctx context.Context, state string) (displayName str
 	defer ticker.Stop()
 
 	for {
-		loginToken, perr := s.qrAuth.PollQRSession(ctx, sess)
+		loginToken, perr := s.qrAuth.PollQRSession(opCtx, sess)
 		switch {
 		case perr == nil:
-			tokens, xerr := s.qrAuth.ExchangeLoginToken(ctx, loginToken)
+			tokens, xerr := s.qrAuth.ExchangeLoginToken(opCtx, loginToken)
 			if xerr != nil {
+				if s.isClosed() {
+					return "", ErrServerClosed
+				}
 				return "", xerr
 			}
-			return s.completeQRLogin(ctx, state, tokens)
+			return s.completeQRLogin(opCtx, state, tokens)
 		case errors.Is(perr, riot.ErrQRPending):
 		default:
+			if s.isClosed() {
+				return "", ErrServerClosed
+			}
 			return "", perr
 		}
 
 		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
+		case <-opCtx.Done():
+			if s.isClosed() {
+				return "", ErrServerClosed
+			}
+			return "", opCtx.Err()
 		case <-ticker.C:
 		}
 	}
@@ -364,6 +401,9 @@ func (s *Server) CompletePasswordMFA(ctx context.Context, mfaState, discordUserI
 	discordUserID = strings.TrimSpace(discordUserID)
 	pending, done, ok := s.beginMFAOperation(mfaState)
 	if !ok {
+		if s.isClosed() {
+			return "", ErrServerClosed
+		}
 		return "", ErrMFAExpired
 	}
 	defer done()
@@ -375,6 +415,9 @@ func (s *Server) CompletePasswordMFA(ctx context.Context, mfaState, discordUserI
 
 	pending, ok = s.liveMFAState(mfaState, pending.flow)
 	if !ok {
+		if s.isClosed() {
+			return "", ErrServerClosed
+		}
 		return "", ErrMFAExpired
 	}
 	if pending.discordUserID != discordUserID {
@@ -387,6 +430,9 @@ func (s *Server) CompletePasswordMFA(ctx context.Context, mfaState, discordUserI
 	requestCancel()
 	pending, live := s.liveMFAState(mfaState, pending.flow)
 	if !live {
+		if s.isClosed() {
+			return "", ErrServerClosed
+		}
 		return "", ErrMFAExpired
 	}
 	if err != nil {
@@ -426,7 +472,7 @@ func (s *Server) consumeMFAState(mfaState string, flow *mfaFlow) bool {
 func (s *Server) beginMFAOperation(mfaState string) (mfaPending, func(), bool) {
 	s.mu.Lock()
 	pending, ok := s.mfaPending[mfaState]
-	if !ok || pending.flow == nil || pending.flow.ctx.Err() != nil || time.Now().After(pending.expiresAt) {
+	if s.closed || !ok || pending.flow == nil || pending.flow.ctx.Err() != nil || time.Now().After(pending.expiresAt) {
 		s.mu.Unlock()
 		return mfaPending{}, nil, false
 	}
@@ -457,6 +503,7 @@ func (s *Server) cleanupMFAState(mfaState string) {
 }
 
 func (s *Server) expireMFAState(mfaState string) {
+	defer s.lifecycleWG.Done()
 	for {
 		s.mu.Lock()
 		pending, ok := s.mfaPending[mfaState]
@@ -470,7 +517,17 @@ func (s *Server) expireMFAState(mfaState string) {
 			return
 		}
 		timer := time.NewTimer(wait)
-		<-timer.C
+		select {
+		case <-timer.C:
+		case <-pending.flow.ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
 	}
 }
 

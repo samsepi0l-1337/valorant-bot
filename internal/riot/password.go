@@ -23,6 +23,17 @@ var (
 	ErrCaptchaSession      = errors.New("unknown or expired captcha session")
 )
 
+// mfaSchemaRejectedError is returned only when Riot explicitly rejects an MFA
+// payload before it can consume the OTP. It intentionally carries no response
+// body because those bodies are untrusted and may contain sensitive material.
+type mfaSchemaRejectedError struct{}
+
+const mfaNonConsumingSchemaRejection = "multifactor request schema rejected before otp processing"
+
+func (*mfaSchemaRejectedError) Error() string {
+	return "riot rejected the MFA payload schema"
+}
+
 // CaptchaRetryError means Riot rejected the token but issued a fresh challenge.
 // The browser page should re-render the widget with SiteKey/RQData.
 type CaptchaRetryError struct {
@@ -367,49 +378,43 @@ func (c *PasswordClient) SubmitMFA(ctx context.Context, challenge *MFAChallenge,
 		return PasswordTokens{}, ErrPasswordInvalidCode
 	}
 
-	bodies := []map[string]any{
-		{
-			"type": "multifactor",
-			"multifactor": map[string]any{
-				"otp":            code,
-				"rememberDevice": true,
-			},
-		},
-		{
-			"type":           "multifactor",
-			"code":           code,
+	body := map[string]any{
+		"type": "multifactor",
+		"multifactor": map[string]any{
+			"otp":            code,
 			"rememberDevice": true,
 		},
 	}
+	tokens, mfa, err := c.submitMFAPayload(ctx, challenge, body)
+	var schemaErr *mfaSchemaRejectedError
+	if errors.As(err, &schemaErr) {
+		// Only a typed, non-consuming request-schema rejection may use the
+		// compatibility payload. Never retry after a transport, token-exchange,
+		// parsing, or other ambiguous result because the OTP may be consumed.
+		fallback := map[string]any{
+			"type":           "multifactor",
+			"code":           code,
+			"rememberDevice": true,
+		}
+		tokens, mfa, err = c.submitMFAPayload(ctx, challenge, fallback)
+	}
+	if err == nil && mfa == nil {
+		return tokens, nil
+	}
+	if errors.Is(err, ErrPasswordInvalidCode) || mfa != nil || errors.Is(err, ErrPasswordInvalid) {
+		return PasswordTokens{}, ErrPasswordInvalidCode
+	}
+	if err == nil {
+		err = ErrPasswordInvalidCode
+	}
+	return PasswordTokens{}, err
+}
 
-	var lastErr error
-	for _, body := range bodies {
-		var (
-			tokens PasswordTokens
-			mfa    *MFAChallenge
-			err    error
-		)
-		if challenge.authenticate {
-			tokens, mfa, err = c.putAuthenticate(ctx, challenge.cookies, body, challenge.sdkSID, challenge.userAgent)
-		} else {
-			tokens, mfa, err = c.putAuth(ctx, challenge.cookies, body, challenge.sdkSID, challenge.userAgent)
-		}
-		if err == nil && mfa == nil {
-			return tokens, nil
-		}
-		if errors.Is(err, ErrPasswordInvalidCode) || mfa != nil {
-			return PasswordTokens{}, ErrPasswordInvalidCode
-		}
-		if errors.Is(err, ErrPasswordInvalid) {
-			lastErr = ErrPasswordInvalidCode
-			continue
-		}
-		lastErr = err
+func (c *PasswordClient) submitMFAPayload(ctx context.Context, challenge *MFAChallenge, body map[string]any) (PasswordTokens, *MFAChallenge, error) {
+	if challenge.authenticate {
+		return c.putAuthenticate(ctx, challenge.cookies, body, challenge.sdkSID, challenge.userAgent)
 	}
-	if lastErr == nil {
-		lastErr = ErrPasswordInvalidCode
-	}
-	return PasswordTokens{}, lastErr
+	return c.putAuth(ctx, challenge.cookies, body, challenge.sdkSID, challenge.userAgent)
 }
 
 func (c *PasswordClient) putAuthenticate(ctx context.Context, cookies map[string]string, body map[string]any, sdkSID, userAgent string) (PasswordTokens, *MFAChallenge, error) {
@@ -421,6 +426,9 @@ func (c *PasswordClient) putAuthenticate(ctx context.Context, cookies map[string
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return PasswordTokens{}, nil, ErrPasswordRateLimit
+	}
+	if isMFASchemaRejection(resp.StatusCode, body, raw) {
+		return PasswordTokens{}, nil, &mfaSchemaRejectedError{}
 	}
 	tokens, mfa, perr := c.parseAuthenticateLogin(ctx, raw, cookies, true, sdkSID, userAgent)
 	if perr != nil && resp.StatusCode != http.StatusOK {
@@ -499,6 +507,9 @@ func (c *PasswordClient) putAuth(ctx context.Context, cookies map[string]string,
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return PasswordTokens{}, nil, ErrPasswordRateLimit
 	}
+	if isMFASchemaRejection(resp.StatusCode, body, raw) {
+		return PasswordTokens{}, nil, &mfaSchemaRejectedError{}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return PasswordTokens{}, nil, fmt.Errorf("auth put: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
 	}
@@ -570,6 +581,19 @@ func (c *PasswordClient) putAuth(ctx context.Context, cookies map[string]string,
 		}
 		return PasswordTokens{}, nil, fmt.Errorf("riot auth: unexpected response")
 	}
+}
+
+func isMFASchemaRejection(status int, body map[string]any, raw []byte) bool {
+	if status != http.StatusBadRequest || body["type"] != "multifactor" {
+		return false
+	}
+	var response struct {
+		Type             string `json:"type"`
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+	}
+	return json.Unmarshal(raw, &response) == nil && response.Type == "error" && response.Error == "invalid_request" &&
+		strings.EqualFold(strings.TrimSpace(response.ErrorDescription), mfaNonConsumingSchemaRejection)
 }
 
 func (c *PasswordClient) exchangeLoginToken(ctx context.Context, loginToken string) (PasswordTokens, error) {

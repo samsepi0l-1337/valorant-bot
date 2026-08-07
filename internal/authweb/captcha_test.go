@@ -1839,7 +1839,7 @@ func TestCaptchaBrowserCleanupFailureRetainsOwnership(t *testing.T) {
 	}
 }
 
-func TestCaptchaBrowserExitedProfileFailureDoesNotReplaceSuccess(t *testing.T) {
+func TestCaptchaBrowserExitedProfileFailureIsTerminalUntilCleanup(t *testing.T) {
 	s := newCaptchaServer(&fakePasswordAuth{})
 	profileFailure := errors.New("state profile could not be removed")
 	controller := newTestCaptchaBrowserController()
@@ -1860,8 +1860,8 @@ func TestCaptchaBrowserExitedProfileFailureDoesNotReplaceSuccess(t *testing.T) {
 	published := s.passwordOutcomes[state]
 	failure, recorded := s.captchaCloseFailures[flow]
 	s.mu.Unlock()
-	if published.err != nil || published.display != "Player#KR1" {
-		t.Fatalf("profile-only cleanup error replaced success: %+v", published)
+	if !errors.Is(published.err, profileFailure) || published.display != "" {
+		t.Fatalf("profile-only cleanup error did not replace success: %+v", published)
 	}
 	if !recorded || failure.controller != controller || !errors.Is(failure.err, profileFailure) || failure.possiblyRunning {
 		t.Fatalf("recorded profile failure=%+v exists=%v", failure, recorded)
@@ -2080,6 +2080,7 @@ func TestCaptchaBrowserClosesOnTerminalErrorCancellationAndExpiry(t *testing.T) 
 		pending := s.passwordPending[state]
 		pending.expiresAt = time.Now().Add(-time.Second)
 		s.passwordPending[state] = pending
+		s.lifecycleWG.Add(1)
 		s.mu.Unlock()
 		s.expirePasswordState(state)
 		if controller.closeCalls.Load() != 1 {

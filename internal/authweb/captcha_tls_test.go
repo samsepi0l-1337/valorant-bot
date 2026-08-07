@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -287,6 +288,152 @@ func TestCaptchaBrowserCloseRemovesOnlyOwnedStateProfileWithoutDevTools(t *testi
 	}
 	if _, err := os.Stat(root); err != nil {
 		t.Fatalf("shared profile root was removed: %v", err)
+	}
+}
+
+func TestCaptchaBrowserCloseKeepsProfileUntilOwnedProcessExits(t *testing.T) {
+	root := t.TempDir()
+	profileDir := filepath.Join(root, strings.Repeat("e", 32))
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profileDir, "marker"), []byte("must remain while Chrome is live"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestChromeLaunchHelperProcess", "--")
+	cmd.Env = append(os.Environ(), "VALORANT_CHROME_LAUNCH_HELPER=1")
+	controller, err := startChromeLogged(cmd, root, profileDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chrome := controller.(*chromeBrowserController)
+	chrome.closeDevTools = func(context.Context, string) error { return errors.New("DevTools unavailable") }
+
+	// Simulate a failed process-group termination. The profile must remain owned
+	// and intact until the process has actually exited, so a later close can
+	// reclaim it safely.
+	chrome.terminateProcess = func(*os.Process, <-chan struct{}) error {
+		return errors.New("process group still running")
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		<-chrome.exited
+		_ = os.RemoveAll(root)
+	})
+
+	closeErr := chrome.Close()
+	if closeErr == nil || !captchaBrowserMayBeRunning(closeErr) {
+		t.Fatalf("close error=%v, want an unexited-process error", closeErr)
+	}
+	if _, err := os.Stat(filepath.Join(profileDir, "marker")); err != nil {
+		t.Fatalf("live Chrome profile was removed before exit: %v", err)
+	}
+}
+
+func TestCaptchaBrowserCloseRetriesProfileCleanup(t *testing.T) {
+	root := t.TempDir()
+	profileDir := filepath.Join(root, strings.Repeat("f", 32))
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profileDir, "marker"), []byte("remove after retry"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	close(exited)
+	var removeCalls atomic.Int32
+	controller := &chromeBrowserController{
+		profileRoot: root,
+		profileDir:  profileDir,
+		exited:      exited,
+		closeDevTools: func(context.Context, string) error {
+			return errors.New("DevTools unavailable")
+		},
+		removeProfile: func(profileRoot, profileDir string) error {
+			if removeCalls.Add(1) == 1 {
+				return errors.New("temporary profile lock")
+			}
+			return removeCaptchaChromeProfile(profileRoot, profileDir)
+		},
+	}
+
+	firstErr := controller.Close()
+	if firstErr == nil || captchaBrowserMayBeRunning(firstErr) {
+		t.Fatalf("first close error=%v, want exited profile-cleanup failure", firstErr)
+	}
+	if _, err := os.Stat(filepath.Join(profileDir, "marker")); err != nil {
+		t.Fatalf("profile removed despite failed first cleanup: %v", err)
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatalf("retry close: %v", err)
+	}
+	if removeCalls.Load() != 2 {
+		t.Fatalf("profile cleanup calls=%d, want 2", removeCalls.Load())
+	}
+	if _, err := os.Stat(profileDir); !os.IsNotExist(err) {
+		t.Fatalf("profile remains after successful retry: %v", err)
+	}
+}
+
+func TestCaptchaBrowserCloseSerializesConcurrentRetries(t *testing.T) {
+	root := t.TempDir()
+	profileDir := filepath.Join(root, strings.Repeat("1", 32))
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	close(exited)
+	cleanupStarted := make(chan struct{})
+	secondCleanup := make(chan struct{}, 1)
+	releaseCleanup := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-releaseCleanup:
+		default:
+			close(releaseCleanup)
+		}
+	})
+	var cleanupCalls atomic.Int32
+	controller := &chromeBrowserController{
+		profileRoot: root,
+		profileDir:  profileDir,
+		exited:      exited,
+		closeDevTools: func(context.Context, string) error {
+			return errors.New("DevTools unavailable")
+		},
+		removeProfile: func(profileRoot, profileDir string) error {
+			if cleanupCalls.Add(1) == 1 {
+				close(cleanupStarted)
+				<-releaseCleanup
+				return removeCaptchaChromeProfile(profileRoot, profileDir)
+			}
+			secondCleanup <- struct{}{}
+			return errors.New("concurrent cleanup entered")
+		},
+	}
+
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- controller.Close() }()
+	<-cleanupStarted
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- controller.Close() }()
+	select {
+	case <-secondCleanup:
+		t.Fatal("second Close entered profile cleanup before the first close finished")
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(releaseCleanup)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if cleanupCalls.Load() != 1 {
+		t.Fatalf("profile cleanup calls=%d, want one", cleanupCalls.Load())
 	}
 }
 

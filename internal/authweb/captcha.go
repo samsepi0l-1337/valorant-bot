@@ -91,6 +91,12 @@ func (s *Server) BeginPasswordLogin(ctx context.Context, discordUserID, username
 	flowCtx, flowCancel := context.WithCancel(context.Background())
 	flow := &passwordFlow{ctx: flowCtx, cancel: flowCancel}
 	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		flowCancel()
+		return "", "", ErrServerClosed
+	}
+	s.lifecycleWG.Add(1)
 	if s.passwordPending == nil {
 		s.passwordPending = make(map[string]passwordPending)
 	}
@@ -174,6 +180,13 @@ func (s *Server) claimPasswordWait(state string, cancelErr error) passwordWaitDe
 			done:    true,
 		}
 	}
+	if s.closed {
+		return passwordWaitDecision{
+			outcome: passwordOutcome{done: true, err: ErrServerClosed},
+			cleanup: s.claimPasswordStateCleanupLocked(state),
+			done:    true,
+		}
+	}
 	if cancelErr != nil {
 		if hook := s.beforePasswordWaitCancellationClaim; hook != nil {
 			hook()
@@ -229,11 +242,11 @@ func (s *Server) setPasswordOutcome(state string, flow *passwordFlow, out passwo
 		return passwordOutcome{}, err
 	}
 	closeErr := s.closeOwnedCaptchaBrowser(flow)
-	if captchaBrowserMayBeRunning(closeErr) {
+	if closeErr != nil {
 		out = passwordOutcome{err: fmt.Errorf("captcha Chrome could not be closed: %w", closeErr)}
 	}
 	published, publishErr := s.publishPasswordOutcome(state, flow, out)
-	if publishErr != nil && captchaBrowserMayBeRunning(closeErr) {
+	if publishErr != nil && closeErr != nil {
 		return passwordOutcome{}, errors.Join(publishErr, out.err)
 	}
 	return published, publishErr
@@ -291,7 +304,7 @@ func (s *Server) finishPasswordAccount(ctx context.Context, state string, pendin
 		return passwordOutcome{}, err
 	}
 	closeErr := s.closeOwnedCaptchaBrowser(flow)
-	if captchaBrowserMayBeRunning(closeErr) {
+	if closeErr != nil {
 		out := passwordOutcome{err: fmt.Errorf("captcha Chrome could not be closed: %w", closeErr)}
 		published, publishErr := s.publishPasswordOutcome(state, flow, out)
 		if publishErr != nil {
@@ -322,7 +335,7 @@ func (s *Server) finishPasswordMFA(state string, pending passwordPending, mfaSta
 	}
 	scrubPasswordCredentials(&pending)
 	closeErr := s.closeOwnedCaptchaBrowser(flow)
-	if captchaBrowserMayBeRunning(closeErr) {
+	if closeErr != nil {
 		out := passwordOutcome{err: fmt.Errorf("captcha Chrome could not be closed: %w", closeErr)}
 		published, publishErr := s.publishPasswordOutcome(state, flow, out)
 		if publishErr != nil {
@@ -335,12 +348,13 @@ func (s *Server) finishPasswordMFA(state string, pending passwordPending, mfaSta
 	s.mu.Lock()
 	current, ok := s.passwordPending[state]
 	published := s.passwordOutcomes[state]
-	if !ok || current.flow != flow || !flow.sealed || flow.commitClaimed || published.done ||
+	if s.closed || !ok || current.flow != flow || !flow.sealed || flow.commitClaimed || published.done ||
 		flow.ctx.Err() != nil || time.Now().After(current.expiresAt) {
 		s.mu.Unlock()
 		return passwordOutcome{}, errPasswordFlowClosed
 	}
 	mfaCtx, mfaCancel := context.WithCancel(context.Background())
+	s.lifecycleWG.Add(1)
 	s.mfaPending[mfaState] = mfaPending{
 		discordUserID: pending.discordUserID,
 		challenge:     challenge,
@@ -424,7 +438,7 @@ func (s *Server) beginPasswordOperation(state string) (passwordPending, func(), 
 	s.mu.Lock()
 	pending, ok := s.passwordPending[state]
 	out := s.passwordOutcomes[state]
-	if !ok || pending.flow == nil || pending.flow.sealed || out.done ||
+	if s.closed || !ok || pending.flow == nil || pending.flow.sealed || out.done ||
 		pending.flow.ctx.Err() != nil || time.Now().After(pending.expiresAt) {
 		s.mu.Unlock()
 		return passwordPending{}, nil, false
@@ -456,6 +470,7 @@ func (s *Server) livePasswordState(state, sessionID string) (passwordPending, bo
 }
 
 func (s *Server) expirePasswordState(state string) {
+	defer s.lifecycleWG.Done()
 	for {
 		s.mu.Lock()
 		pending, ok := s.passwordPending[state]
@@ -469,7 +484,17 @@ func (s *Server) expirePasswordState(state string) {
 			return
 		}
 		timer := time.NewTimer(wait)
-		<-timer.C
+		select {
+		case <-timer.C:
+		case <-pending.flow.ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
 	}
 }
 

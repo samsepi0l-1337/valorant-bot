@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -554,6 +555,187 @@ func TestPasswordCompleteCaptcha_MFA(t *testing.T) {
 	}
 	if tok.AccessToken != "at-mfa" {
 		t.Fatalf("%+v", tok)
+	}
+}
+
+func TestPasswordSubmitMFADoesNotRetryAfterLoginTokenExchangeFailure(t *testing.T) {
+	var mfaPUTs atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"captcha": map[string]any{
+					"hcaptcha": map[string]string{"key": "k", "data": "d"},
+				},
+			})
+		case http.MethodPut:
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode PUT body: %v", err)
+			}
+			if body["type"] == "auth" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"type":        "multifactor",
+					"multifactor": map[string]any{"method": "email"},
+				})
+				return
+			}
+			mfaPUTs.Add(1)
+			multifactor, ok := body["multifactor"].(map[string]any)
+			if !ok || multifactor["otp"] != "123456" || body["code"] != nil {
+				t.Fatalf("canonical MFA body = %#v", body)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type":    "success",
+				"success": map[string]any{"login_token": "consumed-login-token"},
+			})
+		}
+	})
+	mux.HandleFunc("/api/v1/login-token", func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "upstream unavailable", http.StatusBadGateway)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := &riot.PasswordClient{HTTPClient: srv.Client(), AuthBaseURL: srv.URL, AuthenticateBaseURL: srv.URL}
+	challenge, err := c.BeginCaptcha(context.Background(), "u", "p", riot.CaptchaBrowserSession{UserAgent: captchaBrowserUserAgent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, mfa, err := c.CompleteCaptcha(context.Background(), challenge.SessionID, "captcha-token", captchaBrowserSession(challenge))
+	if err != nil || mfa == nil {
+		t.Fatalf("captcha completion: mfa=%v err=%v", mfa, err)
+	}
+	if _, err := c.SubmitMFA(context.Background(), mfa, "123456"); err == nil {
+		t.Fatal("MFA succeeded after login-token exchange failure")
+	}
+	if got := mfaPUTs.Load(); got != 1 {
+		t.Fatalf("MFA PUTs after a consuming success = %d, want 1", got)
+	}
+}
+
+func TestPasswordSubmitMFADoesNotRetryAfterTransportFailure(t *testing.T) {
+	var mfaPUTs atomic.Int32
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/.well-known/openid-configuration" {
+			return jsonResponse(r, `{}`), nil
+		}
+		if r.URL.Path != "/api/v1/login" {
+			return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		switch r.Method {
+		case http.MethodPost:
+			return jsonResponse(r, `{"captcha":{"hcaptcha":{"key":"k","data":"d"}}}`), nil
+		case http.MethodPut:
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				return nil, err
+			}
+			if body["type"] == "auth" {
+				return jsonResponse(r, `{"type":"multifactor","multifactor":{"method":"email"}}`), nil
+			}
+			mfaPUTs.Add(1)
+			return nil, errors.New("network connection reset")
+		default:
+			return nil, fmt.Errorf("unexpected login method %s", r.Method)
+		}
+	})}
+	c := &riot.PasswordClient{HTTPClient: client, AuthBaseURL: "https://riot.test", AuthenticateBaseURL: "https://riot.test"}
+	challenge, err := c.BeginCaptcha(context.Background(), "u", "p", riot.CaptchaBrowserSession{UserAgent: captchaBrowserUserAgent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, mfa, err := c.CompleteCaptcha(context.Background(), challenge.SessionID, "captcha-token", captchaBrowserSession(challenge))
+	if err != nil || mfa == nil {
+		t.Fatalf("captcha completion: mfa=%v err=%v", mfa, err)
+	}
+	if _, err := c.SubmitMFA(context.Background(), mfa, "123456"); err == nil {
+		t.Fatal("MFA succeeded after transport failure")
+	}
+	if got := mfaPUTs.Load(); got != 1 {
+		t.Fatalf("MFA PUTs after transport ambiguity = %d, want 1", got)
+	}
+}
+
+func TestPasswordSubmitMFAFallsBackAfterExplicitSchemaRejection(t *testing.T) {
+	var canonicalPUTs atomic.Int32
+	var alternatePUTs atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"captcha": map[string]any{
+					"hcaptcha": map[string]string{"key": "k", "data": "d"},
+				},
+			})
+		case http.MethodPut:
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode PUT body: %v", err)
+			}
+			if body["type"] == "auth" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"type":        "multifactor",
+					"multifactor": map[string]any{"method": "email"},
+				})
+				return
+			}
+			if multifactor, ok := body["multifactor"].(map[string]any); ok && multifactor["otp"] == "123456" {
+				canonicalPUTs.Add(1)
+				w.WriteHeader(http.StatusBadRequest)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"type":              "error",
+					"error":             "invalid_request",
+					"error_description": "multifactor request schema rejected before otp processing",
+				})
+				return
+			}
+			if body["type"] != "multifactor" || body["code"] != "123456" || body["rememberDevice"] != true {
+				t.Fatalf("alternate MFA body = %#v", body)
+			}
+			alternatePUTs.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"type":    "success",
+				"success": map[string]any{"login_token": "fallback-login-token"},
+			})
+		}
+	})
+	mux.HandleFunc("/api/v1/login-token", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/api/v1/authorization", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"response": map[string]any{
+				"parameters": map[string]string{"uri": "http://localhost/redirect#access_token=at&id_token=id"},
+			},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := &riot.PasswordClient{HTTPClient: srv.Client(), AuthBaseURL: srv.URL, AuthenticateBaseURL: srv.URL}
+	challenge, err := c.BeginCaptcha(context.Background(), "u", "p", riot.CaptchaBrowserSession{UserAgent: captchaBrowserUserAgent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, mfa, err := c.CompleteCaptcha(context.Background(), challenge.SessionID, "captcha-token", captchaBrowserSession(challenge))
+	if err != nil || mfa == nil {
+		t.Fatalf("captcha completion: mfa=%v err=%v", mfa, err)
+	}
+	tokens, err := c.SubmitMFA(context.Background(), mfa, "123456")
+	if err != nil {
+		t.Fatalf("MFA fallback: %v", err)
+	}
+	if tokens.AccessToken != "at" {
+		t.Fatalf("fallback tokens = %+v", tokens)
+	}
+	if got := canonicalPUTs.Load(); got != 1 {
+		t.Fatalf("canonical MFA PUTs = %d, want 1", got)
+	}
+	if got := alternatePUTs.Load(); got != 1 {
+		t.Fatalf("alternate MFA PUTs = %d, want 1", got)
 	}
 }
 
