@@ -10,6 +10,7 @@ import (
 	"html"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -143,17 +144,23 @@ type Server struct {
 	boxer          Boxer
 	onLinked       LinkedNotifier
 	mux            *http.ServeMux
+	captchaMux     *http.ServeMux
 
-	mu                   serverMutex
-	outcomes             map[string]authOutcome
-	qrSessions           map[string]*riot.QRSession
-	mfaPending           map[string]mfaPending
-	passwordPending      map[string]passwordPending
-	passwordOutcomes     map[string]passwordOutcome
-	passwordReady        map[string]chan struct{}
-	captchaCloseFailures map[*passwordFlow]captchaBrowserCloseFailure
-	captchaTLSPort       int
-	launchCaptchaBrowser func(string) (captchaBrowserController, error)
+	mu                       serverMutex
+	outcomes                 map[string]authOutcome
+	qrSessions               map[string]*riot.QRSession
+	mfaPending               map[string]mfaPending
+	passwordPending          map[string]passwordPending
+	passwordOutcomes         map[string]passwordOutcome
+	passwordReady            map[string]chan struct{}
+	captchaCloseFailures     map[*passwordFlow]captchaBrowserCloseFailure
+	captchaTLSConfiguredPort int
+	captchaTLSPort           int
+	captchaTLSServer         *http.Server
+	captchaTLSListener       net.Listener
+	captchaTLSServeErr       error
+	captchaTLSDone           chan struct{}
+	launchCaptchaBrowser     func(string) (captchaBrowserController, error)
 	// Test-only synchronization seam for the cancellation claim critical section.
 	beforePasswordWaitCancellationClaim func()
 }
@@ -168,30 +175,27 @@ func New(d Deps) *Server {
 	if poll <= 0 {
 		poll = defaultQRPollInterval
 	}
-	tlsPort := d.CaptchaTLSPort
-	if tlsPort <= 0 {
-		tlsPort = defaultCaptchaTLSPort
-	}
 	s := &Server{
-		authBaseURL:          strings.TrimRight(d.AuthBaseURL, "/"),
-		pendingTTL:           ttl,
-		store:                d.Store,
-		riot:                 d.Riot,
-		qrAuth:               d.QRAuth,
-		passwordAuth:         d.PasswordAuth,
-		qrPollInterval:       poll,
-		boxer:                d.Boxer,
-		onLinked:             d.OnLinked,
-		mux:                  http.NewServeMux(),
-		outcomes:             make(map[string]authOutcome),
-		qrSessions:           make(map[string]*riot.QRSession),
-		mfaPending:           make(map[string]mfaPending),
-		passwordPending:      make(map[string]passwordPending),
-		passwordOutcomes:     make(map[string]passwordOutcome),
-		passwordReady:        make(map[string]chan struct{}),
-		captchaCloseFailures: make(map[*passwordFlow]captchaBrowserCloseFailure),
-		captchaTLSPort:       tlsPort,
-		launchCaptchaBrowser: launchSystemChrome,
+		authBaseURL:              strings.TrimRight(d.AuthBaseURL, "/"),
+		pendingTTL:               ttl,
+		store:                    d.Store,
+		riot:                     d.Riot,
+		qrAuth:                   d.QRAuth,
+		passwordAuth:             d.PasswordAuth,
+		qrPollInterval:           poll,
+		boxer:                    d.Boxer,
+		onLinked:                 d.OnLinked,
+		mux:                      http.NewServeMux(),
+		captchaMux:               http.NewServeMux(),
+		outcomes:                 make(map[string]authOutcome),
+		qrSessions:               make(map[string]*riot.QRSession),
+		mfaPending:               make(map[string]mfaPending),
+		passwordPending:          make(map[string]passwordPending),
+		passwordOutcomes:         make(map[string]passwordOutcome),
+		passwordReady:            make(map[string]chan struct{}),
+		captchaCloseFailures:     make(map[*passwordFlow]captchaBrowserCloseFailure),
+		captchaTLSConfiguredPort: d.CaptchaTLSPort,
+		launchCaptchaBrowser:     launchSystemChrome,
 	}
 	s.mux.HandleFunc("GET /login", s.handleLogin)
 	s.mux.HandleFunc("GET /redirect", s.handleRedirectCatcher)
@@ -200,10 +204,10 @@ func New(d Deps) *Server {
 	s.mux.HandleFunc("OPTIONS /api/auth/callback", s.handleCallbackCORS)
 	s.mux.HandleFunc("GET /api/auth/wait", s.handleWait)
 	s.mux.HandleFunc("GET /install-catcher.sh", s.handleInstallCatcher)
-	s.mux.HandleFunc("GET /captcha/widget", s.handleCaptchaWidgetPage)
-	s.mux.HandleFunc("GET /api/auth/captcha/challenge", s.handleCaptchaChallenge)
-	s.mux.HandleFunc("POST /api/auth/captcha", s.handleCaptchaSubmit)
-	s.mux.HandleFunc("OPTIONS /api/auth/captcha", s.handleCaptchaSubmit)
+	s.captchaMux.HandleFunc("GET /captcha/widget", s.handleCaptchaWidgetPage)
+	s.captchaMux.HandleFunc("GET /api/auth/captcha/challenge", s.handleCaptchaChallenge)
+	s.captchaMux.HandleFunc("POST /api/auth/captcha", s.handleCaptchaSubmit)
+	s.captchaMux.HandleFunc("OPTIONS /api/auth/captcha", s.handleCaptchaSubmit)
 	s.mux.HandleFunc("GET /{$}", s.handleIndex)
 	return s
 }
@@ -211,6 +215,25 @@ func New(d Deps) *Server {
 // Handler returns the HTTP handler (AUTH_PORT).
 func (s *Server) Handler() http.Handler {
 	return s.mux
+}
+
+func (s *Server) captchaHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil || !remoteAddrIsLoopback(r.RemoteAddr) {
+			http.Error(w, "captcha transport forbidden", http.StatusForbidden)
+			return
+		}
+		s.captchaMux.ServeHTTP(w, r)
+	})
+}
+
+func remoteAddrIsLoopback(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
+	if err != nil {
+		host = strings.Trim(strings.TrimSpace(remoteAddr), "[]")
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *Server) handleCatcherPing(w http.ResponseWriter, r *http.Request) {

@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -39,6 +40,14 @@ var skipCaptchaTLSWait bool
 func (s *Server) StartCaptchaTLS(port int, dataDir string) error {
 	if dataDir == "" {
 		dataDir = "./data"
+	}
+	if port <= 0 {
+		s.mu.Lock()
+		configuredPort := s.captchaTLSConfiguredPort
+		s.mu.Unlock()
+		if configuredPort > 0 {
+			port = configuredPort
+		}
 	}
 	if port > 0 {
 		return s.listenCaptchaTLS(port, dataDir)
@@ -73,21 +82,38 @@ func (s *Server) listenCaptchaTLS(port int, dataDir string) error {
 		MinVersion:   tls.VersionTLS12,
 	})
 
-	s.mu.Lock()
-	s.captchaTLSPort = port
-	s.mu.Unlock()
-
 	srv := &http.Server{
-		Handler:  s.mux,
+		Handler:  s.captchaHandler(),
 		ErrorLog: quietTLSLogger(),
 	}
+	done := make(chan struct{})
+	s.mu.Lock()
+	if s.captchaTLSListener != nil {
+		s.mu.Unlock()
+		_ = tlsLn.Close()
+		return fmt.Errorf("captcha tls already started")
+	}
+	s.captchaTLSPort = ln.Addr().(*net.TCPAddr).Port
+	s.captchaTLSServer = srv
+	s.captchaTLSListener = tlsLn
+	s.captchaTLSServeErr = nil
+	s.captchaTLSDone = done
+	s.mu.Unlock()
 	go func() {
+		defer close(done)
 		log.Printf("captcha tls: %s (local Chrome host-map)", s.captchaWidgetURL("{state}"))
-		if err := srv.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
-			log.Printf("captcha tls: %v", err)
+		serveErr := srv.Serve(tlsLn)
+		s.mu.Lock()
+		if s.captchaTLSServer == srv {
+			s.captchaTLSServeErr = serveErr
+			s.captchaTLSListener = nil
+		}
+		s.mu.Unlock()
+		if serveErr != nil && serveErr != http.ErrServerClosed {
+			log.Printf("captcha tls: %v", serveErr)
 		}
 	}()
-	return s.waitCaptchaTLS(3 * time.Second)
+	return nil
 }
 
 // quietTLSLogger drops Chrome's common aborted handshake probes (EOF / "connection reset")
@@ -112,40 +138,22 @@ func (f *tlsLogFilter) Write(p []byte) (int, error) {
 }
 
 func (s *Server) waitCaptchaTLS(timeout time.Duration) error {
+	_ = timeout
 	if skipCaptchaTLSWait {
 		return nil
 	}
 	s.mu.Lock()
 	port := s.captchaTLSPort
+	listener := s.captchaTLSListener
+	serveErr := s.captchaTLSServeErr
 	s.mu.Unlock()
-	if port <= 0 {
-		port = defaultCaptchaTLSPort
-	}
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	deadline := time.Now().Add(timeout)
-	var last error
-	for time.Now().Before(deadline) {
-		conn, err := tls.DialWithDialer(
-			&net.Dialer{Timeout: 300 * time.Millisecond},
-			"tcp",
-			addr,
-			&tls.Config{
-				InsecureSkipVerify: true, // local self-signed captcha cert only
-				ServerName:         RiotCaptchaHost,
-				MinVersion:         tls.VersionTLS12,
-			},
-		)
-		if err == nil {
-			_ = conn.Close()
-			return nil
+	if listener == nil || port <= 0 {
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			return fmt.Errorf("captcha TLS unavailable: %w", serveErr)
 		}
-		last = err
-		time.Sleep(50 * time.Millisecond)
+		return fmt.Errorf("captcha TLS is not owned by this server; password CAPTCHA is unavailable")
 	}
-	if last == nil {
-		last = fmt.Errorf("timeout")
-	}
-	return fmt.Errorf("captcha tls %s not ready: %w", addr, last)
+	return nil
 }
 
 func (s *Server) captchaWidgetURL(state string) string {

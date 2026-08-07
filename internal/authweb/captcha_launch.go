@@ -565,7 +565,7 @@ func (s *Server) ensureCaptchaLaunched(state string) error {
 		flow.launchMu.Unlock()
 		return fmt.Errorf("captcha session expired; run /auth again")
 	}
-	if port <= 0 {
+	if port <= 0 && !skipCaptchaTLSWait {
 		s.mu.Unlock()
 		flow.launchMu.Unlock()
 		return fmt.Errorf("captcha TLS not started")

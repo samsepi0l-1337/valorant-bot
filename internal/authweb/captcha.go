@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -16,6 +17,8 @@ import (
 
 // ErrCaptchaOwner means a Discord user tried to control another user's login.
 var ErrCaptchaOwner = errors.New("only the login owner can open this captcha")
+
+const captchaSubmitBodyLimit = 64 << 10
 
 type passwordPending struct {
 	discordUserID  string
@@ -634,7 +637,23 @@ func (s *Server) handleCaptchaSubmit(w http.ResponseWriter, r *http.Request) {
 		Token   string `json:"token"`
 		Version uint64 `json:"version"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, captchaSubmitBodyLimit)
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, `{"ok":false,"error":"request too large"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, `{"ok":false,"error":"bad json"}`, http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, `{"ok":false,"error":"request too large"}`, http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, `{"ok":false,"error":"bad json"}`, http.StatusBadRequest)
 		return
 	}

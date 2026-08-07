@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -84,6 +85,44 @@ func TestEnsureCaptchaTLSFilesRegeneratesLegacyHostCertificate(t *testing.T) {
 	}
 	if err := cert.VerifyHostname(RiotCaptchaHost); err != nil {
 		t.Fatalf("certificate was not regenerated for %s: %v", RiotCaptchaHost, err)
+	}
+}
+
+func TestTLSStartupFailureDoesNotLaunchAgainstUnrelatedLoopbackTLS(t *testing.T) {
+	occupant := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer occupant.Close()
+	port := occupant.Listener.Addr().(*net.TCPAddr).Port
+
+	s := New(Deps{
+		CaptchaTLSPort: port,
+		PasswordAuth:   &fakePasswordAuth{},
+		PendingTTL:     time.Minute,
+		Store:          newMockStore(),
+		Riot:           &mockRiot{},
+		Boxer:          &mockBoxer{},
+	})
+	var launchedURL string
+	s.launchCaptchaBrowser = func(widgetURL string) (captchaBrowserController, error) {
+		launchedURL = widgetURL
+		return newTestCaptchaBrowserController(), nil
+	}
+	if err := s.StartCaptchaTLS(port, t.TempDir()); err == nil {
+		t.Fatal("StartCaptchaTLS succeeded on an occupied port")
+	}
+
+	oldSkip := skipCaptchaTLSWait
+	skipCaptchaTLSWait = false
+	t.Cleanup(func() { skipCaptchaTLSWait = oldSkip })
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.LaunchPasswordCaptcha(context.Background(), state, "owner-1")
+	if err == nil {
+		t.Fatal("launch accepted an unrelated loopback TLS service as owned readiness")
+	}
+	if launchedURL != "" {
+		t.Fatalf("state-bearing widget URL leaked to launcher after TLS ownership failure: %q", launchedURL)
 	}
 }
 
