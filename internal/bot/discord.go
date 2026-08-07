@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -142,17 +143,26 @@ func RegisterHandlers(s *discordgo.Session, h *Handlers) {
 
 // OnInteraction dispatches application commands and component interactions.
 func (h *Handlers) OnInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	ctx, done, ok := h.beginLifecycleWorker(interactionCallbackTimeout)
+	if !ok {
+		return
+	}
+	defer done()
 	switch i.Type {
 	case discordgo.InteractionApplicationCommand:
-		h.onAppCommand(s, i)
+		h.onAppCommandContext(ctx, s, i)
 	case discordgo.InteractionMessageComponent:
-		h.onComponent(s, i)
+		h.onComponentContext(ctx, s, i)
 	case discordgo.InteractionModalSubmit:
-		h.onModal(s, i)
+		h.onModalContext(ctx, s, i)
 	}
 }
 
 func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	h.onComponentContext(context.Background(), s, i)
+}
+
+func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) {
 	data := i.MessageComponentData()
 	userID := interactionUserID(i)
 	lang := h.cachedUserLang(userID)
@@ -163,7 +173,7 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 			Type: discordgo.InteractionResponseModal,
 			Data: PasswordLoginModal(lang),
 		}); err != nil {
-			log.Printf("interaction: password modal: %v", err)
+			log.Printf("interaction: password modal: %s", discordRESTErrorLog(err))
 		}
 		return
 	}
@@ -174,32 +184,47 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 			h.clearMFAHint(mfaState)
 			if errors.Is(err, authweb.ErrMFAOwner) {
 				if rerr := respondEphemeral(s, i, mfaTerminalMessage(lang, err)); rerr != nil {
-					log.Printf("interaction: mfa validation response: %v", rerr)
+					log.Printf("interaction: mfa validation response: %s", discordRESTErrorLog(rerr))
 				}
-			} else if rerr := updateComponentMessage(s, i, Response{
+				return
+			}
+			if rerr := deferComponentUpdate(s, i); rerr != nil {
+				log.Printf("interaction: defer stale mfa component: %s", discordRESTErrorLog(rerr))
+				return
+			}
+			lang = h.userLang(userID)
+			guard := h.mfaSubmissionGuard(mfaState)
+			guard.Lock()
+			defer guard.Unlock()
+			if guard.terminal {
+				return
+			}
+			if rerr := editInteraction(s, i, Response{
 				Content:    mfaTerminalMessage(lang, err),
 				Embeds:     []*discordgo.MessageEmbed{},
 				Components: []discordgo.MessageComponent{},
 			}); rerr != nil {
-				log.Printf("interaction: stale mfa component update: %v", rerr)
+				log.Printf("interaction: stale mfa component edit: %s", discordRESTErrorLog(rerr))
+				return
 			}
+			guard.terminal = true
 			return
 		}
 		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseModal,
 			Data: MFALoginModal(mfaState, hint, lang),
 		}); err != nil {
-			log.Printf("interaction: mfa modal: %v", err)
+			log.Printf("interaction: mfa modal: %s", discordRESTErrorLog(err))
 		}
 		return
 	}
 	if data.CustomID == customIDAuthQR {
 		if err := deferComponentUpdate(s, i); err != nil {
-			log.Printf("interaction: defer qr component: %v", err)
+			log.Printf("interaction: defer qr component: %s", discordRESTErrorLog(err))
 			return
 		}
 		lang = h.userLang(userID)
-		resp, qrState, err := h.HandleAuthQR(context.Background(), userID, lang)
+		resp, qrState, err := h.HandleAuthQR(ctx, userID, lang)
 		if err != nil {
 			log.Printf("interaction: qr component error: %v", err)
 			if rerr := editInteraction(s, i, Response{
@@ -207,12 +232,12 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 				Embeds:     []*discordgo.MessageEmbed{},
 				Components: []discordgo.MessageComponent{},
 			}); rerr != nil {
-				log.Printf("interaction: qr component error edit failed: %v", rerr)
+				log.Printf("interaction: qr component error edit failed: %s", discordRESTErrorLog(rerr))
 			}
 			return
 		}
 		if rerr := editInteractionWithFiles(s, i, resp); rerr != nil {
-			log.Printf("interaction: qr component edit failed: %v", rerr)
+			log.Printf("interaction: qr component edit failed: %s", discordRESTErrorLog(rerr))
 		}
 		if qrState != "" {
 			h.startQRLoginWatcher(s, i, qrState, lang)
@@ -221,14 +246,14 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 	}
 	if strings.HasPrefix(data.CustomID, customIDAuthCaptchaPref) {
 		if err := deferComponentUpdate(s, i); err != nil {
-			log.Printf("interaction: defer captcha component: %v", err)
+			log.Printf("interaction: defer captcha component: %s", discordRESTErrorLog(err))
 			return
 		}
 		lang = h.userLang(userID)
 		state := strings.TrimPrefix(data.CustomID, customIDAuthCaptchaPref)
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		captchaCtx, cancel := context.WithTimeout(ctx, interactionCallbackTimeout)
 		defer cancel()
-		resp, launched, err := h.handlePasswordCaptchaLaunch(ctx, state, userID, lang)
+		resp, launched, err := h.handlePasswordCaptchaLaunch(captchaCtx, state, userID, lang)
 		if err != nil {
 			log.Printf("interaction: captcha component error: %v", err)
 			resp = Response{
@@ -238,11 +263,15 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 			}
 		}
 		terminal := resp.Components != nil && len(resp.Components) == 0
-		if rerr := h.editCaptchaInteraction(s, i, state, resp, terminal); rerr != nil {
-			log.Printf("interaction: captcha component edit failed: %v", rerr)
-		}
-		if launched {
-			h.startPasswordCaptchaWatcher(s, i, state, lang)
+		if rerr := h.editCaptchaInteractionThen(s, i, state, resp, terminal, func() {
+			if launched {
+				h.startPasswordCaptchaWatcher(s, i, state, lang)
+			}
+		}); rerr != nil {
+			log.Printf("interaction: captcha component edit failed: %s", discordRESTErrorLog(rerr))
+			if launched {
+				h.cancelPasswordLogin(state, userID)
+			}
 		}
 		return
 	}
@@ -262,7 +291,7 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 		if owner != userID {
 			resp, _ := h.HandleShopNav(owner, 0, userID, lang)
 			if rerr := respondEphemeralEmbed(s, i, resp); rerr != nil {
-				log.Printf("interaction: shop owner response: %v", rerr)
+				log.Printf("interaction: shop owner response: %s", discordRESTErrorLog(rerr))
 			}
 			return
 		}
@@ -300,8 +329,18 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 		log.Printf("interaction: ignoring component %q", data.CustomID)
 		return
 	}
-	if err := deferComponentUpdate(s, i); err != nil {
-		log.Printf("interaction: defer component: %v", err)
+	deferErr := error(nil)
+	if strings.HasPrefix(data.CustomID, customIDChannelTimePrefix) {
+		// The channel settings menu is public, so preserve its source and send
+		// the clicker a separate ephemeral result after the database write.
+		deferErr = deferInteraction(s, i, true)
+	} else {
+		// Shop navigation is public and wishlist menus are already ephemeral;
+		// both should update their originating message.
+		deferErr = deferComponentUpdate(s, i)
+	}
+	if deferErr != nil {
+		log.Printf("interaction: defer component: %s", discordRESTErrorLog(deferErr))
 		return
 	}
 	lang = h.userLang(userID)
@@ -369,19 +408,19 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 		})
 		return
 	}
-	if resp.Ephemeral {
-		log.Printf("interaction: unexpected ephemeral response after component defer")
-		return
-	}
 	if !keepComponents {
 		resp.Components = []discordgo.MessageComponent{}
 	}
 	if rerr := editInteraction(s, i, resp); rerr != nil {
-		log.Printf("interaction: component update failed: %v", rerr)
+		log.Printf("interaction: component update failed: %s", discordRESTErrorLog(rerr))
 	}
 }
 
 func (h *Handlers) onModal(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	h.onModalContext(context.Background(), s, i)
+}
+
+func (h *Handlers) onModalContext(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) {
 	data := i.ModalSubmitData()
 	userID := interactionUserID(i)
 	log.Printf("interaction: modal %s user=%s", interactionLogCustomID(data.CustomID), userID)
@@ -389,13 +428,13 @@ func (h *Handlers) onModal(s *discordgo.Session, i *discordgo.InteractionCreate)
 	switch {
 	case data.CustomID == customIDAuthPWModal:
 		if err := deferInteraction(s, i, true); err != nil {
-			log.Printf("interaction: defer password modal: %v", err)
+			log.Printf("interaction: defer password modal: %s", discordRESTErrorLog(err))
 			return
 		}
 		lang := h.userLang(userID)
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		authCtx, cancel := context.WithTimeout(ctx, interactionCallbackTimeout)
 		defer cancel()
-		resp, _, err := h.HandlePasswordLogin(ctx, userID, modalValue(data, "username"), modalValue(data, "password"), lang)
+		resp, passwordState, err := h.HandlePasswordLogin(authCtx, userID, modalValue(data, "username"), modalValue(data, "password"), lang)
 		if err != nil {
 			resp = Response{
 				Content:    i18n.T(lang, "error.prefix") + err.Error(),
@@ -404,7 +443,10 @@ func (h *Handlers) onModal(s *discordgo.Session, i *discordgo.InteractionCreate)
 			}
 		}
 		if rerr := editInteraction(s, i, resp); rerr != nil {
-			log.Printf("interaction: password captcha edit: %v", rerr)
+			log.Printf("interaction: password captcha edit: %s", discordRESTErrorLog(rerr))
+			if passwordState != "" {
+				h.cancelPasswordLogin(passwordState, userID)
+			}
 		}
 	case strings.HasPrefix(data.CustomID, customIDAuthMFAPref):
 		mfaState := strings.TrimPrefix(data.CustomID, customIDAuthMFAPref)
@@ -413,38 +455,46 @@ func (h *Handlers) onModal(s *discordgo.Session, i *discordgo.InteractionCreate)
 			h.clearMFAHint(mfaState)
 			if errors.Is(err, authweb.ErrMFAOwner) {
 				if rerr := respondEphemeral(s, i, mfaTerminalMessage(lang, err)); rerr != nil {
-					log.Printf("interaction: mfa submit validation response: %v", rerr)
+					log.Printf("interaction: mfa submit validation response: %s", discordRESTErrorLog(rerr))
 				}
 				return
 			}
 			if rerr := deferComponentUpdate(s, i); rerr != nil {
-				log.Printf("interaction: defer stale mfa modal: %v", rerr)
+				log.Printf("interaction: defer stale mfa modal: %s", discordRESTErrorLog(rerr))
 				return
 			}
 			lang = h.userLang(userID)
+			guard := h.mfaSubmissionGuard(mfaState)
+			guard.Lock()
+			defer guard.Unlock()
+			if guard.terminal {
+				return
+			}
 			if rerr := editInteraction(s, i, Response{
 				Content:    mfaTerminalMessage(lang, err),
 				Embeds:     []*discordgo.MessageEmbed{},
 				Components: []discordgo.MessageComponent{},
 			}); rerr != nil {
-				log.Printf("interaction: stale mfa modal edit: %v", rerr)
+				log.Printf("interaction: stale mfa modal edit: %s", discordRESTErrorLog(rerr))
+				return
 			}
+			guard.terminal = true
 			return
 		}
 		guard := h.mfaSubmissionGuard(mfaState)
 		if err := deferComponentUpdate(s, i); err != nil {
-			log.Printf("interaction: defer mfa modal: %v", err)
+			log.Printf("interaction: defer mfa modal: %s", discordRESTErrorLog(err))
 			return
 		}
 		lang := h.userLang(userID)
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		authCtx, cancel := context.WithTimeout(ctx, interactionCallbackTimeout)
 		defer cancel()
 		guard.Lock()
 		defer guard.Unlock()
 		if guard.terminal {
 			return
 		}
-		resp, err := h.HandlePasswordMFA(ctx, mfaState, userID, modalValue(data, "code"), lang)
+		resp, err := h.HandlePasswordMFA(authCtx, mfaState, userID, modalValue(data, "code"), lang)
 		if err != nil {
 			resp = Response{
 				Content:    i18n.T(lang, "error.prefix") + err.Error(),
@@ -453,7 +503,7 @@ func (h *Handlers) onModal(s *discordgo.Session, i *discordgo.InteractionCreate)
 			}
 		}
 		if rerr := editInteraction(s, i, resp); rerr != nil {
-			log.Printf("interaction: mfa result edit: %v", rerr)
+			log.Printf("interaction: mfa result edit: %s", discordRESTErrorLog(rerr))
 			return
 		}
 		if len(resp.Components) == 0 {
@@ -629,6 +679,10 @@ func derefEmbeds(p *[]*discordgo.MessageEmbed) []*discordgo.MessageEmbed {
 }
 
 func (h *Handlers) onAppCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	h.onAppCommandContext(context.Background(), s, i)
+}
+
+func (h *Handlers) onAppCommandContext(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) {
 	data := i.ApplicationCommandData()
 	userID := interactionUserID(i)
 	log.Printf("interaction: /%s user=%s guild=%s", data.Name, userID, i.GuildID)
@@ -636,7 +690,7 @@ func (h *Handlers) onAppCommand(s *discordgo.Session, i *discordgo.InteractionCr
 	// ACK within Discord's 3s window before any DB/network work.
 	ephemeral := commandEphemeral(data.Name)
 	if err := deferInteraction(s, i, ephemeral); err != nil {
-		log.Printf("interaction: defer /%s failed: %v", data.Name, err)
+		log.Printf("interaction: defer /%s failed: %s", data.Name, discordRESTErrorLog(err))
 		return
 	}
 
@@ -646,8 +700,6 @@ func (h *Handlers) onAppCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		resp Response
 		err  error
 	)
-	ctx := context.Background()
-
 	switch data.Name {
 	case "auth":
 		resp, err = h.HandleAuth(ctx, userID, lang)
@@ -694,15 +746,19 @@ func (h *Handlers) onAppCommand(s *discordgo.Session, i *discordgo.InteractionCr
 		if rerr := editInteraction(s, i, Response{
 			Content: i18n.T(lang, "error.prefix") + err.Error(),
 		}); rerr != nil {
-			log.Printf("interaction: edit error: %v", rerr)
+			log.Printf("interaction: edit error: %s", discordRESTErrorLog(rerr))
 		}
 		return
 	}
 	resp.Ephemeral = ephemeral
 	if rerr := editInteraction(s, i, resp); rerr != nil {
-		log.Printf("interaction: edit /%s failed: %v", data.Name, rerr)
+		log.Printf("interaction: edit /%s failed: %s", data.Name, discordRESTErrorLog(rerr))
 	}
 }
+
+// interactionCallbackTimeout bounds synchronous Discord callback work while
+// allowing Shutdown to cancel and join it before dependencies are closed.
+const interactionCallbackTimeout = 45 * time.Second
 
 // qrLoginTimeout bounds how long the bot waits for a Riot Mobile approval.
 const qrLoginTimeout = 3 * time.Minute
@@ -733,7 +789,7 @@ func (h *Handlers) watchQRLogin(ctx context.Context, s *discordgo.Session, i *di
 		log.Printf("interaction: qr login state=%s: %v", continuationLogValue(state), err)
 	}
 	if rerr := editInteraction(s, i, h.HandleAuthComplete(display, err, lang)); rerr != nil {
-		log.Printf("interaction: qr login edit failed: %v", rerr)
+		log.Printf("interaction: qr login edit failed: %s", discordRESTErrorLog(rerr))
 	}
 }
 
@@ -775,11 +831,18 @@ func (h *Handlers) watchPasswordCaptcha(ctx context.Context, s *discordgo.Sessio
 	}
 	resp := h.HandlePasswordCaptchaComplete(display, mfaState, mfaHint, err, lang)
 	if rerr := h.editCaptchaInteraction(s, i, state, resp, true); rerr != nil {
-		log.Printf("interaction: password captcha edit failed: %v", rerr)
+		log.Printf("interaction: password captcha edit failed: %s", discordRESTErrorLog(rerr))
 	}
 }
 
 func (h *Handlers) editCaptchaInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, state string, resp Response, terminal bool) error {
+	return h.editCaptchaInteractionThen(s, i, state, resp, terminal, nil)
+}
+
+// editCaptchaInteractionThen serializes a CAPTCHA edit and its dependent
+// action under the same per-state guard. This prevents a terminal completion
+// from landing between a reopen status edit and watcher enrollment.
+func (h *Handlers) editCaptchaInteractionThen(s *discordgo.Session, i *discordgo.InteractionCreate, state string, resp Response, terminal bool, afterApplied func()) error {
 	guard := h.captchaEditGuard(state)
 	guard.Lock()
 	defer guard.Unlock()
@@ -792,10 +855,47 @@ func (h *Handlers) editCaptchaInteraction(s *discordgo.Session, i *discordgo.Int
 	if terminal {
 		guard.terminal = true
 	}
+	if afterApplied != nil {
+		afterApplied()
+	}
 	return nil
 }
 
 func continuationLogValue(string) string { return "<redacted>" }
+
+func discordRESTErrorLog(err error) string {
+	if err == nil {
+		return "discord REST error type=<nil>"
+	}
+
+	var rateLimitErr *discordgo.RateLimitError
+	if errors.As(err, &rateLimitErr) {
+		result := "discord REST error type=*discordgo.RateLimitError status=429"
+		if rateLimitErr != nil && rateLimitErr.RateLimit != nil && rateLimitErr.TooManyRequests != nil {
+			result += fmt.Sprintf(" retry_after=%s", rateLimitErr.RetryAfter)
+		}
+		return result
+	}
+
+	var restErr *discordgo.RESTError
+	if errors.As(err, &restErr) {
+		result := "discord REST error type=*discordgo.RESTError"
+		if restErr != nil && restErr.Response != nil {
+			result += fmt.Sprintf(" status=%d", restErr.Response.StatusCode)
+		}
+		if restErr != nil && restErr.Message != nil {
+			result += fmt.Sprintf(" code=%d", restErr.Message.Code)
+		}
+		return result
+	}
+
+	var transportErr *url.Error
+	if errors.As(err, &transportErr) {
+		return "discord REST error type=*url.Error"
+	}
+
+	return fmt.Sprintf("discord REST error type=%T", err)
+}
 
 func commandEphemeral(name string) bool {
 	switch name {

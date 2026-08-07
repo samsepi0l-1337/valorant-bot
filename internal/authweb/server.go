@@ -117,6 +117,7 @@ type captchaBrowserCloseFailure struct {
 	controller      captchaBrowserController
 	err             error
 	possiblyRunning bool
+	reaperAttempts  int
 }
 
 type serverMutex struct {
@@ -173,6 +174,10 @@ type Server struct {
 	launchCaptchaBrowser     func(string) (captchaBrowserController, error)
 	// Test-only synchronization seam for the cancellation claim critical section.
 	beforePasswordWaitCancellationClaim func()
+	// Test-only synchronization seam for the retained-browser reaper exit handoff.
+	beforeCaptchaReaperIdleExit func()
+	// Test-only synchronization seam after the final bounded reaper round.
+	beforeCaptchaReaperMaxExit func()
 }
 
 // New builds an auth web Server.
@@ -397,6 +402,11 @@ func (s *Server) CompletePasswordMFA(ctx context.Context, mfaState, discordUserI
 	if s.passwordAuth == nil {
 		return "", fmt.Errorf("password auth not configured")
 	}
+	opCtx, lifecycleDone, err := s.beginLifecycleOperation(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer lifecycleDone()
 	mfaState = strings.TrimSpace(mfaState)
 	discordUserID = strings.TrimSpace(discordUserID)
 	pending, done, ok := s.beginMFAOperation(mfaState)
@@ -423,7 +433,7 @@ func (s *Server) CompletePasswordMFA(ctx context.Context, mfaState, discordUserI
 	if pending.discordUserID != discordUserID {
 		return "", ErrMFAOwner
 	}
-	requestCtx, requestCancel := context.WithCancel(ctx)
+	requestCtx, requestCancel := context.WithCancel(opCtx)
 	stop := context.AfterFunc(pending.flow.ctx, requestCancel)
 	tokens, err := s.passwordAuth.SubmitMFA(requestCtx, pending.challenge, code)
 	stop()
@@ -455,7 +465,11 @@ func (s *Server) CompletePasswordMFA(ctx context.Context, mfaState, discordUserI
 		return "", ErrMFAExpired
 	}
 	pending.flow.cancel()
-	return s.completePasswordTokens(ctx, pending.discordUserID, tokens)
+	displayName, err = s.completePasswordTokens(opCtx, pending.discordUserID, tokens)
+	if err != nil && s.isClosed() {
+		return "", ErrServerClosed
+	}
+	return displayName, err
 }
 
 func (s *Server) consumeMFAState(mfaState string, flow *mfaFlow) bool {

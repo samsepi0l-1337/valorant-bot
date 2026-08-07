@@ -280,15 +280,23 @@ func (c *QRClient) do(ctx context.Context, method, rawURL string, body any, sess
 	}
 
 	client := c.HTTPClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
+	resp, err := riotNoRedirectClient(client).Do(req)
 	if err != nil {
 		return nil, err
 	}
 	mergeSetCookies(sess.cookies, resp)
 	return resp, nil
+}
+
+func riotNoRedirectClient(client *http.Client) *http.Client {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	clone := *client
+	clone.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &clone
 }
 
 func mergeSetCookies(dst map[string]string, resp *http.Response) {

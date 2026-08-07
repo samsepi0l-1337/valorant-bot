@@ -29,6 +29,7 @@ var (
 type mfaSchemaRejectedError struct{}
 
 const mfaNonConsumingSchemaRejection = "multifactor request schema rejected before otp processing"
+const maxPasswordResponseBody = 1 << 20
 
 func (*mfaSchemaRejectedError) Error() string {
 	return "riot rejected the MFA payload schema"
@@ -181,7 +182,10 @@ func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password st
 		return CaptchaChallenge{}, fmt.Errorf("captcha begin: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := readPasswordResponse(resp.Body)
+	if err != nil {
+		return CaptchaChallenge{}, fmt.Errorf("captcha begin response: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return CaptchaChallenge{}, fmt.Errorf("captcha begin: %s", resp.Status)
 	}
@@ -281,7 +285,10 @@ func (c *PasswordClient) CompleteCaptcha(ctx context.Context, sessionID, captcha
 		return PasswordTokens{}, nil, fmt.Errorf("captcha complete: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := readPasswordResponse(resp.Body)
+	if err != nil {
+		return PasswordTokens{}, nil, fmt.Errorf("captcha complete response: %w", err)
+	}
 	setCookies := resp.Cookies()
 	browserCookies = mergeCaptchaBrowserCookies(browserCookies, setCookies)
 	browserCookieSync := captchaBrowserCookieSync(browserCookies, setCookies, browser.Cookies, cookies, false)
@@ -293,14 +300,23 @@ func (c *PasswordClient) CompleteCaptcha(ctx context.Context, sessionID, captcha
 		return PasswordTokens{}, nil, ErrPasswordRateLimit
 	}
 
-	tokens, mfa, perr := c.parseAuthenticateLogin(ctx, raw, cookies, true, sdkSID, userAgent)
-	if perr == nil {
-		c.deleteSession(sessionID)
-		return tokens, mfa, nil
-	}
-
 	reason := authenticateErrorReason(raw)
 	siteKey, rqData, hasChallenge := extractHCaptcha(raw)
+	var perr error
+	if resp.StatusCode == http.StatusOK {
+		var tokens PasswordTokens
+		var mfa *MFAChallenge
+		tokens, mfa, perr = c.parseAuthenticateLogin(ctx, raw, cookies, true, sdkSID, userAgent)
+		if perr == nil {
+			c.deleteSession(sessionID)
+			return tokens, mfa, nil
+		}
+	} else {
+		// A proxy or upstream error body may resemble a valid MFA/success
+		// continuation. Classify only explicit semantic errors on non-OK
+		// responses; never parse or exchange login tokens from them.
+		perr = passwordAuthenticateStatusError(resp.Status, reason)
+	}
 
 	cookieNames := make([]string, 0, len(cookies))
 	for name := range cookies {
@@ -423,17 +439,23 @@ func (c *PasswordClient) putAuthenticate(ctx context.Context, cookies map[string
 		return PasswordTokens{}, nil, fmt.Errorf("authenticate put: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := readPasswordResponse(resp.Body)
+	if err != nil {
+		return PasswordTokens{}, nil, fmt.Errorf("authenticate put response: %w", err)
+	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return PasswordTokens{}, nil, ErrPasswordRateLimit
 	}
 	if isMFASchemaRejection(resp.StatusCode, body, raw) {
 		return PasswordTokens{}, nil, &mfaSchemaRejectedError{}
 	}
-	tokens, mfa, perr := c.parseAuthenticateLogin(ctx, raw, cookies, true, sdkSID, userAgent)
-	if perr != nil && resp.StatusCode != http.StatusOK {
-		return PasswordTokens{}, nil, perr
+	// Outside the exact non-consuming schema rejection above, a non-OK status
+	// is ambiguous: Riot may already have consumed the OTP. Never interpret a
+	// proxy/server error body as MFA retry, success, or a login token.
+	if resp.StatusCode != http.StatusOK {
+		return PasswordTokens{}, nil, fmt.Errorf("authenticate put: %s", resp.Status)
 	}
+	tokens, mfa, perr := c.parseAuthenticateLogin(ctx, raw, cookies, true, sdkSID, userAgent)
 	return tokens, mfa, perr
 }
 
@@ -503,7 +525,10 @@ func (c *PasswordClient) putAuth(ctx context.Context, cookies map[string]string,
 		return PasswordTokens{}, nil, fmt.Errorf("auth put: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := readPasswordResponse(resp.Body)
+	if err != nil {
+		return PasswordTokens{}, nil, fmt.Errorf("auth put response: %w", err)
+	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return PasswordTokens{}, nil, ErrPasswordRateLimit
 	}
@@ -596,6 +621,33 @@ func isMFASchemaRejection(status int, body map[string]any, raw []byte) bool {
 		strings.EqualFold(strings.TrimSpace(response.ErrorDescription), mfaNonConsumingSchemaRejection)
 }
 
+func passwordAuthenticateStatusError(status, reason string) error {
+	switch reason {
+	case "auth_failure", "invalid_credentials":
+		return ErrPasswordInvalid
+	case "rate_limited":
+		return ErrPasswordRateLimit
+	case "invalid_request":
+		return ErrPasswordCaptcha
+	default:
+		if isCaptchaError(reason) {
+			return ErrPasswordCaptcha
+		}
+		return fmt.Errorf("captcha complete: %s", status)
+	}
+}
+
+func readPasswordResponse(body io.Reader) ([]byte, error) {
+	raw, err := io.ReadAll(io.LimitReader(body, maxPasswordResponseBody+1))
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	if len(raw) > maxPasswordResponseBody {
+		return nil, errors.New("response body exceeds limit")
+	}
+	return raw, nil
+}
+
 func (c *PasswordClient) exchangeLoginToken(ctx context.Context, loginToken string) (PasswordTokens, error) {
 	qr := &QRClient{
 		HTTPClient:  c.HTTPClient,
@@ -640,11 +692,10 @@ func (c *PasswordClient) doJSON(ctx context.Context, method, rawURL string, body
 	if h := cookieHeader(cookies); h != "" {
 		req.Header.Set("Cookie", h)
 	}
-	client := c.HTTPClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
+	// Automatic 307/308 handling replays bytes.Reader request bodies. That
+	// could resubmit an OTP or forward credentials to another host, so sensitive
+	// Riot requests always surface redirects to the caller as terminal statuses.
+	resp, err := riotNoRedirectClient(c.HTTPClient).Do(req)
 	if err != nil {
 		return nil, err
 	}

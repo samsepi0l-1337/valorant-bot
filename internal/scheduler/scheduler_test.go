@@ -3,12 +3,26 @@ package scheduler
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/dosfsociety/valorant-bot/internal/bot"
 	"github.com/dosfsociety/valorant-bot/internal/store"
+	"github.com/robfig/cron/v3"
 )
+
+type immediateOnceSchedule struct {
+	calls atomic.Int32
+}
+
+func (s *immediateOnceSchedule) Next(now time.Time) time.Time {
+	if s.calls.Add(1) == 1 {
+		return now.Add(time.Millisecond)
+	}
+	return now.Add(time.Hour)
+}
 
 type fakeGuilds struct {
 	settings []store.GuildSettings
@@ -153,8 +167,8 @@ func TestRunOnce_SkipsGuildsWithEmptyChannel(t *testing.T) {
 func TestRunOnce_WishlistMatchSendsDM(t *testing.T) {
 	dms := &fakeDMs{}
 	s := &Scheduler{
-		Guilds:    &fakeGuilds{},
-		Accounts:  &fakeAccounts{accounts: []store.Account{{DiscordUserID: "user-a", PUUID: "p1"}}},
+		Guilds:   &fakeGuilds{},
+		Accounts: &fakeAccounts{accounts: []store.Account{{DiscordUserID: "user-a", PUUID: "p1"}}},
 		Wishlists: &fakeWishlists{items: []store.WishlistItem{
 			{DiscordUserID: "user-a", SkinUUID: "skin-hit", SkinName: "Reaver Vandal"},
 		}},
@@ -187,8 +201,8 @@ func TestRunOnce_WishlistMatchSendsDM(t *testing.T) {
 func TestRunOnce_NoWishlistMatchMeansNoDM(t *testing.T) {
 	dms := &fakeDMs{}
 	s := &Scheduler{
-		Guilds:    &fakeGuilds{},
-		Accounts:  &fakeAccounts{accounts: []store.Account{{DiscordUserID: "user-a", PUUID: "p1"}}},
+		Guilds:   &fakeGuilds{},
+		Accounts: &fakeAccounts{accounts: []store.Account{{DiscordUserID: "user-a", PUUID: "p1"}}},
 		Wishlists: &fakeWishlists{items: []store.WishlistItem{
 			{DiscordUserID: "user-a", SkinUUID: "skin-miss", SkinName: "Prime"},
 		}},
@@ -273,5 +287,45 @@ func TestRunForHour_NoMatch(t *testing.T) {
 	}
 	if len(channels.posts) != 0 {
 		t.Fatalf("expected no posts, got %d", len(channels.posts))
+	}
+}
+
+func TestRunCronUntilCanceledWaitsForActiveJob(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	c := cron.New()
+	c.Schedule(&immediateOnceSchedule{}, cron.FuncJob(func() {
+		close(started)
+		<-release
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- runCronUntilCanceled(ctx, c) }()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("scheduled job did not start")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		close(release)
+		t.Fatalf("scheduler returned before active job completed: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-done:
+		if err != context.Canceled {
+			t.Fatalf("runCronUntilCanceled error = %v, want context canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduler did not return after active job completed")
 	}
 }

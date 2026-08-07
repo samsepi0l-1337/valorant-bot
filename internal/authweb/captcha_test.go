@@ -1018,6 +1018,48 @@ func TestLaunchPasswordCaptchaValidatesOwner(t *testing.T) {
 	}
 }
 
+func TestCancelPasswordLoginIsOwnerBoundAndImmediatelyScrubsResources(t *testing.T) {
+	s := newCaptchaServer(&fakePasswordAuth{})
+	controller := newTestCaptchaBrowserController()
+	s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) {
+		return controller, nil
+	}
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "riot-user", "secret-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CancelPasswordLogin(state, "intruder-1"); !errors.Is(err, ErrCaptchaOwner) {
+		t.Fatalf("intruder cancel error=%v, want ErrCaptchaOwner", err)
+	}
+	s.mu.Lock()
+	stillPending := s.passwordPending[state]
+	s.mu.Unlock()
+	if stillPending.username == "" || stillPending.password == "" {
+		t.Fatal("wrong-owner cancellation scrubbed live credentials")
+	}
+
+	if err := s.CancelPasswordLogin(state, "owner-1"); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	_, pending := s.passwordPending[state]
+	_, outcome := s.passwordOutcomes[state]
+	_, ready := s.passwordReady[state]
+	s.mu.Unlock()
+	if pending || outcome || ready {
+		t.Fatalf("canceled password state remains: pending=%v outcome=%v ready=%v", pending, outcome, ready)
+	}
+	if got := controller.closeCalls.Load(); got != 1 {
+		t.Fatalf("canceled browser close calls=%d, want 1", got)
+	}
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCaptchaBrowserOwnerLaunchStoresOneController(t *testing.T) {
 	s := newCaptchaServer(&fakePasswordAuth{})
 	controller := newTestCaptchaBrowserController()
@@ -1229,6 +1271,90 @@ func TestLaunchPasswordCaptchaCloseFailureRetainsOwnedBrowser(t *testing.T) {
 	flow.launchMu.Unlock()
 	if owned != first {
 		t.Fatalf("retained controller=%T, want original controller", owned)
+	}
+}
+
+func TestLaunchPasswordCaptchaReopenClearsRetainedFailureBeforeReplacement(t *testing.T) {
+	s := newCaptchaServer(&fakePasswordAuth{})
+	t.Cleanup(func() { _ = s.Close() })
+	original := &retryCloseController{}
+	replacement := newTestCaptchaBrowserController()
+	s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) {
+		return replacement, nil
+	}
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	flow := s.passwordPending[state].flow
+	// Suppress the background reaper so the reopen ordering is deterministic.
+	s.captchaReaperRunning = true
+	s.mu.Unlock()
+	flow.launchMu.Lock()
+	flow.browser = original
+	flow.launchMu.Unlock()
+
+	if err := s.closeOwnedCaptchaBrowser(flow); err == nil {
+		t.Fatal("initial browser close unexpectedly succeeded")
+	}
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
+		t.Fatalf("reopen after transient close failure: %v", err)
+	}
+
+	s.mu.Lock()
+	failure, retained := s.captchaCloseFailures[flow]
+	s.mu.Unlock()
+	if retained {
+		t.Fatalf("successful retry left stale close failure for %T", failure.controller)
+	}
+	flow.launchMu.Lock()
+	owned := flow.browser
+	flow.launchMu.Unlock()
+	if owned != replacement {
+		t.Fatalf("owned controller=%T, want replacement", owned)
+	}
+	if got := replacement.closeCalls.Load(); got != 0 {
+		t.Fatalf("replacement close calls=%d, want 0", got)
+	}
+}
+
+func TestRetainedCaptchaBrowserReaperDoesNotCloseReplacementForStaleSnapshot(t *testing.T) {
+	s := newCaptchaServer(&fakePasswordAuth{})
+	flowCtx, cancel := context.WithCancel(context.Background())
+	flow := &passwordFlow{ctx: flowCtx, cancel: cancel}
+	original := &retryCloseController{}
+	replacement := newTestCaptchaBrowserController()
+	flow.browser = replacement
+	s.mu.Lock()
+	s.captchaCloseFailures[flow] = captchaBrowserCloseFailure{
+		controller:      original,
+		err:             errors.New("transient original-browser close failure"),
+		possiblyRunning: true,
+	}
+	s.captchaReaperRunning = true
+	s.lifecycleWG.Add(1)
+	s.mu.Unlock()
+	t.Cleanup(func() {
+		cancel()
+		s.mu.Lock()
+		delete(s.captchaCloseFailures, flow)
+		s.mu.Unlock()
+		_ = s.Close()
+	})
+
+	// This models a retry snapshot for original resuming after another path
+	// has already installed replacement on the same flow.
+	s.reapRetainedCaptchaBrowsers()
+
+	if got := replacement.closeCalls.Load(); got != 0 {
+		t.Fatalf("stale original-browser retry closed replacement %d time(s)", got)
+	}
+	flow.launchMu.Lock()
+	owned := flow.browser
+	flow.launchMu.Unlock()
+	if owned != replacement {
+		t.Fatalf("owned controller=%T, want replacement", owned)
 	}
 }
 
@@ -2140,6 +2266,20 @@ func TestWaitPasswordLoginCancellationClearsCredentialsAndRiotSession(t *testing
 	}
 }
 
+func TestWaitPasswordLoginUnknownStateReturnsExpiredImmediately(t *testing.T) {
+	s := newCaptchaServer(&fakePasswordAuth{})
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, _, _, err := s.WaitPasswordLogin(ctx, "already-consumed-state")
+	if err == nil || !strings.Contains(err.Error(), "captcha session expired") {
+		t.Fatalf("unknown state error=%v, want captcha session expired", err)
+	}
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("unknown state waited %v instead of failing immediately", elapsed)
+	}
+}
+
 func TestWaitPasswordLoginOutcomeWinsConcurrentCancellationAndKeepsMFAUsable(t *testing.T) {
 	pw := &fakePasswordAuth{
 		tokens: riot.PasswordTokens{AccessToken: "at-1", IDToken: "id-1", SessionCookie: "ssid=s1"},
@@ -2367,10 +2507,12 @@ func TestWaitPasswordLoginCancellationDoesNotYieldToContendingMFAPublisher(t *te
 				mu.Lock()
 			}
 		default:
-			if entry >= 5 {
+			if entry >= 6 {
 				// A split-lock cancellation claimant enters here before trying to
 				// barge ahead of the queued publisher. Hold that relock until the
-				// real publisher has completed its publication attempt.
+				// real publisher has completed its publication attempt. Entry 3 is
+				// lifecycle enrollment, entry 4 is the waiter's initial outcome
+				// probe, and entry 5 is the real cancellation claim.
 				select {
 				case <-publisherDone:
 				case <-time.After(2 * time.Second):

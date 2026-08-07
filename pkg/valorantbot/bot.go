@@ -37,6 +37,38 @@ type Bot struct {
 	cfg Config
 }
 
+type trackedScheduler struct {
+	done chan struct{}
+	err  error
+}
+
+func startTrackedScheduler(run func() error) *trackedScheduler {
+	task := &trackedScheduler{done: make(chan struct{})}
+	go func() {
+		task.err = run()
+		close(task.done)
+	}()
+	return task
+}
+
+func (t *trackedScheduler) wait(ctx context.Context) error {
+	select {
+	case <-t.done:
+		return t.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func closeRuntimeAfterScheduler(task *trackedScheduler, closeDependencies ...func()) {
+	if task != nil {
+		_ = task.wait(context.Background())
+	}
+	for _, closeDependency := range closeDependencies {
+		closeDependency()
+	}
+}
+
 // New constructs a Bot from Config.
 func New(cfg Config) (*Bot, error) {
 	if cfg.DiscordToken == "" {
@@ -152,7 +184,6 @@ func (b *Bot) Run(ctx context.Context) error {
 		Guilds:   st,
 		Lang:     st,
 	}
-	defer handlers.Shutdown(context.Background())
 	bot.RegisterHandlers(dg, handlers)
 
 	cmds := bot.Commands()
@@ -176,7 +207,18 @@ func (b *Bot) Run(ctx context.Context) error {
 	if err := dg.Open(); err != nil {
 		return fmt.Errorf("discord open: %w", err)
 	}
-	defer dg.Close()
+	// A scheduler that outlives the bounded shutdown still joins before the
+	// HTTP, interaction, auth, Discord, and store dependencies disappear.
+	var schedulerTask *trackedScheduler
+	defer func() {
+		closeRuntimeAfterScheduler(
+			schedulerTask,
+			func() { _ = httpSrv.Close() },
+			func() { _ = handlers.Shutdown(context.Background()) },
+			func() { _ = authServer.Close() },
+			func() { _ = dg.Close() },
+		)
+	}()
 
 	// Clear global commands so they don't duplicate guild-scoped ones.
 	if _, err := dg.ApplicationCommandBulkOverwrite(appID, "", []*discordgo.ApplicationCommand{}); err != nil {
@@ -199,11 +241,16 @@ func (b *Bot) Run(ctx context.Context) error {
 		Channels:  poster,
 		DMs:       poster,
 	}
-	go func() {
-		if err := sched.Start(ctx, cronExpr); err != nil && !errors.Is(err, context.Canceled) {
+	schedulerTask = startTrackedScheduler(func() error {
+		err := sched.Start(ctx, cronExpr)
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		if err != nil {
 			log.Printf("scheduler: %v", err)
 		}
-	}()
+		return err
+	})
 
 	log.Printf("valorant-bot running (auth %s, discord connected, daily schedule Asia/Seoul hourly)", addr)
 	log.Print(formatInviteLog(appID, b.cfg.AuthBaseURL))
@@ -212,8 +259,13 @@ func (b *Bot) Run(ctx context.Context) error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	httpErr := httpSrv.Shutdown(shutdownCtx)
-	authErr := authServer.Shutdown(shutdownCtx)
-	watcherErr := handlers.Shutdown(shutdownCtx)
-	return errors.Join(httpErr, watcherErr, authErr)
+	httpDone := make(chan error, 1)
+	authDone := make(chan error, 1)
+	handlerDone := make(chan error, 1)
+	schedulerDone := make(chan error, 1)
+	go func() { httpDone <- httpSrv.Shutdown(shutdownCtx) }()
+	go func() { authDone <- authServer.Shutdown(shutdownCtx) }()
+	go func() { handlerDone <- handlers.Shutdown(shutdownCtx) }()
+	go func() { schedulerDone <- schedulerTask.wait(shutdownCtx) }()
+	return errors.Join(<-httpDone, <-handlerDone, <-authDone, <-schedulerDone)
 }

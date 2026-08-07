@@ -27,6 +27,7 @@ const (
 	chromeStartupProbeTimeout = 250 * time.Millisecond
 	devToolsCloseTimeout      = 750 * time.Millisecond
 	chromeExitTimeout         = 2 * time.Second
+	captchaReaperMaxAttempts  = 5
 )
 
 type captchaBrowserController interface {
@@ -36,6 +37,11 @@ type captchaBrowserController interface {
 type captchaBrowserCloseError struct {
 	ProcessExited bool
 	Err           error
+}
+
+type captchaBrowserCloseAttempt struct {
+	flow       *passwordFlow
+	controller captchaBrowserController
 }
 
 func (e *captchaBrowserCloseError) Error() string {
@@ -70,7 +76,7 @@ func launchSystemChrome(widgetURL string) (captchaBrowserController, error) {
 	bin := findChromeBinary()
 	if bin == "" {
 		launchErr := fmt.Errorf("Chrome/Chromium not found — install Google Chrome on the bot machine, or use Riot Mobile QR")
-		return nil, errors.Join(launchErr, removeCaptchaChromeProfile(profileRoot, profileDir))
+		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, launchErr)
 	}
 	cmd := chromeCommand(bin, flags)
 	return startChromeLogged(cmd, profileRoot, profileDir)
@@ -80,27 +86,33 @@ func launchMacChrome(chromeArgs []string, profileRoot, profileDir string) (captc
 	bin := findChromeBinary()
 	if bin == "" {
 		launchErr := fmt.Errorf("Chrome/Chromium not found — install Google Chrome on the bot machine, or use Riot Mobile QR")
-		return nil, errors.Join(launchErr, removeCaptchaChromeProfile(profileRoot, profileDir))
+		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, launchErr)
 	}
 	return startChromeLogged(chromeCommand(bin, chromeArgs), profileRoot, profileDir)
 }
 
 func startChromeLogged(cmd *exec.Cmd, profileRoot, profileDir string) (captchaBrowserController, error) {
+	return startChromeLoggedWithRemove(cmd, profileRoot, profileDir, removeCaptchaChromeProfile)
+}
+
+func startChromeLoggedWithRemove(cmd *exec.Cmd, profileRoot, profileDir string, removeProfile func(string, string) error) (captchaBrowserController, error) {
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
 	configureCaptchaProcess(cmd)
-	if err := cmd.Start(); err != nil {
-		log.Printf("captcha chrome start failed: %v", err)
-		return nil, errors.Join(fmt.Errorf("start chrome: %w", err), removeCaptchaChromeProfile(profileRoot, profileDir))
-	}
-
 	controller := &chromeBrowserController{
 		cmd:           cmd,
 		profileRoot:   profileRoot,
 		profileDir:    profileDir,
 		exited:        make(chan struct{}),
 		closeDevTools: closeChromeViaDevTools,
+		removeProfile: removeProfile,
 	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("captcha chrome start failed: %v", err)
+		close(controller.exited)
+		return cleanupFailedChromeLaunch(controller, fmt.Errorf("start chrome: %w", err))
+	}
+
 	go func() {
 		controller.waitErr = cmd.Wait()
 		close(controller.exited)
@@ -110,15 +122,39 @@ func startChromeLogged(cmd *exec.Cmd, profileRoot, profileDir string) (captchaBr
 	defer timer.Stop()
 	select {
 	case <-controller.exited:
-		removeErr := removeCaptchaChromeProfile(profileRoot, profileDir)
+		var launchErr error
 		if controller.waitErr != nil {
 			log.Printf("captcha chrome start failed: %v", controller.waitErr)
-			return nil, errors.Join(fmt.Errorf("start chrome: %w", controller.waitErr), removeErr)
+			launchErr = fmt.Errorf("start chrome: %w", controller.waitErr)
+		} else {
+			launchErr = fmt.Errorf("start chrome: process exited before startup completed")
 		}
-		return nil, errors.Join(fmt.Errorf("start chrome: process exited before startup completed"), removeErr)
+		return cleanupFailedChromeLaunch(controller, launchErr)
 	case <-timer.C:
 		return controller, nil
 	}
+}
+
+func cleanupFailedChromeLaunch(controller *chromeBrowserController, launchErr error) (captchaBrowserController, error) {
+	removeErr := controller.removeOwnedProfile()
+	if removeErr == nil {
+		controller.closed = true
+		return nil, launchErr
+	}
+	closeErr := &captchaBrowserCloseError{ProcessExited: true, Err: removeErr}
+	return controller, errors.Join(launchErr, closeErr)
+}
+
+func cleanupUnstartedChromeLaunch(profileRoot, profileDir string, launchErr error) (captchaBrowserController, error) {
+	controller := &chromeBrowserController{
+		profileRoot:   profileRoot,
+		profileDir:    profileDir,
+		exited:        make(chan struct{}),
+		closeDevTools: closeChromeViaDevTools,
+		removeProfile: removeCaptchaChromeProfile,
+	}
+	close(controller.exited)
+	return cleanupFailedChromeLaunch(controller, launchErr)
 }
 
 func (c *chromeBrowserController) Close() error {
@@ -144,16 +180,17 @@ func (c *chromeBrowserController) close() error {
 		closeDevTools = closeChromeViaDevTools
 	}
 
+	ownedProcess := c.cmd != nil && c.cmd.Process != nil
+	processExited := !ownedProcess || waitForCaptchaProcessExit(c.exited, 0)
 	graceful := false
-	if profileErr == nil {
+	if profileErr == nil && ownedProcess && !processExited {
 		ctx, cancel := context.WithTimeout(context.Background(), devToolsCloseTimeout)
 		graceful = closeDevTools(ctx, c.profileDir) == nil
 		cancel()
 	}
 
-	ownedProcess := c.cmd != nil && c.cmd.Process != nil
 	var terminateErr error
-	if ownedProcess && !waitForCaptchaProcessExit(c.exited, 0) {
+	if ownedProcess && !processExited {
 		if !graceful || !waitForCaptchaProcessExit(c.exited, chromeExitTimeout) {
 			terminate := c.terminateProcess
 			if terminate == nil {
@@ -163,17 +200,13 @@ func (c *chromeBrowserController) close() error {
 		}
 	}
 
-	processExited := !ownedProcess || waitForCaptchaProcessExit(c.exited, 0)
+	processExited = !ownedProcess || waitForCaptchaProcessExit(c.exited, 0)
 	if ownedProcess && !processExited && terminateErr == nil {
 		terminateErr = fmt.Errorf("captcha Chrome process did not exit")
 	}
 	var removeErr error
 	if profileErr == nil && processExited {
-		removeProfile := c.removeProfile
-		if removeProfile == nil {
-			removeProfile = removeCaptchaChromeProfile
-		}
-		removeErr = removeProfile(c.profileRoot, c.profileDir)
+		removeErr = c.removeOwnedProfile()
 	}
 	closeErr := errors.Join(profileErr, terminateErr, removeErr)
 	if closeErr == nil {
@@ -183,6 +216,17 @@ func (c *chromeBrowserController) close() error {
 		ProcessExited: processExited,
 		Err:           closeErr,
 	}
+}
+
+func (c *chromeBrowserController) removeOwnedProfile() error {
+	if err := validateCaptchaChromeProfile(c.profileRoot, c.profileDir); err != nil {
+		return err
+	}
+	removeProfile := c.removeProfile
+	if removeProfile == nil {
+		removeProfile = removeCaptchaChromeProfile
+	}
+	return removeProfile(c.profileRoot, c.profileDir)
 }
 
 func waitForCaptchaProcessExit(exited <-chan struct{}, timeout time.Duration) bool {
@@ -593,9 +637,10 @@ func (s *Server) ensureCaptchaLaunched(state string) error {
 	launcher := s.launchCaptchaBrowser
 	s.mu.Unlock()
 
-	if old, closeErr := closeCaptchaBrowserLocked(flow); closeErr != nil {
+	old, closeErr := closeCaptchaBrowserLocked(flow)
+	s.recordCaptchaBrowserCloseResultLocked(flow, old, closeErr, false)
+	if closeErr != nil {
 		flow.launchMu.Unlock()
-		s.recordCaptchaBrowserCloseResult(flow, old, closeErr)
 		return fmt.Errorf("close existing captcha Chrome before reopen: %w", closeErr)
 	}
 	if flow.ctx.Err() != nil {
@@ -608,6 +653,12 @@ func (s *Server) ensureCaptchaLaunched(state string) error {
 	widgetURL := s.captchaWidgetURL(state)
 	controller, err := launcher(widgetURL)
 	if err != nil {
+		if controller != nil {
+			// A failed process may still own a profile whose cleanup failed. Keep
+			// the controller reachable so the bounded reaper and shutdown retry it.
+			flow.browser = controller
+			s.recordCaptchaBrowserCloseResultLocked(flow, controller, err, false)
+		}
 		flow.launchMu.Unlock()
 		return err
 	}
@@ -624,8 +675,8 @@ func (s *Server) ensureCaptchaLaunched(state string) error {
 	if !live {
 		flow.browser = controller
 		closedController, closeErr := closeCaptchaBrowserLocked(flow)
+		s.recordCaptchaBrowserCloseResultLocked(flow, closedController, closeErr, false)
 		flow.launchMu.Unlock()
-		s.recordCaptchaBrowserCloseResult(flow, closedController, closeErr)
 		expiredErr := fmt.Errorf("captcha session expired; run /auth again")
 		if closeErr != nil {
 			return errors.Join(expiredErr, fmt.Errorf("close late captcha Chrome: %w", closeErr))
@@ -659,12 +710,15 @@ func (s *Server) closeOwnedCaptchaBrowser(flow *passwordFlow) error {
 	}
 	flow.launchMu.Lock()
 	controller, err := closeCaptchaBrowserLocked(flow)
+	s.recordCaptchaBrowserCloseResultLocked(flow, controller, err, false)
 	flow.launchMu.Unlock()
-	s.recordCaptchaBrowserCloseResult(flow, controller, err)
 	return err
 }
 
-func (s *Server) recordCaptchaBrowserCloseResult(flow *passwordFlow, controller captchaBrowserController, closeErr error) {
+// recordCaptchaBrowserCloseResultLocked updates the retained-close record for
+// controller. The caller must hold flow.launchMu so replacing flow.browser and
+// publishing its close result are one atomic ownership transition.
+func (s *Server) recordCaptchaBrowserCloseResultLocked(flow *passwordFlow, controller captchaBrowserController, closeErr error, preserveReaperAttempts bool) {
 	if flow == nil || controller == nil {
 		return
 	}
@@ -672,15 +726,25 @@ func (s *Server) recordCaptchaBrowserCloseResult(flow *passwordFlow, controller 
 	if s.captchaCloseFailures == nil {
 		s.captchaCloseFailures = make(map[*passwordFlow]captchaBrowserCloseFailure)
 	}
-	_, alreadyRecorded := s.captchaCloseFailures[flow]
+	existing, alreadyRecorded := s.captchaCloseFailures[flow]
+	sameRecord := alreadyRecorded && existing.controller == controller
+	reaperAttempts := 0
+	if preserveReaperAttempts && sameRecord {
+		reaperAttempts = existing.reaperAttempts
+	}
 	startReaper := false
 	if closeErr == nil {
-		delete(s.captchaCloseFailures, flow)
-	} else {
+		// A delayed success must not erase a newer controller's failure.
+		if sameRecord {
+			delete(s.captchaCloseFailures, flow)
+		}
+	} else if flow.browser == controller {
+		// A delayed failure must not reclaim ownership after replacement.
 		s.captchaCloseFailures[flow] = captchaBrowserCloseFailure{
 			controller:      controller,
 			err:             closeErr,
 			possiblyRunning: captchaBrowserMayBeRunning(closeErr),
+			reaperAttempts:  reaperAttempts,
 		}
 		if !s.closed && !s.captchaReaperRunning {
 			s.captchaReaperRunning = true
@@ -692,20 +756,83 @@ func (s *Server) recordCaptchaBrowserCloseResult(flow *passwordFlow, controller 
 	if startReaper {
 		go s.reapRetainedCaptchaBrowsers()
 	}
-	if closeErr != nil && !alreadyRecorded {
+	if closeErr != nil && !sameRecord && flow.browser == controller {
 		log.Printf("captcha Chrome ownership retained after close failure: %v", closeErr)
 	}
 }
 
+func (s *Server) retainedCaptchaBrowserCloseAttempts() []captchaBrowserCloseAttempt {
+	s.mu.Lock()
+	attempts := make([]captchaBrowserCloseAttempt, 0, len(s.captchaCloseFailures))
+	for flow, failure := range s.captchaCloseFailures {
+		attempts = append(attempts, captchaBrowserCloseAttempt{
+			flow:       flow,
+			controller: failure.controller,
+		})
+	}
+	s.mu.Unlock()
+	return attempts
+}
+
+// claimCaptchaBrowserReaperCloseAttempts gives each retained controller a
+// bounded retry budget. A controller inserted during another controller's
+// final round keeps its own untouched budget for the successor handoff.
+func (s *Server) claimCaptchaBrowserReaperCloseAttempts() []captchaBrowserCloseAttempt {
+	s.mu.Lock()
+	attempts := make([]captchaBrowserCloseAttempt, 0, len(s.captchaCloseFailures))
+	for flow, failure := range s.captchaCloseFailures {
+		if failure.reaperAttempts >= captchaReaperMaxAttempts {
+			continue
+		}
+		failure.reaperAttempts++
+		s.captchaCloseFailures[flow] = failure
+		attempts = append(attempts, captchaBrowserCloseAttempt{
+			flow:       flow,
+			controller: failure.controller,
+		})
+	}
+	s.mu.Unlock()
+	return attempts
+}
+
+func (s *Server) hasRetryableCaptchaBrowserFailureLocked() bool {
+	for _, failure := range s.captchaCloseFailures {
+		if failure.reaperAttempts < captchaReaperMaxAttempts {
+			return true
+		}
+	}
+	return false
+}
+
+// closeRetainedCaptchaBrowser retries only the controller captured in attempt.
+// A stale retry is a no-op after another path has closed it or installed a
+// replacement. Server.mu is never held while the controller performs I/O.
+func (s *Server) closeRetainedCaptchaBrowser(attempt captchaBrowserCloseAttempt) error {
+	flow := attempt.flow
+	controller := attempt.controller
+	if flow == nil || controller == nil {
+		return nil
+	}
+	flow.launchMu.Lock()
+	s.mu.Lock()
+	failure, retained := s.captchaCloseFailures[flow]
+	current := flow.browser
+	matches := retained && failure.controller == controller && current == controller
+	s.mu.Unlock()
+	if !matches {
+		flow.launchMu.Unlock()
+		return nil
+	}
+	closedController, err := closeCaptchaBrowserLocked(flow)
+	s.recordCaptchaBrowserCloseResultLocked(flow, closedController, err, true)
+	flow.launchMu.Unlock()
+	return err
+}
+
 func (s *Server) reapRetainedCaptchaBrowsers() {
 	defer s.lifecycleWG.Done()
-	defer func() {
-		s.mu.Lock()
-		s.captchaReaperRunning = false
-		s.mu.Unlock()
-	}()
-	const maxAttempts = 5
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	defer s.finishCaptchaReaper()
+	for round := 0; round < captchaReaperMaxAttempts; round++ {
 		timer := time.NewTimer(100 * time.Millisecond)
 		select {
 		case <-timer.C:
@@ -718,24 +845,60 @@ func (s *Server) reapRetainedCaptchaBrowsers() {
 			}
 			return
 		}
-		s.mu.Lock()
-		flows := make([]*passwordFlow, 0, len(s.captchaCloseFailures))
-		for failedFlow := range s.captchaCloseFailures {
-			flows = append(flows, failedFlow)
-		}
-		s.mu.Unlock()
-		if len(flows) == 0 {
+		attempts := s.claimCaptchaBrowserReaperCloseAttempts()
+		if len(attempts) == 0 {
+			s.mu.Lock()
+			empty := len(s.captchaCloseFailures) == 0
+			s.mu.Unlock()
+			if empty {
+				if hook := s.beforeCaptchaReaperIdleExit; hook != nil {
+					hook()
+				}
+			} else if hook := s.beforeCaptchaReaperMaxExit; hook != nil {
+				hook()
+			}
 			return
 		}
-		for _, failedFlow := range flows {
-			_ = s.closeOwnedCaptchaBrowser(failedFlow)
+		for _, closeAttempt := range attempts {
+			_ = s.closeRetainedCaptchaBrowser(closeAttempt)
 		}
 		s.mu.Lock()
 		remaining := len(s.captchaCloseFailures)
+		retryable := s.hasRetryableCaptchaBrowserFailureLocked()
 		s.mu.Unlock()
 		if remaining == 0 {
+			if hook := s.beforeCaptchaReaperIdleExit; hook != nil {
+				hook()
+			}
 			return
 		}
+		if !retryable {
+			if hook := s.beforeCaptchaReaperMaxExit; hook != nil {
+				hook()
+			}
+			return
+		}
+	}
+	if hook := s.beforeCaptchaReaperMaxExit; hook != nil {
+		hook()
+	}
+}
+
+// finishCaptchaReaper closes every exit handoff without a missed wakeup. Only
+// controllers with retry budget remaining can claim a successor, so persistent
+// failures stay bounded while a newly inserted controller still gets retries.
+func (s *Server) finishCaptchaReaper() {
+	startSuccessor := false
+	s.mu.Lock()
+	s.captchaReaperRunning = false
+	if !s.closed && s.hasRetryableCaptchaBrowserFailureLocked() {
+		s.captchaReaperRunning = true
+		s.lifecycleWG.Add(1)
+		startSuccessor = true
+	}
+	s.mu.Unlock()
+	if startSuccessor {
+		go s.reapRetainedCaptchaBrowsers()
 	}
 }
 

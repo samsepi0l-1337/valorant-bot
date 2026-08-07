@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/dosfsociety/valorant-bot/internal/riot"
@@ -199,5 +200,33 @@ func TestQRClient_ExchangeRejectsBadStatus(t *testing.T) {
 
 	if _, err := c.ExchangeLoginToken(context.Background(), "tok"); err == nil {
 		t.Fatal("expected error on non-204 login-token response")
+	}
+}
+
+func TestQRClient_ExchangeDoesNotFollowRedirectWithLoginToken(t *testing.T) {
+	var redirected atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirected.Add(1)
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(target.Close)
+
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/login-token" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Location", target.URL+"/stolen-login-token")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(source.Close)
+
+	c := riot.NewQRClient(source.Client())
+	c.AuthBaseURL = source.URL
+	if _, err := c.ExchangeLoginToken(context.Background(), "sensitive-login-token"); err == nil {
+		t.Fatal("redirected login-token exchange unexpectedly succeeded")
+	}
+	if got := redirected.Load(); got != 0 {
+		t.Fatalf("redirect target requests=%d, want 0", got)
 	}
 }

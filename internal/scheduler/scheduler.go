@@ -197,9 +197,12 @@ func (s *Scheduler) Start(ctx context.Context, cronExpr string) error {
 	if err != nil {
 		return fmt.Errorf("cron: %w", err)
 	}
-	c.Start()
-	defer c.Stop()
+	return runCronUntilCanceled(ctx, c)
+}
 
+func runCronUntilCanceled(ctx context.Context, c *cron.Cron) error {
+	c.Start()
 	<-ctx.Done()
+	<-c.Stop().Done()
 	return ctx.Err()
 }

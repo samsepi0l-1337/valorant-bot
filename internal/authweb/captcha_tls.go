@@ -29,6 +29,8 @@ const RiotCaptchaHost = "authenticate.riotgames.com"
 
 const defaultCaptchaTLSPort = 8443
 const preferredCaptchaTLSPort = 443
+const captchaTLSReadHeaderTimeout = 5 * time.Second
+const captchaTLSIdleTimeout = 30 * time.Second
 
 // skipCaptchaTLSWait is set by unit tests that do not start a TLS listener.
 var skipCaptchaTLSWait bool
@@ -83,8 +85,10 @@ func (s *Server) listenCaptchaTLS(port int, dataDir string) error {
 	})
 
 	srv := &http.Server{
-		Handler:  s.captchaHandler(),
-		ErrorLog: quietTLSLogger(),
+		Handler:           s.captchaHandler(),
+		ErrorLog:          quietTLSLogger(),
+		ReadHeaderTimeout: captchaTLSReadHeaderTimeout,
+		IdleTimeout:       captchaTLSIdleTimeout,
 	}
 	done := make(chan struct{})
 	s.mu.Lock()

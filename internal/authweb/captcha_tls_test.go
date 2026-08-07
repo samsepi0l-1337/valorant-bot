@@ -252,6 +252,68 @@ func TestStartChromeLoggedReportsImmediateProcessFailure(t *testing.T) {
 	}
 }
 
+func TestImmediateLaunchFailureRetainsProfileForReaperRetry(t *testing.T) {
+	root := t.TempDir()
+	profileDir := filepath.Join(root, strings.Repeat("2", 32))
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(profileDir, "challenge-state")
+	if err := os.WriteFile(marker, []byte("owned"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var launchCalls atomic.Int32
+	var removeCalls atomic.Int32
+	temporaryRemoveFailure := errors.New("profile is temporarily locked")
+	s := newCaptchaServer(&fakePasswordAuth{})
+	s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) {
+		launchCalls.Add(1)
+		cmd := exec.Command(os.Args[0], "-test.run=TestChromeLaunchHelperProcess", "--")
+		cmd.Env = append(os.Environ(), "VALORANT_CHROME_LAUNCH_HELPER=fail")
+		return startChromeLoggedWithRemove(cmd, root, profileDir, func(profileRoot, profileDir string) error {
+			if removeCalls.Add(1) == 1 {
+				return temporaryRemoveFailure
+			}
+			return removeCaptchaChromeProfile(profileRoot, profileDir)
+		})
+	}
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "riot-user", "secret-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); !errors.Is(err, temporaryRemoveFailure) {
+		t.Fatalf("launch error=%v, want retained cleanup failure", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := os.Stat(profileDir); os.IsNotExist(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("reaper did not remove retained failed-launch profile; remove calls=%d", removeCalls.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := launchCalls.Load(); got != 1 {
+		t.Fatalf("failed launch attempts=%d, want 1", got)
+	}
+	s.mu.Lock()
+	pending := s.passwordPending[state]
+	_, retained := s.captchaCloseFailures[pending.flow]
+	s.mu.Unlock()
+	pending.flow.launchMu.Lock()
+	owned := pending.flow.browser
+	pending.flow.launchMu.Unlock()
+	if retained || owned != nil {
+		t.Fatalf("successful reaper left failed-launch ownership: retained=%v browser=%T", retained, owned)
+	}
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCaptchaBrowserCloseRemovesOnlyOwnedStateProfileWithoutDevTools(t *testing.T) {
 	root := t.TempDir()
 	profileDir := filepath.Join(root, strings.Repeat("b", 32))

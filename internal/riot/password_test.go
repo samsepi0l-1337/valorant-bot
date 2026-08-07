@@ -34,6 +34,22 @@ func jsonResponse(req *http.Request, body string) *http.Response {
 	}
 }
 
+type readErrorBody struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (b *readErrorBody) Read(p []byte) (int, error) {
+	if b.done {
+		return 0, b.err
+	}
+	b.done = true
+	return copy(p, b.data), b.err
+}
+
+func (*readErrorBody) Close() error { return nil }
+
 const captchaBrowserUserAgent = "captcha-browser/1"
 
 func captchaCookieValues(cookies []*http.Cookie) map[string]string {
@@ -558,6 +574,50 @@ func TestPasswordCompleteCaptcha_MFA(t *testing.T) {
 	}
 }
 
+func TestPasswordCompleteCaptchaRejectsAmbiguousNonOKContinuationBodies(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "mfa shaped", body: `{"type":"multifactor","multifactor":{"method":"email"}}`},
+		{name: "success shaped", body: `{"type":"success","success":{"login_token":"must-not-exchange"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var tokenExchanges atomic.Int32
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodPost:
+					_, _ = io.WriteString(w, `{"captcha":{"hcaptcha":{"key":"k","data":"d"}}}`)
+				case http.MethodPut:
+					w.WriteHeader(http.StatusBadGateway)
+					_, _ = io.WriteString(w, tt.body)
+				}
+			})
+			mux.HandleFunc("/api/v1/login-token", func(w http.ResponseWriter, _ *http.Request) {
+				tokenExchanges.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+			})
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+
+			c := &riot.PasswordClient{HTTPClient: srv.Client(), AuthBaseURL: srv.URL, AuthenticateBaseURL: srv.URL}
+			challenge, err := c.BeginCaptcha(context.Background(), "u", "p", riot.CaptchaBrowserSession{UserAgent: captchaBrowserUserAgent})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tokens, mfa, err := c.CompleteCaptcha(context.Background(), challenge.SessionID, "captcha-token", captchaBrowserSession(challenge))
+			if err == nil || mfa != nil || tokens.AccessToken != "" {
+				t.Fatalf("ambiguous non-OK completion: tokens=%+v mfa=%v err=%v", tokens, mfa, err)
+			}
+			if got := tokenExchanges.Load(); got != 0 {
+				t.Fatalf("token exchanges=%d, want 0", got)
+			}
+		})
+	}
+}
+
 func TestPasswordSubmitMFADoesNotRetryAfterLoginTokenExchangeFailure(t *testing.T) {
 	var mfaPUTs atomic.Int32
 	mux := http.NewServeMux()
@@ -655,6 +715,192 @@ func TestPasswordSubmitMFADoesNotRetryAfterTransportFailure(t *testing.T) {
 	}
 	if got := mfaPUTs.Load(); got != 1 {
 		t.Fatalf("MFA PUTs after transport ambiguity = %d, want 1", got)
+	}
+}
+
+func TestPasswordSubmitMFARejectsAmbiguousNonOKBodiesBeforeParsing(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "mfa shaped", body: `{"type":"multifactor","multifactor":{"method":"email"}}`},
+		{name: "success shaped", body: `{"type":"success","success":{"login_token":"must-not-exchange"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var mfaPUTs atomic.Int32
+			var tokenExchanges atomic.Int32
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodPost:
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"captcha": map[string]any{
+							"hcaptcha": map[string]string{"key": "k", "data": "d"},
+						},
+					})
+				case http.MethodPut:
+					var body map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+						t.Fatalf("decode PUT body: %v", err)
+					}
+					if body["type"] == "auth" {
+						_ = json.NewEncoder(w).Encode(map[string]any{
+							"type":        "multifactor",
+							"multifactor": map[string]any{"method": "email"},
+						})
+						return
+					}
+					mfaPUTs.Add(1)
+					w.WriteHeader(http.StatusBadGateway)
+					_, _ = io.WriteString(w, tt.body)
+				}
+			})
+			mux.HandleFunc("/api/v1/login-token", func(w http.ResponseWriter, _ *http.Request) {
+				tokenExchanges.Add(1)
+				w.WriteHeader(http.StatusNoContent)
+			})
+			mux.HandleFunc("/api/v1/authorization", func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"response": map[string]any{"parameters": map[string]string{
+						"uri": "http://localhost/redirect#access_token=at&id_token=id",
+					}},
+				})
+			})
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+
+			c := &riot.PasswordClient{HTTPClient: srv.Client(), AuthBaseURL: srv.URL, AuthenticateBaseURL: srv.URL}
+			challenge, err := c.BeginCaptcha(context.Background(), "u", "p", riot.CaptchaBrowserSession{UserAgent: captchaBrowserUserAgent})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, mfa, err := c.CompleteCaptcha(context.Background(), challenge.SessionID, "captcha-token", captchaBrowserSession(challenge))
+			if err != nil || mfa == nil {
+				t.Fatalf("captcha completion: mfa=%v err=%v", mfa, err)
+			}
+			_, err = c.SubmitMFA(context.Background(), mfa, "123456")
+			if err == nil {
+				t.Fatal("ambiguous non-OK MFA response was accepted")
+			}
+			if errors.Is(err, riot.ErrPasswordInvalidCode) {
+				t.Fatalf("ambiguous non-OK MFA response remained retryable: %v", err)
+			}
+			if got := mfaPUTs.Load(); got != 1 {
+				t.Fatalf("MFA PUTs=%d, want exactly 1", got)
+			}
+			if got := tokenExchanges.Load(); got != 0 {
+				t.Fatalf("token exchanges=%d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestPasswordSubmitMFADoesNotFallbackAfterSchemaBodyReadError(t *testing.T) {
+	var loginPUTs atomic.Int32
+	sentinel := errors.New("truncated response")
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/.well-known/openid-configuration" {
+			return jsonResponse(r, `{}`), nil
+		}
+		if r.URL.Path != "/api/v1/login" {
+			return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		switch r.Method {
+		case http.MethodPost:
+			return jsonResponse(r, `{"captcha":{"hcaptcha":{"key":"k","data":"d"}}}`), nil
+		case http.MethodPut:
+			put := loginPUTs.Add(1)
+			if put == 1 {
+				return jsonResponse(r, `{"type":"multifactor","multifactor":{"method":"email"}}`), nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Status:     "400 Bad Request",
+				Header:     make(http.Header),
+				Body: &readErrorBody{
+					data: []byte(`{"type":"error","error":"invalid_request","error_description":"multifactor request schema rejected before otp processing"}`),
+					err:  sentinel,
+				},
+				Request: r,
+			}, nil
+		default:
+			return nil, fmt.Errorf("unexpected login method %s", r.Method)
+		}
+	})}
+	c := &riot.PasswordClient{HTTPClient: client, AuthBaseURL: "https://riot.test", AuthenticateBaseURL: "https://riot.test"}
+	challenge, err := c.BeginCaptcha(context.Background(), "u", "p", riot.CaptchaBrowserSession{UserAgent: captchaBrowserUserAgent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, mfa, err := c.CompleteCaptcha(context.Background(), challenge.SessionID, "captcha-token", captchaBrowserSession(challenge))
+	if err != nil || mfa == nil {
+		t.Fatalf("captcha completion: mfa=%v err=%v", mfa, err)
+	}
+	_, err = c.SubmitMFA(context.Background(), mfa, "123456")
+	if err == nil || errors.Is(err, riot.ErrPasswordInvalidCode) {
+		t.Fatalf("schema response read ambiguity remained retryable: %v", err)
+	}
+	if got := loginPUTs.Load(); got != 2 {
+		t.Fatalf("login PUTs=%d, want captcha plus exactly one MFA PUT", got)
+	}
+}
+
+func TestPasswordSubmitMFADoesNotFollowRedirectOrReplayOTP(t *testing.T) {
+	var redirectedPUTs atomic.Int32
+	redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			redirectedPUTs.Add(1)
+		}
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	t.Cleanup(redirectTarget.Close)
+
+	var loginPUTs atomic.Int32
+	var tokenExchanges atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			_, _ = io.WriteString(w, `{"captcha":{"hcaptcha":{"key":"k","data":"d"}}}`)
+		case http.MethodPut:
+			put := loginPUTs.Add(1)
+			if put == 1 {
+				_, _ = io.WriteString(w, `{"type":"multifactor","multifactor":{"method":"email"}}`)
+				return
+			}
+			w.Header().Set("Location", redirectTarget.URL+"/otp-replay")
+			w.WriteHeader(http.StatusTemporaryRedirect)
+		}
+	})
+	mux.HandleFunc("/api/v1/login-token", func(w http.ResponseWriter, _ *http.Request) {
+		tokenExchanges.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := &riot.PasswordClient{HTTPClient: srv.Client(), AuthBaseURL: srv.URL, AuthenticateBaseURL: srv.URL}
+	challenge, err := c.BeginCaptcha(context.Background(), "u", "p", riot.CaptchaBrowserSession{UserAgent: captchaBrowserUserAgent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, mfa, err := c.CompleteCaptcha(context.Background(), challenge.SessionID, "captcha-token", captchaBrowserSession(challenge))
+	if err != nil || mfa == nil {
+		t.Fatalf("captcha completion: mfa=%v err=%v", mfa, err)
+	}
+	_, err = c.SubmitMFA(context.Background(), mfa, "123456")
+	if err == nil || errors.Is(err, riot.ErrPasswordInvalidCode) {
+		t.Fatalf("redirected MFA remained retryable: %v", err)
+	}
+	if got := loginPUTs.Load(); got != 2 {
+		t.Fatalf("login PUTs=%d, want captcha plus exactly one MFA PUT", got)
+	}
+	if got := redirectedPUTs.Load(); got != 0 {
+		t.Fatalf("redirect target PUTs=%d, want 0", got)
+	}
+	if got := tokenExchanges.Load(); got != 0 {
+		t.Fatalf("token exchanges=%d, want 0", got)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -288,6 +289,10 @@ func (h *Handlers) handlePasswordCaptchaLaunch(ctx context.Context, state, disco
 	if errors.Is(err, authweb.ErrCaptchaOwner) {
 		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.denied")}, false, nil
 	}
+	// Every non-owner launch error below removes the only retry control. Seal the
+	// flow now so plaintext credentials and any failed-launch profile are not
+	// retained until the TTL.
+	h.cancelPasswordLogin(state, discordUserID)
 	errText := strings.ToLower(err.Error())
 	if strings.Contains(errText, "chrome") || strings.Contains(errText, "chromium") {
 		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.need_chrome"), Components: []discordgo.MessageComponent{}}, false, nil
@@ -296,6 +301,20 @@ func (h *Handlers) handlePasswordCaptchaLaunch(ctx context.Context, state, disco
 		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.expired"), Components: []discordgo.MessageComponent{}}, false, nil
 	}
 	return Response{Ephemeral: true, Content: fmt.Sprintf(i18n.T(lang, "auth.captcha.launch_failed"), err), Components: []discordgo.MessageComponent{}}, false, nil
+}
+
+type passwordLoginCanceler interface {
+	CancelPasswordLogin(state, discordUserID string) error
+}
+
+func (h *Handlers) cancelPasswordLogin(state, discordUserID string) {
+	canceler, ok := h.Auth.(passwordLoginCanceler)
+	if !ok {
+		return
+	}
+	if err := canceler.CancelPasswordLogin(state, discordUserID); err != nil && !errors.Is(err, authweb.ErrCaptchaOwner) {
+		log.Printf("interaction: cancel password state: %s", discordRESTErrorLog(err))
+	}
 }
 
 // HandlePasswordCaptchaComplete builds the Discord reply after browser captcha finishes.

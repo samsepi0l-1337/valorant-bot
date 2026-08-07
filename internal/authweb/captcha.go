@@ -69,7 +69,10 @@ type passwordWaitDecision struct {
 	done    bool
 }
 
-var errPasswordFlowClosed = errors.New("captcha session closed; run /auth again")
+var (
+	errPasswordFlowClosed   = errors.New("captcha session closed; run /auth again")
+	errPasswordStateExpired = errors.New("captcha session expired; run /auth again")
+)
 
 // BeginPasswordLogin stores credentials and prepares a button-launched
 // bot-host Chrome flow.
@@ -141,9 +144,36 @@ func (s *Server) LaunchPasswordCaptcha(ctx context.Context, state, discordUserID
 	return s.ensureCaptchaLaunched(state)
 }
 
+// CancelPasswordLogin immediately seals an owner-bound password flow, scrubs
+// retained credentials, closes its owned browser, and cancels any Riot captcha
+// session. It is idempotent after the state has already reached a terminal path.
+func (s *Server) CancelPasswordLogin(state, discordUserID string) error {
+	state = strings.TrimSpace(state)
+	discordUserID = strings.TrimSpace(discordUserID)
+	s.mu.Lock()
+	pending, ok := s.passwordPending[state]
+	if !ok {
+		s.mu.Unlock()
+		return nil
+	}
+	if pending.discordUserID != discordUserID {
+		s.mu.Unlock()
+		return ErrCaptchaOwner
+	}
+	cleanup := s.claimPasswordStateCleanupLocked(state)
+	s.mu.Unlock()
+	s.finishPasswordStateCleanup(cleanup)
+	return nil
+}
+
 // WaitPasswordLogin blocks until the captcha page completes (success, MFA, or terminal error).
 // Captcha retries (new widget challenge) do not finish this wait.
 func (s *Server) WaitPasswordLogin(ctx context.Context, state string) (displayName, mfaState, mfaHint string, err error) {
+	opCtx, lifecycleDone, err := s.beginLifecycleOperation(ctx)
+	if err != nil {
+		return "", "", "", err
+	}
+	defer lifecycleDone()
 	ticker := time.NewTicker(s.qrPollInterval)
 	defer ticker.Stop()
 	for {
@@ -154,8 +184,8 @@ func (s *Server) WaitPasswordLogin(ctx context.Context, state string) (displayNa
 			return out.display, out.mfaState, out.mfaHint, out.err
 		}
 		select {
-		case <-ctx.Done():
-			decision = s.claimPasswordWait(state, ctx.Err())
+		case <-opCtx.Done():
+			decision = s.claimPasswordWait(state, opCtx.Err())
 			s.finishPasswordStateCleanup(decision.cleanup)
 			out := decision.outcome
 			return out.display, out.mfaState, out.mfaHint, out.err
@@ -184,6 +214,12 @@ func (s *Server) claimPasswordWait(state string, cancelErr error) passwordWaitDe
 		return passwordWaitDecision{
 			outcome: passwordOutcome{done: true, err: ErrServerClosed},
 			cleanup: s.claimPasswordStateCleanupLocked(state),
+			done:    true,
+		}
+	}
+	if _, ok := s.passwordPending[state]; !ok {
+		return passwordWaitDecision{
+			outcome: passwordOutcome{done: true, err: errPasswordStateExpired},
 			done:    true,
 		}
 	}

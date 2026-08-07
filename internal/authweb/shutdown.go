@@ -106,8 +106,12 @@ func (s *Server) shutdown() {
 		cancel()
 		if err != nil {
 			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("stop CAPTCHA TLS: %w", err))
-			if tlsListener != nil {
-				_ = tlsListener.Close()
+			// Shutdown leaves active connections open when its context expires.
+			// Close the server itself so partial requests and other accepted
+			// connections cannot outlive the auth server.
+			if closeErr := tlsServer.Close(); closeErr != nil &&
+				!errors.Is(closeErr, net.ErrClosed) && !errors.Is(closeErr, http.ErrServerClosed) {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("force-close CAPTCHA TLS: %w", closeErr))
 			}
 		}
 	} else if tlsListener != nil {
@@ -142,17 +146,12 @@ func (s *Server) retryRetainedCaptchaBrowsers(attempts int) error {
 		attempts = 1
 	}
 	for attempt := 0; attempt < attempts; attempt++ {
-		s.mu.Lock()
-		flows := make([]*passwordFlow, 0, len(s.captchaCloseFailures))
-		for flow := range s.captchaCloseFailures {
-			flows = append(flows, flow)
-		}
-		s.mu.Unlock()
-		if len(flows) == 0 {
+		closeAttempts := s.retainedCaptchaBrowserCloseAttempts()
+		if len(closeAttempts) == 0 {
 			return nil
 		}
-		for _, flow := range flows {
-			_ = s.closeOwnedCaptchaBrowser(flow)
+		for _, closeAttempt := range closeAttempts {
+			_ = s.closeRetainedCaptchaBrowser(closeAttempt)
 		}
 	}
 	s.mu.Lock()
