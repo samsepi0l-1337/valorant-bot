@@ -23,6 +23,41 @@ type acknowledgementCheckingAuth struct {
 	launchRelease   <-chan struct{}
 }
 
+type passwordButtonAuth struct {
+	launches    atomic.Int32
+	waitRelease <-chan struct{}
+	waitDone    chan<- struct{}
+}
+
+func (*passwordButtonAuth) BeginQRAuth(context.Context, string) (string, string, error) {
+	return "", "", nil
+}
+
+func (*passwordButtonAuth) WaitQRLogin(context.Context, string) (string, error) {
+	return "", nil
+}
+
+func (*passwordButtonAuth) BeginPasswordLogin(context.Context, string, string, string) (string, string, error) {
+	return "", "captcha-state", nil
+}
+
+func (a *passwordButtonAuth) LaunchPasswordCaptcha(context.Context, string, string) error {
+	a.launches.Add(1)
+	return nil
+}
+
+func (a *passwordButtonAuth) WaitPasswordLogin(context.Context, string) (string, string, string, error) {
+	<-a.waitRelease
+	if a.waitDone != nil {
+		a.waitDone <- struct{}{}
+	}
+	return "", "", "", context.Canceled
+}
+
+func (*passwordButtonAuth) CompletePasswordMFA(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
 func (a *acknowledgementCheckingAuth) BeginQRAuth(context.Context, string) (string, string, error) {
 	if !a.acknowledged.Load() {
 		a.beginBeforeACK.Store(true)
@@ -282,5 +317,124 @@ func TestAuthCaptchaComponentAcknowledgesBeforeLaunchingChrome(t *testing.T) {
 	}
 	if editCalls.Load() != 1 {
 		t.Fatalf("original-message edit calls = %d, want 1", editCalls.Load())
+	}
+}
+
+func TestPasswordModalWaitsForOwnerCaptchaButtonBeforeLaunchingChrome(t *testing.T) {
+	type component struct {
+		CustomID   string      `json:"custom_id"`
+		Components []component `json:"components"`
+	}
+	type modalResponsePayload struct {
+		Type discordgo.InteractionResponseType `json:"type"`
+		Data struct {
+			Components []component `json:"components"`
+		} `json:"data"`
+	}
+	modalResponse := make(chan modalResponsePayload, 1)
+	originalEdits := make(chan struct{}, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/callback":
+			var response modalResponsePayload
+			if err := json.NewDecoder(r.Body).Decode(&response); err != nil {
+				t.Errorf("decode callback: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if response.Type == discordgo.InteractionResponseChannelMessageWithSource {
+				modalResponse <- response
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case "/original":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+			originalEdits <- struct{}{}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	originalCallbackEndpoint := discordgo.EndpointInteractionResponse
+	originalWebhookEndpoint := discordgo.EndpointWebhookMessage
+	discordgo.EndpointInteractionResponse = func(_, _ string) string { return srv.URL + "/callback" }
+	discordgo.EndpointWebhookMessage = func(_, _, _ string) string { return srv.URL + "/original" }
+	t.Cleanup(func() {
+		discordgo.EndpointInteractionResponse = originalCallbackEndpoint
+		discordgo.EndpointWebhookMessage = originalWebhookEndpoint
+	})
+
+	session, err := discordgo.New("Bot test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRelease := make(chan struct{})
+	waitDone := make(chan struct{}, 1)
+	auth := &passwordButtonAuth{waitRelease: waitRelease, waitDone: waitDone}
+	h := &Handlers{Auth: auth}
+	modal := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-password-modal",
+		AppID: "application-1",
+		Token: "token-password-modal",
+		Type:  discordgo.InteractionModalSubmit,
+		Data: discordgo.ModalSubmitInteractionData{
+			CustomID: customIDAuthPWModal,
+			Components: []discordgo.MessageComponent{discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+				discordgo.TextInput{CustomID: "username", Value: "user"},
+				discordgo.TextInput{CustomID: "password", Value: "pass"},
+			}}},
+		},
+		User: &discordgo.User{ID: "owner-1"},
+	}}
+	h.onModal(session, modal)
+
+	select {
+	case response := <-modalResponse:
+		if len(response.Data.Components) != 1 {
+			t.Fatalf("modal response components = %#v", response.Data.Components)
+		}
+		row := response.Data.Components[0]
+		if len(row.Components) != 1 {
+			t.Fatalf("modal response row = %#v", response.Data.Components[0])
+		}
+		button := row.Components[0]
+		if button.CustomID != customIDAuthCaptchaPref+"captcha-state" {
+			t.Fatalf("captcha button = %#v", row.Components[0])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("password modal did not return its captcha button")
+	}
+	if got := auth.launches.Load(); got != 0 {
+		t.Fatalf("modal Chrome launches = %d, want 0", got)
+	}
+
+	captchaComponent := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-captcha-button",
+		AppID: "application-1",
+		Token: "token-captcha-button",
+		Type:  discordgo.InteractionMessageComponent,
+		Data:  discordgo.MessageComponentInteractionData{CustomID: customIDAuthCaptchaPref + "captcha-state"},
+		User:  &discordgo.User{ID: "owner-1"},
+	}}
+	h.onComponent(session, captchaComponent)
+	if got := auth.launches.Load(); got != 1 {
+		t.Fatalf("owner button Chrome launches = %d, want 1", got)
+	}
+	select {
+	case <-originalEdits:
+	case <-time.After(time.Second):
+		t.Fatal("captcha button response did not finish editing")
+	}
+	close(waitRelease)
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("captcha watcher did not finish")
+	}
+	select {
+	case <-originalEdits:
+	case <-time.After(time.Second):
+		t.Fatal("captcha watcher did not finish editing")
 	}
 }

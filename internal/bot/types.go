@@ -13,7 +13,8 @@ import (
 type AuthStarter interface {
 	BeginQRAuth(ctx context.Context, discordUserID string) (loginURL string, state string, err error)
 	WaitQRLogin(ctx context.Context, state string) (displayName string, err error)
-	// BeginPasswordLogin starts bot-host Chrome; the URL result is retained for compatibility and is normally empty.
+	// BeginPasswordLogin prepares an owner-bound, button-launched bot-host Chrome
+	// flow; the URL result is retained for compatibility and is normally empty.
 	BeginPasswordLogin(ctx context.Context, discordUserID, username, password string) (captchaURL, state string, err error)
 	LaunchPasswordCaptcha(ctx context.Context, state, discordUserID string) error
 	WaitPasswordLogin(ctx context.Context, state string) (displayName, mfaState, mfaHint string, err error)

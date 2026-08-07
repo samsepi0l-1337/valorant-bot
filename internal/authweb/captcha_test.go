@@ -542,6 +542,31 @@ func TestBeginPasswordLogin_PublicBaseStillUsesServerSideLaunch(t *testing.T) {
 	}
 }
 
+func TestBeginPasswordLogin_DoesNotLaunchChrome(t *testing.T) {
+	s := newCaptchaServer(&fakePasswordAuth{})
+	launched := make(chan struct{}, 1)
+	s.launchCaptchaBrowser = func(string) error {
+		launched <- struct{}{}
+		return nil
+	}
+
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	_, pending := s.passwordPending[state]
+	s.mu.Unlock()
+	if !pending {
+		t.Fatal("BeginPasswordLogin did not retain a live pending state")
+	}
+	select {
+	case <-launched:
+		t.Fatal("BeginPasswordLogin launched Chrome before the owner clicked the captcha button")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestBeginPasswordLoginWaitsForBrowserBeforeRiotSession(t *testing.T) {
 	pw := &fakePasswordAuth{
 		ch: riot.CaptchaChallenge{SessionID: "sess-browser", SiteKey: "site-key", RQData: "rq-data"},
@@ -572,6 +597,11 @@ func TestLaunchPasswordCaptchaValidatesOwner(t *testing.T) {
 		ch: riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
 	}
 	s := newCaptchaServer(pw)
+	var launches atomic.Int32
+	s.launchCaptchaBrowser = func(string) error {
+		launches.Add(1)
+		return nil
+	}
 	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "user", "pass")
 	if err != nil {
 		t.Fatal(err)
@@ -579,8 +609,14 @@ func TestLaunchPasswordCaptchaValidatesOwner(t *testing.T) {
 	if err := s.LaunchPasswordCaptcha(context.Background(), state, "intruder"); !errors.Is(err, ErrCaptchaOwner) {
 		t.Fatalf("intruder launch error = %v, want ErrCaptchaOwner", err)
 	}
+	if got := launches.Load(); got != 0 {
+		t.Fatalf("wrong-owner Chrome launches = %d, want 0", got)
+	}
 	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
 		t.Fatalf("owner launch: %v", err)
+	}
+	if got := launches.Load(); got != 1 {
+		t.Fatalf("first owner Chrome launches = %d, want 1", got)
 	}
 }
 
@@ -615,7 +651,7 @@ func TestWaitPasswordLoginCancellationClearsCredentialsAndRiotSession(t *testing
 	}
 }
 
-func TestCaptchaPreparationFailureFinishesWait(t *testing.T) {
+func TestLaunchPasswordCaptchaReturnsPreparationFailure(t *testing.T) {
 	pw := &fakePasswordAuth{
 		ch: riot.CaptchaChallenge{SessionID: "sess-1", SiteKey: "site-key", RQData: "rq-data"},
 	}
@@ -625,11 +661,9 @@ func TestCaptchaPreparationFailureFinishesWait(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	_, _, _, waitErr := s.WaitPasswordLogin(ctx, state)
-	if waitErr == nil || !strings.Contains(waitErr.Error(), "Chrome/Chromium") {
-		t.Fatalf("preparation error = %v", waitErr)
+	err = s.LaunchPasswordCaptcha(context.Background(), state, "owner-1")
+	if err == nil || !strings.Contains(err.Error(), "Chrome/Chromium") {
+		t.Fatalf("launch error = %v", err)
 	}
 }
 

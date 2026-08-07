@@ -36,6 +36,9 @@ type fakeAuth struct {
 	launchErr   error
 	launchState string
 	launchUser  string
+	pwBegins    int
+	launches    int
+	browserRuns int
 }
 
 func (f *fakeAuth) BeginQRAuth(ctx context.Context, discordUserID string) (string, string, error) {
@@ -53,6 +56,7 @@ func (f *fakeAuth) WaitQRLogin(ctx context.Context, state string) (string, error
 }
 
 func (f *fakeAuth) BeginPasswordLogin(ctx context.Context, discordUserID, username, password string) (string, string, error) {
+	f.pwBegins++
 	if f.pwErr != nil {
 		return "", "", f.pwErr
 	}
@@ -75,8 +79,12 @@ func (f *fakeAuth) WaitPasswordLogin(ctx context.Context, state string) (string,
 }
 
 func (f *fakeAuth) LaunchPasswordCaptcha(ctx context.Context, state, discordUserID string) error {
+	f.launches++
 	f.launchState = state
 	f.launchUser = discordUserID
+	if f.launchErr == nil {
+		f.browserRuns++
+	}
 	return f.launchErr
 }
 
@@ -226,7 +234,8 @@ func TestHandleAuthQR_Error(t *testing.T) {
 }
 
 func TestHandlePasswordLogin_CaptchaServerSideButton(t *testing.T) {
-	h := &bot.Handlers{Auth: &fakeAuth{captchaURL: "http://127.0.0.1:8787/captcha/open?state=abc", pwState: "abc"}}
+	auth := &fakeAuth{captchaURL: "http://127.0.0.1:8787/captcha/open?state=abc", pwState: "abc"}
+	h := &bot.Handlers{Auth: auth}
 	resp, state, err := h.HandlePasswordLogin(context.Background(), "u1", "user", "pass", i18n.KO)
 	if err != nil {
 		t.Fatal(err)
@@ -241,6 +250,15 @@ func TestHandlePasswordLogin_CaptchaServerSideButton(t *testing.T) {
 	btn := row.Components[0].(discordgo.Button)
 	if btn.URL != "" || btn.CustomID != "auth:captcha:abc" || btn.Style == discordgo.LinkButton {
 		t.Fatalf("button %+v", btn)
+	}
+	if auth.pwBegins != 1 || auth.launches != 0 {
+		t.Fatalf("credential submit began=%d launches=%d, want 1/0", auth.pwBegins, auth.launches)
+	}
+	if _, err := h.HandlePasswordCaptchaLaunch(context.Background(), state, "u1", i18n.KO); err != nil {
+		t.Fatal(err)
+	}
+	if auth.launches != 1 {
+		t.Fatalf("owner button launches=%d, want 1", auth.launches)
 	}
 }
 
@@ -260,13 +278,17 @@ func TestHandlePasswordCaptchaLaunch(t *testing.T) {
 }
 
 func TestHandlePasswordCaptchaLaunchDenied(t *testing.T) {
-	h := &bot.Handlers{Auth: &fakeAuth{launchErr: authweb.ErrCaptchaOwner}}
+	auth := &fakeAuth{launchErr: authweb.ErrCaptchaOwner}
+	h := &bot.Handlers{Auth: auth}
 	resp, err := h.HandlePasswordCaptchaLaunch(context.Background(), "captcha-state", "intruder", i18n.KO)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !resp.Ephemeral || !strings.Contains(resp.Content, "본인") {
 		t.Fatalf("response = %+v", resp)
+	}
+	if auth.browserRuns != 0 {
+		t.Fatalf("wrong-owner browser launches = %d, want 0", auth.browserRuns)
 	}
 }
 

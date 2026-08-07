@@ -48,9 +48,10 @@ type passwordOutcome struct {
 	err      error
 }
 
-// BeginPasswordLogin stores credentials and starts the bot-host Chrome flow.
+// BeginPasswordLogin stores credentials and prepares a button-launched
+// bot-host Chrome flow.
 // captchaURL is intentionally empty: Discord uses a custom-ID button to ask the
-// bot process to re-launch Chrome, never a localhost/public link on the user device.
+// bot process to launch Chrome, never a localhost/public link on the user device.
 func (s *Server) BeginPasswordLogin(ctx context.Context, discordUserID, username, password string) (captchaURL, state string, err error) {
 	_ = ctx
 	if s.passwordAuth == nil {
@@ -66,7 +67,6 @@ func (s *Server) BeginPasswordLogin(ctx context.Context, discordUserID, username
 	}
 	flowCtx, flowCancel := context.WithCancel(context.Background())
 	flow := &passwordFlow{ctx: flowCtx, cancel: flowCancel}
-	flow.wg.Add(1)
 	s.mu.Lock()
 	if s.passwordPending == nil {
 		s.passwordPending = make(map[string]passwordPending)
@@ -89,36 +89,12 @@ func (s *Server) BeginPasswordLogin(ctx context.Context, discordUserID, username
 	s.mu.Unlock()
 	go s.expirePasswordState(state)
 
-	// Open Chrome without creating a Riot session first. The challenge request
-	// from that exact browser supplies the User-Agent used for the whole flow.
-	go func() {
-		defer flow.wg.Done()
-		s.prepareCaptchaPage(state)
-	}()
-
 	return "", state, nil
 }
 
-func (s *Server) prepareCaptchaPage(state string) {
-	s.mu.Lock()
-	pending, ok := s.passwordPending[state]
-	s.mu.Unlock()
-	if !ok || pending.flow == nil {
-		return
-	}
-	if err := s.waitCaptchaTLS(3 * time.Second); err != nil {
-		log.Printf("captcha tls wait state=%s: %v", state, err)
-		s.setPasswordOutcome(state, passwordOutcome{err: err})
-		return
-	}
-	if err := s.ensureCaptchaLaunched(state); err != nil {
-		log.Printf("captcha auto-launch state=%s: %v", state, err)
-		s.setPasswordOutcome(state, passwordOutcome{err: err})
-	}
-}
-
 // LaunchPasswordCaptcha validates the Discord owner and asks the bot host to
-// open a fresh Chrome window. It never exposes loopback URLs to Discord users.
+// wait for loopback TLS before opening a fresh Chrome window. It never exposes
+// loopback URLs to Discord users.
 func (s *Server) LaunchPasswordCaptcha(ctx context.Context, state, discordUserID string) error {
 	state = strings.TrimSpace(state)
 	discordUserID = strings.TrimSpace(discordUserID)

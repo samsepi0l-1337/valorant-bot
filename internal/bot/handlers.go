@@ -227,7 +227,8 @@ func mfaRetryComponents(mfaState string, lang i18n.Lang) []discordgo.MessageComp
 	}
 }
 
-// HandlePasswordLogin is step 1: start bot-host Chrome after username/password.
+// HandlePasswordLogin is step 1: prepare the owner-bound CAPTCHA button after
+// username/password. The button starts bot-host Chrome.
 func (h *Handlers) HandlePasswordLogin(ctx context.Context, discordUserID, username, password string, lang i18n.Lang) (Response, string, error) {
 	if h.Auth == nil {
 		return Response{}, "", fmt.Errorf("auth not configured")
