@@ -96,6 +96,14 @@ type Handlers struct {
 
 	mfaHintMu sync.Mutex
 	mfaHints  map[string]string // mfaState → email hint or "authenticator"
+
+	mfaSubmitMu     sync.Mutex
+	mfaSubmitGuards map[string]*mfaSubmissionGuard
+}
+
+type mfaSubmissionGuard struct {
+	sync.Mutex
+	terminal bool
 }
 
 // Response is a Discord reply shape tests can assert without the gateway.

@@ -155,7 +155,7 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 	data := i.MessageComponentData()
 	userID := interactionUserID(i)
 	lang := h.userLang(userID)
-	log.Printf("interaction: component %s user=%s", data.CustomID, userID)
+	log.Printf("interaction: component %s user=%s", interactionLogCustomID(data.CustomID), userID)
 
 	if data.CustomID == customIDAuthPassword {
 		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
@@ -309,14 +309,13 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 func (h *Handlers) onModal(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	data := i.ModalSubmitData()
 	userID := interactionUserID(i)
-	lang := h.userLang(userID)
-	log.Printf("interaction: modal %s user=%s", data.CustomID, userID)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-	defer cancel()
+	log.Printf("interaction: modal %s user=%s", interactionLogCustomID(data.CustomID), userID)
 
 	switch {
 	case data.CustomID == customIDAuthPWModal:
+		lang := h.userLang(userID)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
 		resp, _, err := h.HandlePasswordLogin(ctx, userID, modalValue(data, "username"), modalValue(data, "password"), lang)
 		if err != nil {
 			_ = respondEphemeral(s, i, i18n.T(lang, "error.prefix")+err.Error())
@@ -327,15 +326,82 @@ func (h *Handlers) onModal(s *discordgo.Session, i *discordgo.InteractionCreate)
 		}
 	case strings.HasPrefix(data.CustomID, customIDAuthMFAPref):
 		mfaState := strings.TrimPrefix(data.CustomID, customIDAuthMFAPref)
-		resp, err := h.HandlePasswordMFA(ctx, mfaState, userID, modalValue(data, "code"), lang)
-		if err != nil {
-			_ = respondEphemeral(s, i, i18n.T(lang, "error.prefix")+err.Error())
+		if _, err := h.Auth.ValidatePasswordMFA(mfaState, userID); err != nil {
+			lang := h.userLang(userID)
+			h.clearMFAHint(mfaState)
+			if rerr := respondEphemeral(s, i, mfaTerminalMessage(lang, err)); rerr != nil {
+				log.Printf("interaction: mfa submit validation response: %v", rerr)
+			}
 			return
 		}
-		_ = respondEphemeralWithComponents(s, i, resp)
+		guard := h.mfaSubmissionGuard(mfaState)
+		if err := deferComponentUpdate(s, i); err != nil {
+			log.Printf("interaction: defer mfa modal: %v", err)
+			return
+		}
+		lang := h.userLang(userID)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		defer cancel()
+		guard.Lock()
+		defer guard.Unlock()
+		if guard.terminal {
+			return
+		}
+		resp, err := h.HandlePasswordMFA(ctx, mfaState, userID, modalValue(data, "code"), lang)
+		if err != nil {
+			resp = Response{
+				Content:    i18n.T(lang, "error.prefix") + err.Error(),
+				Embeds:     []*discordgo.MessageEmbed{},
+				Components: []discordgo.MessageComponent{},
+			}
+		}
+		if rerr := editInteraction(s, i, resp); rerr != nil {
+			log.Printf("interaction: mfa result edit: %v", rerr)
+			return
+		}
+		if len(resp.Components) == 0 {
+			guard.terminal = true
+		}
 	default:
 		log.Printf("interaction: ignoring modal %q", data.CustomID)
 	}
+}
+
+func interactionLogCustomID(customID string) string {
+	switch {
+	case strings.HasPrefix(customID, customIDAuthCaptchaPref):
+		return strings.TrimSuffix(customIDAuthCaptchaPref, ":")
+	case strings.HasPrefix(customID, customIDAuthMFAOpenPref):
+		return strings.TrimSuffix(customIDAuthMFAOpenPref, ":")
+	case strings.HasPrefix(customID, customIDAuthMFAPref):
+		return strings.TrimSuffix(customIDAuthMFAPref, ":")
+	default:
+		return customID
+	}
+}
+
+func (h *Handlers) mfaSubmissionGuard(state string) *mfaSubmissionGuard {
+	h.mfaSubmitMu.Lock()
+	if h.mfaSubmitGuards == nil {
+		h.mfaSubmitGuards = make(map[string]*mfaSubmissionGuard)
+	}
+	guard := h.mfaSubmitGuards[state]
+	if guard == nil {
+		guard = &mfaSubmissionGuard{}
+		h.mfaSubmitGuards[state] = guard
+		go func() {
+			timer := time.NewTimer(mfaHintTTL)
+			defer timer.Stop()
+			<-timer.C
+			h.mfaSubmitMu.Lock()
+			if h.mfaSubmitGuards[state] == guard {
+				delete(h.mfaSubmitGuards, state)
+			}
+			h.mfaSubmitMu.Unlock()
+		}()
+	}
+	h.mfaSubmitMu.Unlock()
+	return guard
 }
 
 func modalValue(data discordgo.ModalSubmitInteractionData, customID string) string {

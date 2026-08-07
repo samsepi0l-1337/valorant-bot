@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -41,15 +43,43 @@ type passwordButtonAuth struct {
 }
 
 type mfaInteractionAuth struct {
-	validateState string
-	validateUser  string
-	validateHint  string
-	validateErr   error
-	completeState string
-	completeUser  string
-	completeCode  string
-	completeErr   error
+	mu                   sync.Mutex
+	validateState        string
+	validateUser         string
+	validateHint         string
+	validateErr          error
+	validateCalls        atomic.Int32
+	completeState        string
+	completeUser         string
+	completeCode         string
+	completeCalls        atomic.Int32
+	completeBeforeACK    atomic.Bool
+	acknowledged         *atomic.Bool
+	firstCompleteStarted chan<- struct{}
+	firstCompleteRelease <-chan struct{}
+	completeResults      []mfaCompletionResult
+	completeDisplay      string
+	completeErr          error
 }
+
+type mfaCompletionResult struct {
+	display string
+	err     error
+}
+
+type mfaLanguageOrderStore struct {
+	auth                 *mfaInteractionAuth
+	readBeforeValidation atomic.Bool
+}
+
+func (s *mfaLanguageOrderStore) GetUserLanguage(string) (string, error) {
+	if s.auth.validateCalls.Load() == 0 {
+		s.readBeforeValidation.Store(true)
+	}
+	return string(i18n.KO), nil
+}
+
+func (*mfaLanguageOrderStore) SetUserLanguage(string, string) error { return nil }
 
 func (*mfaInteractionAuth) BeginQRAuth(context.Context, string) (string, string, error) {
 	return "", "", nil
@@ -72,16 +102,35 @@ func (*mfaInteractionAuth) WaitPasswordLogin(context.Context, string) (string, s
 }
 
 func (a *mfaInteractionAuth) ValidatePasswordMFA(mfaState, discordUserID string) (string, error) {
+	a.validateCalls.Add(1)
+	a.mu.Lock()
 	a.validateState = mfaState
 	a.validateUser = discordUserID
+	a.mu.Unlock()
 	return a.validateHint, a.validateErr
 }
 
 func (a *mfaInteractionAuth) CompletePasswordMFA(_ context.Context, mfaState, discordUserID, code string) (string, error) {
+	call := int(a.completeCalls.Add(1))
+	if a.acknowledged != nil && !a.acknowledged.Load() {
+		a.completeBeforeACK.Store(true)
+	}
+	a.mu.Lock()
 	a.completeState = mfaState
 	a.completeUser = discordUserID
 	a.completeCode = code
-	return "", a.completeErr
+	a.mu.Unlock()
+	if call == 1 && a.firstCompleteStarted != nil {
+		a.firstCompleteStarted <- struct{}{}
+	}
+	if call == 1 && a.firstCompleteRelease != nil {
+		<-a.firstCompleteRelease
+	}
+	if call <= len(a.completeResults) {
+		result := a.completeResults[call-1]
+		return result.display, result.err
+	}
+	return a.completeDisplay, a.completeErr
 }
 
 type capturedInteractionResponse struct {
@@ -122,6 +171,86 @@ func newInteractionResponseCapture(t *testing.T) (*discordgo.Session, <-chan cap
 		t.Fatal(err)
 	}
 	return session, responses
+}
+
+type capturedInteractionEdit struct {
+	Content    string `json:"content"`
+	Components []struct {
+		Components []struct {
+			CustomID string `json:"custom_id"`
+		} `json:"components"`
+	} `json:"components"`
+}
+
+type mfaInteractionCapture struct {
+	responses <-chan capturedInteractionResponse
+	edits     <-chan capturedInteractionEdit
+}
+
+func newMFAInteractionCapture(t *testing.T, acknowledged *atomic.Bool) (*discordgo.Session, mfaInteractionCapture) {
+	t.Helper()
+	responses := make(chan capturedInteractionResponse, 8)
+	edits := make(chan capturedInteractionEdit, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/callback":
+			var response capturedInteractionResponse
+			if err := json.NewDecoder(r.Body).Decode(&response); err != nil {
+				t.Errorf("decode callback: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if acknowledged != nil {
+				acknowledged.Store(true)
+			}
+			responses <- response
+			w.WriteHeader(http.StatusNoContent)
+		case "/original":
+			var edit capturedInteractionEdit
+			if err := json.NewDecoder(r.Body).Decode(&edit); err != nil {
+				t.Errorf("decode original edit: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			edits <- edit
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	originalCallbackEndpoint := discordgo.EndpointInteractionResponse
+	originalWebhookEndpoint := discordgo.EndpointWebhookMessage
+	discordgo.EndpointInteractionResponse = func(_, _ string) string { return srv.URL + "/callback" }
+	discordgo.EndpointWebhookMessage = func(_, _, _ string) string { return srv.URL + "/original" }
+	t.Cleanup(func() {
+		discordgo.EndpointInteractionResponse = originalCallbackEndpoint
+		discordgo.EndpointWebhookMessage = originalWebhookEndpoint
+	})
+
+	session, err := discordgo.New("Bot test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session, mfaInteractionCapture{responses: responses, edits: edits}
+}
+
+func mfaModalSubmitInteraction(id, userID, state, code string) *discordgo.InteractionCreate {
+	return &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    id,
+		AppID: "application-1",
+		Token: id + "-token",
+		Type:  discordgo.InteractionModalSubmit,
+		Data: discordgo.ModalSubmitInteractionData{
+			CustomID: customIDAuthMFAPref + state,
+			Components: []discordgo.MessageComponent{discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+				discordgo.TextInput{CustomID: "code", Value: code},
+			}}},
+		},
+		User: &discordgo.User{ID: userID},
+	}}
 }
 
 func (*passwordButtonAuth) BeginQRAuth(context.Context, string) (string, string, error) {
@@ -265,34 +394,237 @@ func TestMFAOpenComponentWrongOwnerIsEphemeralAndLocalized(t *testing.T) {
 }
 
 func TestMFAModalSubmitPassesOwnerAndKeepsInvalidCodeRetry(t *testing.T) {
-	session, responses := newInteractionResponseCapture(t)
+	session, capture := newMFAInteractionCapture(t, nil)
 	auth := &mfaInteractionAuth{completeErr: fmt.Errorf("riot response: %w", riot.ErrPasswordInvalidCode)}
 	h := &Handlers{Auth: auth}
-	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
-		ID:    "interaction-mfa-submit",
-		AppID: "application-1",
-		Token: "token-mfa-submit",
-		Type:  discordgo.InteractionModalSubmit,
-		Data: discordgo.ModalSubmitInteractionData{
-			CustomID: customIDAuthMFAPref + "mfa-state-1",
-			Components: []discordgo.MessageComponent{discordgo.ActionsRow{Components: []discordgo.MessageComponent{
-				discordgo.TextInput{CustomID: "code", Value: "000000"},
-			}}},
-		},
-		User: &discordgo.User{ID: "owner-1"},
-	}}
+	interaction := mfaModalSubmitInteraction("interaction-mfa-submit", "owner-1", "mfa-state-1", "000000")
 
 	h.onModal(session, interaction)
-	response := <-responses
+	response := <-capture.responses
 	if auth.completeState != "mfa-state-1" || auth.completeUser != "owner-1" || auth.completeCode != "000000" {
 		t.Fatalf("MFA submit got state=%q user=%q code=%q", auth.completeState, auth.completeUser, auth.completeCode)
 	}
-	if response.Type != discordgo.InteractionResponseChannelMessageWithSource ||
-		response.Data.Flags&discordgo.MessageFlagsEphemeral == 0 || len(response.Data.Components) == 0 {
-		t.Fatalf("invalid-code MFA response=%+v", response)
+	if auth.validateState != "mfa-state-1" || auth.validateUser != "owner-1" {
+		t.Fatalf("MFA prevalidation got state=%q user=%q", auth.validateState, auth.validateUser)
 	}
-	if response.Data.Content != i18n.T(i18n.KO, "auth.mfa.invalid") {
-		t.Fatalf("invalid-code content=%q", response.Data.Content)
+	if response.Type != discordgo.InteractionResponseDeferredMessageUpdate {
+		t.Fatalf("invalid-code MFA ACK type=%d, want deferred update", response.Type)
+	}
+	edit := <-capture.edits
+	if edit.Content != i18n.T(i18n.KO, "auth.mfa.invalid") || len(edit.Components) != 1 ||
+		len(edit.Components[0].Components) != 1 || edit.Components[0].Components[0].CustomID != customIDAuthMFAOpenPref+"mfa-state-1" {
+		t.Fatalf("invalid-code MFA edit=%+v", edit)
+	}
+}
+
+func TestMFAModalSubmitValidatesBeforeLanguageStoreRead(t *testing.T) {
+	session, capture := newMFAInteractionCapture(t, nil)
+	auth := &mfaInteractionAuth{completeErr: fmt.Errorf("riot response: %w", riot.ErrPasswordInvalidCode)}
+	lang := &mfaLanguageOrderStore{auth: auth}
+	h := &Handlers{Auth: auth, Lang: lang}
+
+	h.onModal(session, mfaModalSubmitInteraction("interaction-mfa-order", "owner-1", "mfa-state-1", "000000"))
+	<-capture.responses
+	<-capture.edits
+	if lang.readBeforeValidation.Load() {
+		t.Fatal("language store was read before in-memory MFA validation")
+	}
+}
+
+func TestMFAModalSubmitAcknowledgesBeforeBlockingCompletion(t *testing.T) {
+	var acknowledged atomic.Bool
+	session, capture := newMFAInteractionCapture(t, &acknowledged)
+	completeStarted := make(chan struct{}, 1)
+	completeRelease := make(chan struct{})
+	auth := &mfaInteractionAuth{
+		acknowledged:         &acknowledged,
+		firstCompleteStarted: completeStarted,
+		firstCompleteRelease: completeRelease,
+		completeErr:          fmt.Errorf("riot response: %w", riot.ErrPasswordInvalidCode),
+	}
+	h := &Handlers{Auth: auth}
+	done := make(chan struct{})
+	go func() {
+		h.onModal(session, mfaModalSubmitInteraction("interaction-mfa-blocking", "owner-1", "mfa-state-1", "000000"))
+		close(done)
+	}()
+
+	select {
+	case <-completeStarted:
+	case <-time.After(time.Second):
+		close(completeRelease)
+		t.Fatal("MFA completion did not start")
+	}
+	ackedBeforeRelease := acknowledged.Load()
+	completeBeforeACK := auth.completeBeforeACK.Load()
+	close(completeRelease)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("MFA modal handler did not finish")
+	}
+	response := <-capture.responses
+	if !ackedBeforeRelease || completeBeforeACK {
+		t.Fatalf("MFA completion started before ACK: acknowledged=%v beforeACK=%v", ackedBeforeRelease, completeBeforeACK)
+	}
+	if response.Type != discordgo.InteractionResponseDeferredMessageUpdate {
+		t.Fatalf("MFA ACK type=%d, want deferred update", response.Type)
+	}
+	select {
+	case <-capture.edits:
+	case <-time.After(time.Second):
+		t.Fatal("invalid MFA result did not edit the originating message")
+	}
+}
+
+func TestMFAModalSubmitRejectedBeforeACKDoesNotEditOwnerMessage(t *testing.T) {
+	tests := []struct {
+		name    string
+		userID  string
+		err     error
+		message string
+	}{
+		{name: "wrong owner", userID: "intruder-1", err: authweb.ErrMFAOwner, message: i18n.T(i18n.KO, "auth.mfa.denied")},
+		{name: "expired", userID: "owner-1", err: authweb.ErrMFAExpired, message: i18n.T(i18n.KO, "auth.mfa.expired")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			session, capture := newMFAInteractionCapture(t, nil)
+			auth := &mfaInteractionAuth{validateErr: tt.err}
+			h := &Handlers{Auth: auth}
+			h.onModal(session, mfaModalSubmitInteraction("interaction-mfa-rejected", tt.userID, "mfa-state-1", "123456"))
+
+			response := <-capture.responses
+			if response.Type != discordgo.InteractionResponseChannelMessageWithSource ||
+				response.Data.Flags&discordgo.MessageFlagsEphemeral == 0 || response.Data.Content != tt.message {
+				t.Fatalf("rejected MFA response=%+v", response)
+			}
+			if calls := auth.completeCalls.Load(); calls != 0 {
+				t.Fatalf("rejected MFA reached completion %d time(s)", calls)
+			}
+			select {
+			case edit := <-capture.edits:
+				t.Fatalf("rejected MFA edited owner message: %+v", edit)
+			case <-time.After(50 * time.Millisecond):
+			}
+		})
+	}
+}
+
+func TestMFAModalSubmitSuccessAndTerminalFailureClearOriginatingComponents(t *testing.T) {
+	tests := []struct {
+		name    string
+		display string
+		err     error
+	}{
+		{name: "success", display: "Player#KR1"},
+		{name: "terminal", err: errors.New("sqlite write failed")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			session, capture := newMFAInteractionCapture(t, nil)
+			auth := &mfaInteractionAuth{completeDisplay: tt.display, completeErr: tt.err}
+			h := &Handlers{Auth: auth}
+			h.onModal(session, mfaModalSubmitInteraction("interaction-mfa-"+tt.name, "owner-1", "mfa-state-1", "123456"))
+
+			response := <-capture.responses
+			if response.Type != discordgo.InteractionResponseDeferredMessageUpdate {
+				t.Fatalf("MFA ACK type=%d, want deferred update", response.Type)
+			}
+			edit := <-capture.edits
+			if edit.Components == nil || len(edit.Components) != 0 {
+				t.Fatalf("terminal MFA edit retained components: %+v", edit)
+			}
+		})
+	}
+}
+
+func TestConcurrentMFAModalResultsDoNotOverwriteSuccess(t *testing.T) {
+	session, capture := newMFAInteractionCapture(t, nil)
+	firstStarted := make(chan struct{}, 1)
+	firstRelease := make(chan struct{})
+	auth := &mfaInteractionAuth{
+		firstCompleteStarted: firstStarted,
+		firstCompleteRelease: firstRelease,
+		completeResults: []mfaCompletionResult{
+			{display: "Player#KR1"},
+			{err: authweb.ErrMFAExpired},
+		},
+	}
+	h := &Handlers{Auth: auth}
+	firstDone := make(chan struct{})
+	go func() {
+		h.onModal(session, mfaModalSubmitInteraction("interaction-mfa-first", "owner-1", "mfa-state-1", "123456"))
+		close(firstDone)
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		close(firstRelease)
+		t.Fatal("first MFA completion did not start")
+	}
+	secondDone := make(chan struct{})
+	go func() {
+		h.onModal(session, mfaModalSubmitInteraction("interaction-mfa-second", "owner-1", "mfa-state-1", "654321"))
+		close(secondDone)
+	}()
+
+	callbacksBeforeRelease := 0
+	deadline := time.After(200 * time.Millisecond)
+collectCallbacks:
+	for callbacksBeforeRelease < 2 {
+		select {
+		case <-capture.responses:
+			callbacksBeforeRelease++
+		case <-deadline:
+			break collectCallbacks
+		}
+	}
+	close(firstRelease)
+	for _, done := range []<-chan struct{}{firstDone, secondDone} {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent MFA handler did not finish")
+		}
+	}
+	if callbacksBeforeRelease != 2 {
+		t.Fatalf("MFA ACKs before first completion=%d, want 2", callbacksBeforeRelease)
+	}
+	if calls := auth.completeCalls.Load(); calls != 1 {
+		t.Fatalf("concurrent MFA completion calls=%d, want 1", calls)
+	}
+	var edits []capturedInteractionEdit
+	drain := time.After(100 * time.Millisecond)
+drainEdits:
+	for {
+		select {
+		case edit := <-capture.edits:
+			edits = append(edits, edit)
+		case <-drain:
+			break drainEdits
+		}
+	}
+	if len(edits) != 1 || !strings.Contains(edits[0].Content, "Player#KR1") || len(edits[0].Components) != 0 {
+		t.Fatalf("concurrent MFA edits=%+v, want one component-free success", edits)
+	}
+}
+
+func TestInteractionLogCustomIDRedactsAuthContinuationState(t *testing.T) {
+	tests := []struct {
+		customID string
+		want     string
+	}{
+		{customID: customIDAuthCaptchaPref + "captcha-secret-state", want: "auth:captcha"},
+		{customID: customIDAuthMFAOpenPref + "mfa-secret-state", want: "auth:mfaopen"},
+		{customID: customIDAuthMFAPref + "mfa-secret-state", want: "auth:mfa"},
+		{customID: customIDAuthPassword, want: customIDAuthPassword},
+		{customID: "shop:page:owner:1", want: "shop:page:owner:1"},
+	}
+	for _, tt := range tests {
+		if got := interactionLogCustomID(tt.customID); got != tt.want {
+			t.Errorf("interactionLogCustomID(%q)=%q, want %q", tt.customID, got, tt.want)
+		}
 	}
 }
 
