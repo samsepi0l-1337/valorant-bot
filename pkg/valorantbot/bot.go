@@ -116,6 +116,7 @@ func (b *Bot) Run(ctx context.Context) error {
 			}
 		},
 	})
+	defer authServer.Close()
 	if err := authServer.StartCaptchaTLS(0, filepath.Dir(b.cfg.DatabasePath)); err != nil {
 		log.Printf("captcha tls: %v (password captcha unavailable until TLS is up)", err)
 	}
@@ -128,6 +129,7 @@ func (b *Bot) Run(ctx context.Context) error {
 		Addr:    addr,
 		Handler: root,
 	}
+	defer httpSrv.Close()
 	go func() {
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("auth http: %v", err)
@@ -150,6 +152,7 @@ func (b *Bot) Run(ctx context.Context) error {
 		Guilds:   st,
 		Lang:     st,
 	}
+	defer handlers.Shutdown(context.Background())
 	bot.RegisterHandlers(dg, handlers)
 
 	cmds := bot.Commands()
@@ -209,6 +212,8 @@ func (b *Bot) Run(ctx context.Context) error {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = httpSrv.Shutdown(shutdownCtx)
-	return nil
+	httpErr := httpSrv.Shutdown(shutdownCtx)
+	authErr := authServer.Shutdown(shutdownCtx)
+	watcherErr := handlers.Shutdown(shutdownCtx)
+	return errors.Join(httpErr, watcherErr, authErr)
 }

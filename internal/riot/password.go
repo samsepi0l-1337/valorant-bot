@@ -181,9 +181,9 @@ func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password st
 		return CaptchaChallenge{}, fmt.Errorf("captcha begin: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return CaptchaChallenge{}, fmt.Errorf("captcha begin: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+		return CaptchaChallenge{}, fmt.Errorf("captcha begin: %s", resp.Status)
 	}
 	siteKey, rqData, ok := extractHCaptcha(raw)
 	if !ok {
@@ -281,7 +281,7 @@ func (c *PasswordClient) CompleteCaptcha(ctx context.Context, sessionID, captcha
 		return PasswordTokens{}, nil, fmt.Errorf("captcha complete: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	setCookies := resp.Cookies()
 	browserCookies = mergeCaptchaBrowserCookies(browserCookies, setCookies)
 	browserCookieSync := captchaBrowserCookieSync(browserCookies, setCookies, browser.Cookies, cookies, false)
@@ -423,7 +423,7 @@ func (c *PasswordClient) putAuthenticate(ctx context.Context, cookies map[string
 		return PasswordTokens{}, nil, fmt.Errorf("authenticate put: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return PasswordTokens{}, nil, ErrPasswordRateLimit
 	}
@@ -503,7 +503,7 @@ func (c *PasswordClient) putAuth(ctx context.Context, cookies map[string]string,
 		return PasswordTokens{}, nil, fmt.Errorf("auth put: %w", err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode == http.StatusTooManyRequests {
 		return PasswordTokens{}, nil, ErrPasswordRateLimit
 	}
@@ -511,7 +511,7 @@ func (c *PasswordClient) putAuth(ctx context.Context, cookies map[string]string,
 		return PasswordTokens{}, nil, &mfaSchemaRejectedError{}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return PasswordTokens{}, nil, fmt.Errorf("auth put: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
+		return PasswordTokens{}, nil, fmt.Errorf("auth put: %s", resp.Status)
 	}
 
 	var out struct {

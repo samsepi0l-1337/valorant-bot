@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/dosfsociety/valorant-bot/internal/i18n"
 	"github.com/dosfsociety/valorant-bot/internal/skins"
 	"github.com/dosfsociety/valorant-bot/internal/store"
 )
@@ -89,16 +90,34 @@ type Handlers struct {
 	Guilds   GuildStore
 	Lang     LanguageStore
 
+	langMu    sync.RWMutex
+	langCache map[string]i18n.Lang
+
+	lifecycleMu       sync.Mutex
+	lifecycleCtx      context.Context
+	lifecycleCancel   context.CancelFunc
+	lifecycleClosed   bool
+	lifecycleWG       sync.WaitGroup
+	lifecycleDone     chan struct{}
+	lifecycleWaitOnce sync.Once
+
 	shopCache *shopPageCache
 
 	captchaWatchMu sync.Mutex
 	captchaWatches map[string]struct{}
+	captchaEditMu  sync.Mutex
+	captchaEdits   map[string]*captchaEditGuard
 
 	mfaHintMu sync.Mutex
 	mfaHints  map[string]string // mfaState → email hint or "authenticator"
 
 	mfaSubmitMu     sync.Mutex
 	mfaSubmitGuards map[string]*mfaSubmissionGuard
+}
+
+type captchaEditGuard struct {
+	sync.Mutex
+	terminal bool
 }
 
 type mfaSubmissionGuard struct {

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/dosfsociety/valorant-bot/internal/authweb"
 	"github.com/dosfsociety/valorant-bot/internal/i18n"
 )
 
@@ -154,7 +155,7 @@ func (h *Handlers) OnInteraction(s *discordgo.Session, i *discordgo.InteractionC
 func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCreate) {
 	data := i.MessageComponentData()
 	userID := interactionUserID(i)
-	lang := h.userLang(userID)
+	lang := h.cachedUserLang(userID)
 	log.Printf("interaction: component %s user=%s", interactionLogCustomID(data.CustomID), userID)
 
 	if data.CustomID == customIDAuthPassword {
@@ -171,8 +172,16 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 		hint, err := h.Auth.ValidatePasswordMFA(mfaState, userID)
 		if err != nil {
 			h.clearMFAHint(mfaState)
-			if rerr := respondEphemeral(s, i, mfaTerminalMessage(lang, err)); rerr != nil {
-				log.Printf("interaction: mfa validation response: %v", rerr)
+			if errors.Is(err, authweb.ErrMFAOwner) {
+				if rerr := respondEphemeral(s, i, mfaTerminalMessage(lang, err)); rerr != nil {
+					log.Printf("interaction: mfa validation response: %v", rerr)
+				}
+			} else if rerr := updateComponentMessage(s, i, Response{
+				Content:    mfaTerminalMessage(lang, err),
+				Embeds:     []*discordgo.MessageEmbed{},
+				Components: []discordgo.MessageComponent{},
+			}); rerr != nil {
+				log.Printf("interaction: stale mfa component update: %v", rerr)
 			}
 			return
 		}
@@ -189,6 +198,7 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 			log.Printf("interaction: defer qr component: %v", err)
 			return
 		}
+		lang = h.userLang(userID)
 		resp, qrState, err := h.HandleAuthQR(context.Background(), userID, lang)
 		if err != nil {
 			log.Printf("interaction: qr component error: %v", err)
@@ -205,7 +215,7 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 			log.Printf("interaction: qr component edit failed: %v", rerr)
 		}
 		if qrState != "" {
-			go h.watchQRLogin(s, i, qrState, lang)
+			h.startQRLoginWatcher(s, i, qrState, lang)
 		}
 		return
 	}
@@ -214,21 +224,87 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 			log.Printf("interaction: defer captcha component: %v", err)
 			return
 		}
+		lang = h.userLang(userID)
 		state := strings.TrimPrefix(data.CustomID, customIDAuthCaptchaPref)
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 		resp, launched, err := h.handlePasswordCaptchaLaunch(ctx, state, userID, lang)
 		if err != nil {
 			log.Printf("interaction: captcha component error: %v", err)
-			resp = Response{Content: i18n.T(lang, "error.prefix") + err.Error()}
-		} else if launched {
-			h.startPasswordCaptchaWatcher(s, i, state, lang)
+			resp = Response{
+				Content:    i18n.T(lang, "error.prefix") + err.Error(),
+				Embeds:     []*discordgo.MessageEmbed{},
+				Components: []discordgo.MessageComponent{},
+			}
 		}
-		if rerr := editInteraction(s, i, resp); rerr != nil {
+		terminal := resp.Components != nil && len(resp.Components) == 0
+		if rerr := h.editCaptchaInteraction(s, i, state, resp, terminal); rerr != nil {
 			log.Printf("interaction: captcha component edit failed: %v", rerr)
+		}
+		if launched {
+			h.startPasswordCaptchaWatcher(s, i, state, lang)
 		}
 		return
 	}
+
+	// Resolve ownership and malformed inputs without persistence. All remaining
+	// component paths are acknowledged before language/database work.
+	switch {
+	case strings.HasPrefix(data.CustomID, customIDShopPagePrefix):
+		owner, _, noop, ok := parseShopPageCustomID(data.CustomID)
+		if !ok {
+			_ = updateComponentMessage(s, i, Response{Content: i18n.T(lang, "error.prefix") + "invalid shop navigation"})
+			return
+		}
+		if noop {
+			return
+		}
+		if owner != userID {
+			resp, _ := h.HandleShopNav(owner, 0, userID, lang)
+			if rerr := respondEphemeralEmbed(s, i, resp); rerr != nil {
+				log.Printf("interaction: shop owner response: %v", rerr)
+			}
+			return
+		}
+	case strings.HasPrefix(data.CustomID, customIDWishlistAddPrefix):
+		owner := strings.TrimPrefix(data.CustomID, customIDWishlistAddPrefix)
+		if owner != userID {
+			_ = respondEphemeral(s, i, i18n.T(lang, "wishlist.pick_denied"))
+			return
+		}
+		if len(data.Values) == 0 {
+			_ = updateComponentMessage(s, i, Response{Content: i18n.T(lang, "error.prefix") + "no selection"})
+			return
+		}
+	case strings.HasPrefix(data.CustomID, customIDWishlistRemovePrefix):
+		owner := strings.TrimPrefix(data.CustomID, customIDWishlistRemovePrefix)
+		if owner != userID {
+			_ = respondEphemeral(s, i, i18n.T(lang, "wishlist.pick_denied"))
+			return
+		}
+		if len(data.Values) == 0 {
+			_ = updateComponentMessage(s, i, Response{Content: i18n.T(lang, "error.prefix") + "no selection"})
+			return
+		}
+	case strings.HasPrefix(data.CustomID, customIDChannelTimePrefix):
+		guildID := strings.TrimPrefix(data.CustomID, customIDChannelTimePrefix)
+		if i.GuildID != "" && i.GuildID != guildID {
+			_ = respondEphemeral(s, i, i18n.T(lang, "channel.time_denied"))
+			return
+		}
+		if len(data.Values) == 0 {
+			_ = updateComponentMessage(s, i, Response{Content: i18n.T(lang, "error.prefix") + "no selection"})
+			return
+		}
+	default:
+		log.Printf("interaction: ignoring component %q", data.CustomID)
+		return
+	}
+	if err := deferComponentUpdate(s, i); err != nil {
+		log.Printf("interaction: defer component: %v", err)
+		return
+	}
+	lang = h.userLang(userID)
 
 	var (
 		resp           Response
@@ -287,21 +363,20 @@ func (h *Handlers) onComponent(s *discordgo.Session, i *discordgo.InteractionCre
 
 	if err != nil {
 		log.Printf("interaction: component error: %v", err)
-		_ = updateComponentMessage(s, i, Response{Content: i18n.T(lang, "error.prefix") + err.Error()})
+		_ = editInteraction(s, i, Response{
+			Content:    i18n.T(lang, "error.prefix") + err.Error(),
+			Components: []discordgo.MessageComponent{},
+		})
 		return
 	}
-	// Ephemeral replies (e.g. shop nav denied) go only to the clicker and
-	// must not replace the public component message.
 	if resp.Ephemeral {
-		if rerr := respondEphemeralEmbed(s, i, resp); rerr != nil {
-			log.Printf("interaction: ephemeral component reply failed: %v", rerr)
-		}
+		log.Printf("interaction: unexpected ephemeral response after component defer")
 		return
 	}
 	if !keepComponents {
 		resp.Components = []discordgo.MessageComponent{}
 	}
-	if rerr := updateComponentMessage(s, i, resp); rerr != nil {
+	if rerr := editInteraction(s, i, resp); rerr != nil {
 		log.Printf("interaction: component update failed: %v", rerr)
 	}
 }
@@ -313,24 +388,46 @@ func (h *Handlers) onModal(s *discordgo.Session, i *discordgo.InteractionCreate)
 
 	switch {
 	case data.CustomID == customIDAuthPWModal:
+		if err := deferInteraction(s, i, true); err != nil {
+			log.Printf("interaction: defer password modal: %v", err)
+			return
+		}
 		lang := h.userLang(userID)
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		defer cancel()
 		resp, _, err := h.HandlePasswordLogin(ctx, userID, modalValue(data, "username"), modalValue(data, "password"), lang)
 		if err != nil {
-			_ = respondEphemeral(s, i, i18n.T(lang, "error.prefix")+err.Error())
-			return
+			resp = Response{
+				Content:    i18n.T(lang, "error.prefix") + err.Error(),
+				Embeds:     []*discordgo.MessageEmbed{},
+				Components: []discordgo.MessageComponent{},
+			}
 		}
-		if rerr := respondEphemeralWithComponents(s, i, resp); rerr != nil {
-			log.Printf("interaction: password captcha reply: %v", rerr)
+		if rerr := editInteraction(s, i, resp); rerr != nil {
+			log.Printf("interaction: password captcha edit: %v", rerr)
 		}
 	case strings.HasPrefix(data.CustomID, customIDAuthMFAPref):
 		mfaState := strings.TrimPrefix(data.CustomID, customIDAuthMFAPref)
 		if _, err := h.Auth.ValidatePasswordMFA(mfaState, userID); err != nil {
-			lang := h.userLang(userID)
+			lang := h.cachedUserLang(userID)
 			h.clearMFAHint(mfaState)
-			if rerr := respondEphemeral(s, i, mfaTerminalMessage(lang, err)); rerr != nil {
-				log.Printf("interaction: mfa submit validation response: %v", rerr)
+			if errors.Is(err, authweb.ErrMFAOwner) {
+				if rerr := respondEphemeral(s, i, mfaTerminalMessage(lang, err)); rerr != nil {
+					log.Printf("interaction: mfa submit validation response: %v", rerr)
+				}
+				return
+			}
+			if rerr := deferComponentUpdate(s, i); rerr != nil {
+				log.Printf("interaction: defer stale mfa modal: %v", rerr)
+				return
+			}
+			lang = h.userLang(userID)
+			if rerr := editInteraction(s, i, Response{
+				Content:    mfaTerminalMessage(lang, err),
+				Embeds:     []*discordgo.MessageEmbed{},
+				Components: []discordgo.MessageComponent{},
+			}); rerr != nil {
+				log.Printf("interaction: stale mfa modal edit: %v", rerr)
 			}
 			return
 		}
@@ -389,16 +486,18 @@ func (h *Handlers) mfaSubmissionGuard(state string) *mfaSubmissionGuard {
 	if guard == nil {
 		guard = &mfaSubmissionGuard{}
 		h.mfaSubmitGuards[state] = guard
-		go func() {
-			timer := time.NewTimer(mfaHintTTL)
-			defer timer.Stop()
-			<-timer.C
-			h.mfaSubmitMu.Lock()
-			if h.mfaSubmitGuards[state] == guard {
-				delete(h.mfaSubmitGuards, state)
-			}
-			h.mfaSubmitMu.Unlock()
-		}()
+		ctx, done, ok := h.beginLifecycleWorker(mfaHintTTL)
+		if ok {
+			go func() {
+				defer done()
+				<-ctx.Done()
+				h.mfaSubmitMu.Lock()
+				if h.mfaSubmitGuards[state] == guard {
+					delete(h.mfaSubmitGuards, state)
+				}
+				h.mfaSubmitMu.Unlock()
+			}()
+		}
 	}
 	h.mfaSubmitMu.Unlock()
 	return guard
@@ -615,15 +714,23 @@ const passwordCaptchaTimeout = 10 * time.Minute
 // edit always fires instead of hanging forever on a stuck upstream request.
 const shopTimeout = 45 * time.Second
 
-// watchQRLogin polls until the user approves the QR login, then rewrites the
-// ephemeral /auth message with the outcome.
-func (h *Handlers) watchQRLogin(s *discordgo.Session, i *discordgo.InteractionCreate, state string, lang i18n.Lang) {
-	ctx, cancel := context.WithTimeout(context.Background(), qrLoginTimeout)
-	defer cancel()
+// startQRLoginWatcher polls until the user approves the QR login, then rewrites
+// the ephemeral /auth message with the outcome.
+func (h *Handlers) startQRLoginWatcher(s *discordgo.Session, i *discordgo.InteractionCreate, state string, lang i18n.Lang) {
+	ctx, done, ok := h.beginLifecycleWorker(qrLoginTimeout)
+	if !ok {
+		return
+	}
+	go func() {
+		defer done()
+		h.watchQRLogin(ctx, s, i, state, lang)
+	}()
+}
 
+func (h *Handlers) watchQRLogin(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, state string, lang i18n.Lang) {
 	display, err := h.Auth.WaitQRLogin(ctx, state)
 	if err != nil {
-		log.Printf("interaction: qr login state=%s: %v", state, err)
+		log.Printf("interaction: qr login state=%s: %v", continuationLogValue(state), err)
 	}
 	if rerr := editInteraction(s, i, h.HandleAuthComplete(display, err, lang)); rerr != nil {
 		log.Printf("interaction: qr login edit failed: %v", rerr)
@@ -641,6 +748,11 @@ func (h *Handlers) startPasswordCaptchaWatcher(s *discordgo.Session, i *discordg
 		h.captchaWatchMu.Unlock()
 		return
 	}
+	ctx, done, ok := h.beginLifecycleWorker(passwordCaptchaTimeout)
+	if !ok {
+		h.captchaWatchMu.Unlock()
+		return
+	}
 	h.captchaWatches[state] = struct{}{}
 	h.captchaWatchMu.Unlock()
 
@@ -649,25 +761,41 @@ func (h *Handlers) startPasswordCaptchaWatcher(s *discordgo.Session, i *discordg
 			h.captchaWatchMu.Lock()
 			delete(h.captchaWatches, state)
 			h.captchaWatchMu.Unlock()
+			done()
 		}()
-		h.watchPasswordCaptcha(s, i, state, lang)
+		h.watchPasswordCaptcha(ctx, s, i, state, lang)
 	}()
 }
 
 // watchPasswordCaptcha waits for the browser captcha page, then shows MFA step 2 or success.
-func (h *Handlers) watchPasswordCaptcha(s *discordgo.Session, i *discordgo.InteractionCreate, state string, lang i18n.Lang) {
-	ctx, cancel := context.WithTimeout(context.Background(), passwordCaptchaTimeout)
-	defer cancel()
-
+func (h *Handlers) watchPasswordCaptcha(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, state string, lang i18n.Lang) {
 	display, mfaState, mfaHint, err := h.Auth.WaitPasswordLogin(ctx, state)
 	if err != nil {
-		log.Printf("interaction: password captcha state=%s: %v", state, err)
+		log.Printf("interaction: password captcha state=%s: %v", continuationLogValue(state), err)
 	}
 	resp := h.HandlePasswordCaptchaComplete(display, mfaState, mfaHint, err, lang)
-	if rerr := editInteraction(s, i, resp); rerr != nil {
+	if rerr := h.editCaptchaInteraction(s, i, state, resp, true); rerr != nil {
 		log.Printf("interaction: password captcha edit failed: %v", rerr)
 	}
 }
+
+func (h *Handlers) editCaptchaInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, state string, resp Response, terminal bool) error {
+	guard := h.captchaEditGuard(state)
+	guard.Lock()
+	defer guard.Unlock()
+	if guard.terminal {
+		return nil
+	}
+	if err := editInteraction(s, i, resp); err != nil {
+		return err
+	}
+	if terminal {
+		guard.terminal = true
+	}
+	return nil
+}
+
+func continuationLogValue(string) string { return "<redacted>" }
 
 func commandEphemeral(name string) bool {
 	switch name {
@@ -713,13 +841,40 @@ func editInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, resp 
 
 func (h *Handlers) userLang(discordUserID string) i18n.Lang {
 	if h.Lang == nil || discordUserID == "" {
-		return i18n.KO
+		return h.cachedUserLang(discordUserID)
 	}
 	s, err := h.Lang.GetUserLanguage(discordUserID)
 	if err != nil {
+		return h.cachedUserLang(discordUserID)
+	}
+	lang := i18n.Parse(s)
+	h.cacheUserLang(discordUserID, lang)
+	return lang
+}
+
+// cachedUserLang is safe on Discord's modal-opening deadline: it never reads
+// the database and falls back to Korean until a safely acknowledged lookup has
+// populated the cache.
+func (h *Handlers) cachedUserLang(discordUserID string) i18n.Lang {
+	h.langMu.RLock()
+	lang := h.langCache[discordUserID]
+	h.langMu.RUnlock()
+	if lang == "" {
 		return i18n.KO
 	}
-	return i18n.Parse(s)
+	return lang
+}
+
+func (h *Handlers) cacheUserLang(discordUserID string, lang i18n.Lang) {
+	if discordUserID == "" {
+		return
+	}
+	h.langMu.Lock()
+	if h.langCache == nil {
+		h.langCache = make(map[string]i18n.Lang)
+	}
+	h.langCache[discordUserID] = lang
+	h.langMu.Unlock()
 }
 
 func interactionUserID(i *discordgo.InteractionCreate) string {

@@ -183,15 +183,18 @@ func (h *Handlers) rememberMFAHint(state, hint string) {
 		return
 	}
 	h.mfaHintMu.Lock()
-	defer h.mfaHintMu.Unlock()
 	if h.mfaHints == nil {
 		h.mfaHints = make(map[string]string)
 	}
 	h.mfaHints[state] = hint
+	h.mfaHintMu.Unlock()
+	ctx, done, ok := h.beginLifecycleWorker(mfaHintTTL)
+	if !ok {
+		return
+	}
 	go func() {
-		timer := time.NewTimer(mfaHintTTL)
-		defer timer.Stop()
-		<-timer.C
+		defer done()
+		<-ctx.Done()
 		h.clearMFAHint(state)
 	}()
 }
@@ -287,12 +290,12 @@ func (h *Handlers) handlePasswordCaptchaLaunch(ctx context.Context, state, disco
 	}
 	errText := strings.ToLower(err.Error())
 	if strings.Contains(errText, "chrome") || strings.Contains(errText, "chromium") {
-		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.need_chrome")}, false, nil
+		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.need_chrome"), Components: []discordgo.MessageComponent{}}, false, nil
 	}
 	if strings.Contains(errText, "expired") {
-		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.expired")}, false, nil
+		return Response{Ephemeral: true, Content: i18n.T(lang, "auth.captcha.expired"), Components: []discordgo.MessageComponent{}}, false, nil
 	}
-	return Response{Ephemeral: true, Content: fmt.Sprintf(i18n.T(lang, "auth.captcha.launch_failed"), err)}, false, nil
+	return Response{Ephemeral: true, Content: fmt.Sprintf(i18n.T(lang, "auth.captcha.launch_failed"), err), Components: []discordgo.MessageComponent{}}, false, nil
 }
 
 // HandlePasswordCaptchaComplete builds the Discord reply after browser captcha finishes.
@@ -468,6 +471,7 @@ func (h *Handlers) HandleLanguage(discordUserID, langCode string) (Response, err
 	if err := h.Lang.SetUserLanguage(discordUserID, string(lang)); err != nil {
 		return Response{}, err
 	}
+	h.cacheUserLang(discordUserID, lang)
 	msg := i18n.T(lang, "lang.set")
 	if lang == i18n.EN {
 		msg = i18n.T(lang, "lang.set_en")

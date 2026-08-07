@@ -67,8 +67,8 @@ func (c *Client) GetEntitlements(ctx context.Context, accessToken string) (strin
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("entitlements: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
+		return "", fmt.Errorf("entitlements: %s", resp.Status)
 	}
 
 	var out struct {
@@ -98,8 +98,8 @@ func (c *Client) GetUserInfo(ctx context.Context, accessToken string) (string, e
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("userinfo: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
+		return "", fmt.Errorf("userinfo: %s", resp.Status)
 	}
 
 	var out struct {
@@ -137,8 +137,8 @@ func (c *Client) GetPlayerNames(ctx context.Context, accessToken, entitlementsTo
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("name-service: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
+		return nil, fmt.Errorf("name-service: %s", resp.Status)
 	}
 
 	var raw []struct {
@@ -180,8 +180,8 @@ func (c *Client) GetStorefront(ctx context.Context, accessToken, entitlementsTok
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return Storefront{}, fmt.Errorf("storefront: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
+		return Storefront{}, fmt.Errorf("storefront: %s", resp.Status)
 	}
 
 	var raw struct {
@@ -307,8 +307,8 @@ func (c *Client) GetValorantAffinity(ctx context.Context, accessToken, idToken s
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("geo: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
+		return "", fmt.Errorf("geo: %s", resp.Status)
 	}
 	var out struct {
 		Affinities struct {

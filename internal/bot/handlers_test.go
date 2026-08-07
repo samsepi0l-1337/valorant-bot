@@ -312,6 +312,18 @@ func TestHandlePasswordCaptchaLaunchDenied(t *testing.T) {
 	}
 }
 
+func TestHandlePasswordCaptchaLaunchExpiredClearsControls(t *testing.T) {
+	auth := &fakeAuth{launchErr: errors.New("captcha session expired; run /auth again")}
+	h := &bot.Handlers{Auth: auth}
+	resp, err := h.HandlePasswordCaptchaLaunch(context.Background(), "captcha-state", "owner-1", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Content != i18n.T(i18n.KO, "auth.captcha.expired") || resp.Components == nil || len(resp.Components) != 0 {
+		t.Fatalf("expired CAPTCHA retained stale controls: %+v", resp)
+	}
+}
+
 func TestHandlePasswordLogin_NeedChrome(t *testing.T) {
 	h := &bot.Handlers{Auth: &fakeAuth{pwErr: errors.New("Chrome/Chromium not found — install Google Chrome")}}
 	resp, state, err := h.HandlePasswordLogin(context.Background(), "u1", "user", "pass", i18n.KO)
@@ -350,6 +362,9 @@ func TestHandlePasswordCaptchaComplete_MFA(t *testing.T) {
 	}
 	modal := bot.MFALoginModal("mfa-1", "authenticator", i18n.KO)
 	input := modal.Components[0].(discordgo.ActionsRow).Components[0].(discordgo.TextInput)
+	if input.MinLength != 6 || input.MaxLength != 8 {
+		t.Fatalf("MFA input length=%d..%d, want 6..8", input.MinLength, input.MaxLength)
+	}
 	if !strings.Contains(input.Label, "2FA") && !strings.Contains(input.Label, "Riot Mobile") {
 		t.Fatalf("app modal label %q", input.Label)
 	}

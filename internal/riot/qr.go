@@ -113,8 +113,8 @@ func (c *QRClient) StartQRSession(ctx context.Context) (*QRSession, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("qr start: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
+		return nil, fmt.Errorf("qr start: %s", resp.Status)
 	}
 
 	var out struct {
@@ -159,8 +159,8 @@ func (c *QRClient) PollQRSession(ctx context.Context, sess *QRSession) (loginTok
 	case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
 		return "", ErrQRExpired
 	default:
-		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("qr poll: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
+		return "", fmt.Errorf("qr poll: %s", resp.Status)
 	}
 
 	var out struct {
@@ -203,10 +203,10 @@ func (c *QRClient) ExchangeLoginToken(ctx context.Context, loginToken string) (Q
 	if err != nil {
 		return QRTokens{}, fmt.Errorf("login-token: %w", err)
 	}
-	body, _ := io.ReadAll(resp.Body)
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		return QRTokens{}, fmt.Errorf("login-token: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return QRTokens{}, fmt.Errorf("login-token: %s", resp.Status)
 	}
 
 	authzBody := map[string]any{
@@ -226,8 +226,8 @@ func (c *QRClient) ExchangeLoginToken(ctx context.Context, loginToken string) (Q
 	}
 	defer authzResp.Body.Close()
 	if authzResp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(authzResp.Body)
-		return QRTokens{}, fmt.Errorf("authorization: %s: %s", authzResp.Status, strings.TrimSpace(string(b)))
+		_, _ = io.Copy(io.Discard, io.LimitReader(authzResp.Body, 32<<10))
+		return QRTokens{}, fmt.Errorf("authorization: %s", authzResp.Status)
 	}
 
 	var out struct {

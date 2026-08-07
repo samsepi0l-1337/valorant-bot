@@ -1,6 +1,9 @@
 package i18n
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCaptchaCopyDescribesButtonStartedChrome(t *testing.T) {
 	tests := []struct {
@@ -70,4 +73,37 @@ func TestMFAOwnerAndTerminalCopy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMFACopyConsistentlyDescribesSixToEightDigits(t *testing.T) {
+	tests := []struct {
+		lang i18nTestLang
+		want string
+	}{
+		{lang: i18nTestLang{code: KO, marker: "6~8자리"}, want: "ko"},
+		{lang: i18nTestLang{code: EN, marker: "6–8 digit"}, want: "en"},
+	}
+	keys := []string{
+		"auth.mfa.code",
+		"auth.mfa.code_email",
+		"auth.mfa.code_app",
+		"auth.mfa.prompt",
+		"auth.mfa.prompt_email",
+		"auth.mfa.prompt_email_generic",
+		"auth.mfa.prompt_app",
+	}
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			for _, key := range keys {
+				if got := T(tt.lang.code, key); !strings.Contains(got, tt.lang.marker) {
+					t.Errorf("%s=%q, want marker %q", key, got, tt.lang.marker)
+				}
+			}
+		})
+	}
+}
+
+type i18nTestLang struct {
+	code   Lang
+	marker string
 }

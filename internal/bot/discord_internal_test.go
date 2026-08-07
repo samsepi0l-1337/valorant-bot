@@ -34,12 +34,14 @@ type acknowledgementCheckingAuth struct {
 }
 
 type passwordButtonAuth struct {
-	launchErr   error
-	launches    atomic.Int32
-	waits       atomic.Int32
-	waitStarted chan<- struct{}
-	waitRelease <-chan struct{}
-	waitDone    chan<- struct{}
+	launchErr            error
+	launches             atomic.Int32
+	waits                atomic.Int32
+	waitStarted          chan<- struct{}
+	waitRelease          <-chan struct{}
+	waitDone             chan<- struct{}
+	launchEditResponded  *atomic.Bool
+	waitBeforeLaunchEdit atomic.Bool
 }
 
 type mfaInteractionAuth struct {
@@ -71,6 +73,52 @@ type mfaLanguageOrderStore struct {
 	auth                 *mfaInteractionAuth
 	readBeforeValidation atomic.Bool
 }
+
+type blockingLanguageStore struct {
+	started chan struct{}
+	release <-chan struct{}
+	once    sync.Once
+}
+
+type ackLanguageStore struct {
+	acknowledged  *atomic.Bool
+	readBeforeACK atomic.Bool
+}
+
+func (s *ackLanguageStore) GetUserLanguage(string) (string, error) {
+	if !s.acknowledged.Load() {
+		s.readBeforeACK.Store(true)
+	}
+	return string(i18n.KO), nil
+}
+
+func (*ackLanguageStore) SetUserLanguage(string, string) error { return nil }
+
+type cancelingWatcherAuth struct {
+	mfaInteractionAuth
+	qrStarted       chan struct{}
+	passwordStarted chan struct{}
+}
+
+func (a *cancelingWatcherAuth) WaitQRLogin(ctx context.Context, _ string) (string, error) {
+	close(a.qrStarted)
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func (a *cancelingWatcherAuth) WaitPasswordLogin(ctx context.Context, _ string) (string, string, string, error) {
+	close(a.passwordStarted)
+	<-ctx.Done()
+	return "", "", "", ctx.Err()
+}
+
+func (s *blockingLanguageStore) GetUserLanguage(string) (string, error) {
+	s.once.Do(func() { close(s.started) })
+	<-s.release
+	return string(i18n.EN), nil
+}
+
+func (*blockingLanguageStore) SetUserLanguage(string, string) error { return nil }
 
 func (s *mfaLanguageOrderStore) GetUserLanguage(string) (string, error) {
 	if s.auth.validateCalls.Load() == 0 {
@@ -272,6 +320,9 @@ func (a *passwordButtonAuth) LaunchPasswordCaptcha(context.Context, string, stri
 
 func (a *passwordButtonAuth) WaitPasswordLogin(context.Context, string) (string, string, string, error) {
 	a.waits.Add(1)
+	if a.launchEditResponded != nil && !a.launchEditResponded.Load() {
+		a.waitBeforeLaunchEdit.Store(true)
+	}
 	if a.waitStarted != nil {
 		a.waitStarted <- struct{}{}
 	}
@@ -280,6 +331,159 @@ func (a *passwordButtonAuth) WaitPasswordLogin(context.Context, string) (string,
 		a.waitDone <- struct{}{}
 	}
 	return "", "", "", context.Canceled
+}
+
+func TestCaptchaWatcherStartsAfterLaunchStatusAndCannotBeOverwritten(t *testing.T) {
+	var launchEditResponded atomic.Bool
+	waitStarted := make(chan struct{}, 1)
+	waitRelease := make(chan struct{})
+	close(waitRelease)
+	auth := &passwordButtonAuth{
+		waitStarted:         waitStarted,
+		waitRelease:         waitRelease,
+		launchEditResponded: &launchEditResponded,
+	}
+	var (
+		mu       sync.Mutex
+		contents []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/callback":
+			w.WriteHeader(http.StatusNoContent)
+		case "/original":
+			var edit capturedInteractionEdit
+			if err := json.NewDecoder(r.Body).Decode(&edit); err != nil {
+				t.Errorf("decode edit: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if edit.Content == i18n.T(i18n.KO, "auth.captcha.launched") {
+				select {
+				case <-waitStarted:
+				case <-time.After(75 * time.Millisecond):
+				}
+				launchEditResponded.Store(true)
+			}
+			mu.Lock()
+			contents = append(contents, edit.Content)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	originalCallbackEndpoint := discordgo.EndpointInteractionResponse
+	originalWebhookEndpoint := discordgo.EndpointWebhookMessage
+	discordgo.EndpointInteractionResponse = func(_, _ string) string { return srv.URL + "/callback" }
+	discordgo.EndpointWebhookMessage = func(_, _, _ string) string { return srv.URL + "/original" }
+	t.Cleanup(func() {
+		discordgo.EndpointInteractionResponse = originalCallbackEndpoint
+		discordgo.EndpointWebhookMessage = originalWebhookEndpoint
+	})
+	session, err := discordgo.New("Bot test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handlers{Auth: auth}
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-captcha-order",
+		AppID: "application-1",
+		Token: "token-captcha-order",
+		Type:  discordgo.InteractionMessageComponent,
+		Data:  discordgo.MessageComponentInteractionData{CustomID: customIDAuthCaptchaPref + "captcha-state"},
+		User:  &discordgo.User{ID: "owner-1"},
+	}}
+	h.onComponent(session, interaction)
+	deadline := time.Now().Add(time.Second)
+	for {
+		mu.Lock()
+		count := len(contents)
+		last := ""
+		if count > 0 {
+			last = contents[count-1]
+		}
+		mu.Unlock()
+		if count >= 2 {
+			if auth.waitBeforeLaunchEdit.Load() {
+				t.Fatal("CAPTCHA watcher began before the launch status edit completed")
+			}
+			if last == i18n.T(i18n.KO, "auth.captcha.launched") {
+				t.Fatalf("launch status overwrote terminal watcher edit: %q", last)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("CAPTCHA edits=%v, want launch then terminal", contents)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestCaptchaTerminalEditSuppressesConcurrentReopenStatus(t *testing.T) {
+	requestStarted := make(chan struct{}, 1)
+	releaseTerminal := make(chan struct{})
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/original" {
+			http.NotFound(w, r)
+			return
+		}
+		requests.Add(1)
+		requestStarted <- struct{}{}
+		<-releaseTerminal
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+	originalWebhookEndpoint := discordgo.EndpointWebhookMessage
+	discordgo.EndpointWebhookMessage = func(_, _, _ string) string { return srv.URL + "/original" }
+	t.Cleanup(func() { discordgo.EndpointWebhookMessage = originalWebhookEndpoint })
+	session, err := discordgo.New("Bot test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handlers{}
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID: "interaction-terminal-race", AppID: "application-1", Token: "token-terminal-race",
+	}}
+	terminalDone := make(chan error, 1)
+	go func() {
+		terminalDone <- h.editCaptchaInteraction(session, interaction, "captcha-state", Response{
+			Content:    "terminal",
+			Components: []discordgo.MessageComponent{},
+		}, true)
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("terminal edit did not start")
+	}
+	reopenDone := make(chan error, 1)
+	go func() {
+		reopenDone <- h.editCaptchaInteraction(session, interaction, "captcha-state", Response{Content: "launched"}, false)
+	}()
+	select {
+	case err := <-reopenDone:
+		t.Fatalf("reopen edit bypassed in-flight terminal edit: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseTerminal)
+	for _, done := range []<-chan error{terminalDone, reopenDone} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("serialized edit did not finish")
+		}
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("Discord edits=%d, terminal success should suppress reopen", got)
+	}
 }
 
 func (*passwordButtonAuth) ValidatePasswordMFA(string, string) (string, error) {
@@ -364,6 +568,92 @@ func TestMFAOpenComponentPassesOwnerToValidation(t *testing.T) {
 	}
 }
 
+func TestPasswordModalOpenUsesCachedLanguageWithoutDatabaseRead(t *testing.T) {
+	session, responses := newInteractionResponseCapture(t)
+	release := make(chan struct{})
+	lang := &blockingLanguageStore{started: make(chan struct{}), release: release}
+	h := &Handlers{Lang: lang}
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-password-open",
+		AppID: "application-1",
+		Token: "token-password-open",
+		Type:  discordgo.InteractionMessageComponent,
+		Data:  discordgo.MessageComponentInteractionData{CustomID: customIDAuthPassword},
+		User:  &discordgo.User{ID: "owner-1"},
+	}}
+	done := make(chan struct{})
+	go func() {
+		h.onComponent(session, interaction)
+		close(done)
+	}()
+	select {
+	case response := <-responses:
+		if response.Type != discordgo.InteractionResponseModal {
+			t.Fatalf("password open response=%+v", response)
+		}
+	case <-lang.started:
+		close(release)
+		<-done
+		t.Fatal("password modal opening read the language database before ACK")
+	case <-time.After(time.Second):
+		close(release)
+		<-done
+		t.Fatal("password modal opening did not respond")
+	}
+	close(release)
+	<-done
+}
+
+func TestPasswordModalSubmitAcknowledgesBeforeLanguageDatabaseAndAuthWork(t *testing.T) {
+	session, capture := newMFAInteractionCapture(t, nil)
+	release := make(chan struct{})
+	lang := &blockingLanguageStore{started: make(chan struct{}), release: release}
+	h := &Handlers{Auth: &passwordButtonAuth{}, Lang: lang}
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-password-submit-order",
+		AppID: "application-1",
+		Token: "token-password-submit-order",
+		Type:  discordgo.InteractionModalSubmit,
+		Data: discordgo.ModalSubmitInteractionData{
+			CustomID: customIDAuthPWModal,
+			Components: []discordgo.MessageComponent{discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+				discordgo.TextInput{CustomID: "username", Value: "user"},
+				discordgo.TextInput{CustomID: "password", Value: "pass"},
+			}}},
+		},
+		User: &discordgo.User{ID: "owner-1"},
+	}}
+	done := make(chan struct{})
+	go func() {
+		h.onModal(session, interaction)
+		close(done)
+	}()
+	select {
+	case response := <-capture.responses:
+		if response.Type != discordgo.InteractionResponseDeferredChannelMessageWithSource {
+			t.Fatalf("password modal ACK type=%d", response.Type)
+		}
+	case <-lang.started:
+		close(release)
+		<-done
+		t.Fatal("password modal submit read the language database before ACK")
+	case <-time.After(time.Second):
+		close(release)
+		<-done
+		t.Fatal("password modal submit was not acknowledged")
+	}
+	close(release)
+	select {
+	case edit := <-capture.edits:
+		if len(edit.Components) != 1 {
+			t.Fatalf("password modal result=%+v", edit)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("password modal submit did not edit its deferred response")
+	}
+	<-done
+}
+
 func TestMFAOpenComponentWrongOwnerIsEphemeralAndLocalized(t *testing.T) {
 	session, responses := newInteractionResponseCapture(t)
 	auth := &mfaInteractionAuth{validateErr: authweb.ErrMFAOwner}
@@ -390,6 +680,28 @@ func TestMFAOpenComponentWrongOwnerIsEphemeralAndLocalized(t *testing.T) {
 	}
 	if response.Data.Content != i18n.T(i18n.KO, "auth.mfa.denied") {
 		t.Fatalf("wrong-owner content=%q", response.Data.Content)
+	}
+}
+
+func TestExpiredMFAOpenUpdatesSourceAndClearsStaleControls(t *testing.T) {
+	session, responses := newInteractionResponseCapture(t)
+	auth := &mfaInteractionAuth{validateErr: authweb.ErrMFAExpired}
+	h := &Handlers{Auth: auth}
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-mfa-expired-open",
+		AppID: "application-1",
+		Token: "token-mfa-expired-open",
+		Type:  discordgo.InteractionMessageComponent,
+		Data:  discordgo.MessageComponentInteractionData{CustomID: customIDAuthMFAOpenPref + "mfa-state-1"},
+		User:  &discordgo.User{ID: "owner-1"},
+	}}
+
+	h.onComponent(session, interaction)
+	response := <-responses
+	if response.Type != discordgo.InteractionResponseUpdateMessage ||
+		response.Data.Content != i18n.T(i18n.KO, "auth.mfa.expired") ||
+		response.Data.Components == nil || len(response.Data.Components) != 0 {
+		t.Fatalf("expired MFA open retained stale controls: %+v", response)
 	}
 }
 
@@ -477,37 +789,40 @@ func TestMFAModalSubmitAcknowledgesBeforeBlockingCompletion(t *testing.T) {
 	}
 }
 
-func TestMFAModalSubmitRejectedBeforeACKDoesNotEditOwnerMessage(t *testing.T) {
-	tests := []struct {
-		name    string
-		userID  string
-		err     error
-		message string
-	}{
-		{name: "wrong owner", userID: "intruder-1", err: authweb.ErrMFAOwner, message: i18n.T(i18n.KO, "auth.mfa.denied")},
-		{name: "expired", userID: "owner-1", err: authweb.ErrMFAExpired, message: i18n.T(i18n.KO, "auth.mfa.expired")},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			session, capture := newMFAInteractionCapture(t, nil)
-			auth := &mfaInteractionAuth{validateErr: tt.err}
-			h := &Handlers{Auth: auth}
-			h.onModal(session, mfaModalSubmitInteraction("interaction-mfa-rejected", tt.userID, "mfa-state-1", "123456"))
+func TestMFAModalWrongOwnerDoesNotEditOwnerMessage(t *testing.T) {
+	session, capture := newMFAInteractionCapture(t, nil)
+	auth := &mfaInteractionAuth{validateErr: authweb.ErrMFAOwner}
+	h := &Handlers{Auth: auth}
+	h.onModal(session, mfaModalSubmitInteraction("interaction-mfa-wrong-owner", "intruder-1", "mfa-state-1", "123456"))
 
-			response := <-capture.responses
-			if response.Type != discordgo.InteractionResponseChannelMessageWithSource ||
-				response.Data.Flags&discordgo.MessageFlagsEphemeral == 0 || response.Data.Content != tt.message {
-				t.Fatalf("rejected MFA response=%+v", response)
-			}
-			if calls := auth.completeCalls.Load(); calls != 0 {
-				t.Fatalf("rejected MFA reached completion %d time(s)", calls)
-			}
-			select {
-			case edit := <-capture.edits:
-				t.Fatalf("rejected MFA edited owner message: %+v", edit)
-			case <-time.After(50 * time.Millisecond):
-			}
-		})
+	response := <-capture.responses
+	if response.Type != discordgo.InteractionResponseChannelMessageWithSource ||
+		response.Data.Flags&discordgo.MessageFlagsEphemeral == 0 || response.Data.Content != i18n.T(i18n.KO, "auth.mfa.denied") {
+		t.Fatalf("wrong-owner MFA response=%+v", response)
+	}
+	select {
+	case edit := <-capture.edits:
+		t.Fatalf("wrong-owner MFA edited owner message: %+v", edit)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestExpiredMFAModalUpdatesSourceAndClearsStaleControls(t *testing.T) {
+	session, capture := newMFAInteractionCapture(t, nil)
+	auth := &mfaInteractionAuth{validateErr: authweb.ErrMFAExpired}
+	h := &Handlers{Auth: auth}
+	h.onModal(session, mfaModalSubmitInteraction("interaction-mfa-expired", "owner-1", "mfa-state-1", "123456"))
+
+	response := <-capture.responses
+	if response.Type != discordgo.InteractionResponseDeferredMessageUpdate {
+		t.Fatalf("expired MFA ACK type=%d, want deferred update", response.Type)
+	}
+	edit := <-capture.edits
+	if edit.Content != i18n.T(i18n.KO, "auth.mfa.expired") || edit.Components == nil || len(edit.Components) != 0 {
+		t.Fatalf("expired MFA edit retained stale controls: %+v", edit)
+	}
+	if calls := auth.completeCalls.Load(); calls != 0 {
+		t.Fatalf("expired MFA reached completion %d time(s)", calls)
 	}
 }
 
@@ -628,6 +943,53 @@ func TestInteractionLogCustomIDRedactsAuthContinuationState(t *testing.T) {
 	}
 }
 
+func TestContinuationLogValueNeverReturnsAuthState(t *testing.T) {
+	for _, state := range []string{"", "qr-secret-state", "password-secret-state", strings.Repeat("s", 512)} {
+		got := continuationLogValue(state)
+		if got != "<redacted>" || (state != "" && strings.Contains(got, state)) {
+			t.Fatalf("continuationLogValue leaked input: got=%q", got)
+		}
+	}
+}
+
+func TestHandlersShutdownCancelsAndJoinsQRAndPasswordWatchers(t *testing.T) {
+	session, _ := newMFAInteractionCapture(t, nil)
+	auth := &cancelingWatcherAuth{
+		qrStarted:       make(chan struct{}),
+		passwordStarted: make(chan struct{}),
+	}
+	h := &Handlers{Auth: auth}
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-watcher-shutdown",
+		AppID: "application-1",
+		Token: "token-watcher-shutdown",
+		User:  &discordgo.User{ID: "owner-1"},
+	}}
+	h.startQRLoginWatcher(session, interaction, "qr-secret-state", i18n.KO)
+	h.startPasswordCaptchaWatcher(session, interaction, "password-secret-state", i18n.KO)
+	for _, started := range []<-chan struct{}{auth.qrStarted, auth.passwordStarted} {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("auth watcher did not start")
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := h.Shutdown(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Shutdown(ctx); err != nil {
+		t.Fatalf("second Shutdown: %v", err)
+	}
+	h.captchaWatchMu.Lock()
+	watches := len(h.captchaWatches)
+	h.captchaWatchMu.Unlock()
+	if watches != 0 {
+		t.Fatalf("shutdown retained %d CAPTCHA watcher(s)", watches)
+	}
+}
+
 func TestMFATerminalFailureClearsCachedHint(t *testing.T) {
 	auth := &mfaInteractionAuth{completeErr: errors.New("identity lookup failed")}
 	h := &Handlers{Auth: auth}
@@ -736,7 +1098,8 @@ func TestAuthQRComponent_AcknowledgesThenEditsWithMappedAttachment(t *testing.T)
 		t.Fatal(err)
 	}
 	auth := &acknowledgementCheckingAuth{acknowledged: &acknowledged}
-	h := &Handlers{Auth: auth}
+	lang := &ackLanguageStore{acknowledged: &acknowledged}
+	h := &Handlers{Auth: auth, Lang: lang}
 	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
 		ID:    "interaction-1",
 		AppID: "application-1",
@@ -752,6 +1115,9 @@ func TestAuthQRComponent_AcknowledgesThenEditsWithMappedAttachment(t *testing.T)
 
 	if auth.beginBeforeACK.Load() {
 		t.Error("BeginQRAuth ran before Discord acknowledged the component interaction")
+	}
+	if lang.readBeforeACK.Load() {
+		t.Error("language database was read before Discord acknowledged the QR component interaction")
 	}
 	if got := discordgo.InteractionResponseType(callbackType.Load()); got != discordgo.InteractionResponseDeferredMessageUpdate {
 		t.Fatalf("callback type = %d, want deferred message update (%d)", got, discordgo.InteractionResponseDeferredMessageUpdate)
@@ -906,7 +1272,11 @@ func TestPasswordModalStartsOneWatcherAfterOwnerCaptchaButton(t *testing.T) {
 			Components []component `json:"components"`
 		} `json:"data"`
 	}
-	modalResponse := make(chan modalResponsePayload, 1)
+	type modalEditPayload struct {
+		Components []component `json:"components"`
+	}
+	modalACK := make(chan modalResponsePayload, 1)
+	modalEdit := make(chan modalEditPayload, 1)
 	originalEdits := make(chan struct{}, 3)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -917,11 +1287,21 @@ func TestPasswordModalStartsOneWatcherAfterOwnerCaptchaButton(t *testing.T) {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
-			if response.Type == discordgo.InteractionResponseChannelMessageWithSource {
-				modalResponse <- response
+			if response.Type == discordgo.InteractionResponseDeferredChannelMessageWithSource {
+				modalACK <- response
 			}
 			w.WriteHeader(http.StatusNoContent)
 		case "/original":
+			var edit modalEditPayload
+			if err := json.NewDecoder(r.Body).Decode(&edit); err != nil {
+				t.Errorf("decode edit: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			select {
+			case modalEdit <- edit:
+			default:
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, `{}`)
 			originalEdits <- struct{}{}
@@ -964,15 +1344,18 @@ func TestPasswordModalStartsOneWatcherAfterOwnerCaptchaButton(t *testing.T) {
 		User: &discordgo.User{ID: "owner-1"},
 	}}
 	h.onModal(session, modal)
+	if response := <-modalACK; response.Type != discordgo.InteractionResponseDeferredChannelMessageWithSource {
+		t.Fatalf("password modal ACK type=%d", response.Type)
+	}
 
 	select {
-	case response := <-modalResponse:
-		if len(response.Data.Components) != 1 {
-			t.Fatalf("modal response components = %#v", response.Data.Components)
+	case response := <-modalEdit:
+		if len(response.Components) != 1 {
+			t.Fatalf("modal response components = %#v", response.Components)
 		}
-		row := response.Data.Components[0]
+		row := response.Components[0]
 		if len(row.Components) != 1 {
-			t.Fatalf("modal response row = %#v", response.Data.Components[0])
+			t.Fatalf("modal response row = %#v", response.Components[0])
 		}
 		button := row.Components[0]
 		if button.CustomID != customIDAuthCaptchaPref+"captcha-state" {
@@ -981,6 +1364,7 @@ func TestPasswordModalStartsOneWatcherAfterOwnerCaptchaButton(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("password modal did not return its captcha button")
 	}
+	<-originalEdits // password modal's deferred-response edit
 	if got := auth.launches.Load(); got != 0 {
 		t.Fatalf("modal Chrome launches = %d, want 0", got)
 	}
