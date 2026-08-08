@@ -285,17 +285,21 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 		terminalApplied := false
 		defer func() { guard.finish(terminalApplied) }()
 
-		cancelErr := h.cancelPasswordLoginOwned(state, userID)
+		canceled, cancelErr := h.cancelPasswordLoginOwned(state, userID)
 		if errors.Is(cancelErr, authweb.ErrCaptchaOwner) {
+			return
+		}
+		if cancelErr != nil {
+			log.Printf("interaction: captcha cancel: %s", discordRESTErrorLog(cancelErr))
+			return
+		}
+		if !canceled {
 			return
 		}
 		resp := Response{
 			Content:    i18n.T(lang, "auth.captcha.cancelled"),
 			Embeds:     []*discordgo.MessageEmbed{},
 			Components: []discordgo.MessageComponent{},
-		}
-		if cancelErr != nil {
-			resp.Content = i18n.T(lang, "auth.captcha.expired")
 		}
 		delivery, editErr := editInteractionOutcome(ctx, s, i, resp)
 		if delivery == deliveryApplied || delivery == deliveryAmbiguous {

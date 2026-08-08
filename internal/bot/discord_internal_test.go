@@ -40,6 +40,7 @@ type passwordButtonAuth struct {
 	captchaState         string
 	launchErr            error
 	cancelErr            error
+	cancelNotClaimed     bool
 	cancelHook           func()
 	launches             atomic.Int32
 	waits                atomic.Int32
@@ -281,6 +282,10 @@ func (*mfaInteractionAuth) LaunchPasswordCaptcha(context.Context, string, string
 	return nil
 }
 
+func (*mfaInteractionAuth) CancelPasswordLogin(string, string) (bool, error) {
+	return true, nil
+}
+
 func (*mfaInteractionAuth) WaitPasswordLogin(context.Context, string) (string, string, string, error) {
 	return "", "", "", nil
 }
@@ -425,6 +430,51 @@ func newMFAInteractionCapture(t *testing.T, acknowledged *atomic.Bool) (*discord
 	return session, mfaInteractionCapture{responses: responses, edits: edits}
 }
 
+func newGatedInitialEditSession(t *testing.T) (*discordgo.Session, <-chan struct{}, func(), *atomic.Bool) {
+	t.Helper()
+	initialEditStarted := make(chan struct{}, 1)
+	releaseInitialEdit := make(chan struct{})
+	var releaseOnce sync.Once
+	var initialEditResponded atomic.Bool
+	var editCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/callback":
+			w.WriteHeader(http.StatusNoContent)
+		case "/original":
+			if editCalls.Add(1) == 1 {
+				initialEditStarted <- struct{}{}
+				<-releaseInitialEdit
+				initialEditResponded.Store(true)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(releaseInitialEdit) })
+		srv.Close()
+	})
+
+	originalCallbackEndpoint := discordgo.EndpointInteractionResponse
+	originalWebhookEndpoint := discordgo.EndpointWebhookMessage
+	discordgo.EndpointInteractionResponse = func(_, _ string) string { return srv.URL + "/callback" }
+	discordgo.EndpointWebhookMessage = func(_, _, _ string) string { return srv.URL + "/original" }
+	t.Cleanup(func() {
+		discordgo.EndpointInteractionResponse = originalCallbackEndpoint
+		discordgo.EndpointWebhookMessage = originalWebhookEndpoint
+	})
+
+	session, err := discordgo.New("Bot test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := func() { releaseOnce.Do(func() { close(releaseInitialEdit) }) }
+	return session, initialEditStarted, release, &initialEditResponded
+}
+
 func newFailedOriginalEditSession(t *testing.T) *discordgo.Session {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -494,14 +544,14 @@ func (a *passwordButtonAuth) LaunchPasswordCaptcha(context.Context, string, stri
 	return a.launchErr
 }
 
-func (a *passwordButtonAuth) CancelPasswordLogin(state, discordUserID string) error {
+func (a *passwordButtonAuth) CancelPasswordLogin(state, discordUserID string) (bool, error) {
 	a.cancelCalls.Add(1)
 	a.cancelState = state
 	a.cancelUser = discordUserID
 	if a.cancelHook != nil {
 		a.cancelHook()
 	}
-	return a.cancelErr
+	return !a.cancelNotClaimed, a.cancelErr
 }
 
 func (a *passwordButtonAuth) WaitPasswordLogin(context.Context, string) (string, string, string, error) {
@@ -801,6 +851,10 @@ func (a *acknowledgementCheckingAuth) LaunchPasswordCaptcha(context.Context, str
 		<-a.launchRelease
 	}
 	return nil
+}
+
+func (*acknowledgementCheckingAuth) CancelPasswordLogin(string, string) (bool, error) {
+	return true, nil
 }
 
 func (a *acknowledgementCheckingAuth) WaitPasswordLogin(context.Context, string) (string, string, string, error) {
@@ -1432,6 +1486,8 @@ func TestPasswordCaptchaCancelCustomIDParsesExactOwnerAndStateOnly(t *testing.T)
 		customIDAuthCaptchaCancelPref + owner + ":550E8400-E29B-41D4-A716-446655440000",
 		customIDAuthCaptchaCancelPref + owner + ":" + state + ":extra",
 		customIDAuthCaptchaCancelPref + owner + ":https://relay.example/#bearer",
+		customIDAuthCaptchaCancelPref + "123456789012345678901:" + state,
+		strings.Repeat("x", 101),
 		customIDAuthCaptchaPref + state,
 	} {
 		if parsedOwner, parsedState, parsed := parsePasswordCaptchaCancelCustomID(invalid); parsed {
@@ -1450,15 +1506,23 @@ func TestRemotePasswordCaptchaOwnerCancelIsTerminalAndWatcherCannotOverwriteIt(t
 	waitStarted := make(chan struct{}, 1)
 	waitRelease := make(chan struct{})
 	waitDone := make(chan struct{}, 1)
+	cancelEntered := make(chan struct{})
+	cancelRelease := make(chan struct{})
 	var releaseOnce sync.Once
+	var cancelReleaseOnce sync.Once
 	auth := &passwordButtonAuth{
 		waitStarted: waitStarted,
 		waitRelease: waitRelease,
 		waitDone:    waitDone,
-		cancelHook:  func() { releaseOnce.Do(func() { close(waitRelease) }) },
+		cancelHook: func() {
+			close(cancelEntered)
+			<-cancelRelease
+			releaseOnce.Do(func() { close(waitRelease) })
+		},
 	}
 	h := &Handlers{Auth: auth}
 	t.Cleanup(func() {
+		cancelReleaseOnce.Do(func() { close(cancelRelease) })
 		releaseOnce.Do(func() { close(waitRelease) })
 		_ = h.Shutdown(context.Background())
 	})
@@ -1479,7 +1543,20 @@ func TestRemotePasswordCaptchaOwnerCancelIsTerminalAndWatcherCannotOverwriteIt(t
 		t.Fatal("remote watcher did not start")
 	}
 
-	h.onComponent(session, interaction)
+	handlerDone := make(chan struct{})
+	go func() {
+		h.onComponent(session, interaction)
+		close(handlerDone)
+	}()
+	select {
+	case <-cancelEntered:
+	case <-time.After(time.Second):
+		t.Fatal("owner cancellation did not reach auth")
+	}
+	if !acknowledged.Load() {
+		t.Fatal("owner cancellation reached auth before Discord acknowledged the component")
+	}
+	cancelReleaseOnce.Do(func() { close(cancelRelease) })
 
 	select {
 	case response := <-capture.responses:
@@ -1509,9 +1586,88 @@ func TestRemotePasswordCaptchaOwnerCancelIsTerminalAndWatcherCannotOverwriteIt(t
 		t.Fatal("canceled remote watcher did not finish")
 	}
 	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		t.Fatal("owner cancellation handler did not finish")
+	}
+	if pending := len(capture.edits); pending != 0 {
+		t.Fatalf("canceled watcher emitted %d terminal overwrite edit(s)", pending)
+	}
+}
+
+// A false cancellation outcome means Riot publication/commit already owns the
+// flow. The cancel interaction must leave the edit guard non-terminal so the
+// watcher can publish that authoritative result.
+func TestRemotePasswordCaptchaCommitWonCancelLeavesWatcherAuthoritative(t *testing.T) {
+	const (
+		owner = "123456789012345678"
+		state = "550e8400-e29b-41d4-a716-446655440000"
+	)
+	session, capture := newMFAInteractionCapture(t, nil)
+	waitStarted := make(chan struct{}, 1)
+	waitRelease := make(chan struct{})
+	waitDone := make(chan struct{}, 1)
+	var releaseOnce sync.Once
+	auth := &passwordButtonAuth{
+		waitStarted:      waitStarted,
+		waitRelease:      waitRelease,
+		waitDone:         waitDone,
+		waitDisplay:      "Committed#AP1",
+		cancelNotClaimed: true,
+		cancelHook: func() {
+			releaseOnce.Do(func() { close(waitRelease) })
+			select {
+			case <-waitDone:
+			case <-time.After(time.Second):
+				t.Error("Riot waiter did not return before cancellation reported commit-owned")
+			}
+		},
+	}
+	h := &Handlers{Auth: auth}
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(waitRelease) })
+		_ = h.Shutdown(context.Background())
+	})
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "remote-cancel-after-commit",
+		AppID: "application-1",
+		Token: "remote-cancel-after-commit-token",
+		Type:  discordgo.InteractionMessageComponent,
+		Data: discordgo.MessageComponentInteractionData{
+			CustomID: passwordCaptchaCancelCustomID(owner, state),
+		},
+		User: &discordgo.User{ID: owner},
+	}}
+	h.startPasswordCaptchaWatcher(session, interaction, state, i18n.KO)
+	select {
+	case <-waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("remote watcher did not start")
+	}
+
+	h.onComponent(session, interaction)
+
+	select {
+	case response := <-capture.responses:
+		if response.Type != discordgo.InteractionResponseDeferredMessageUpdate {
+			t.Fatalf("commit-won cancel ACK type=%d", response.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("commit-won cancel was not acknowledged")
+	}
+	select {
 	case edit := <-capture.edits:
-		t.Fatalf("canceled watcher overwrote terminal cancel: %+v", edit)
-	case <-time.After(100 * time.Millisecond):
+		if !strings.Contains(edit.Content, "Committed#AP1") || len(edit.Components) != 0 {
+			t.Fatalf("authoritative watcher edit=%+v", edit)
+		}
+		if edit.Content == i18n.T(i18n.KO, "auth.captcha.cancelled") {
+			t.Fatal("commit-won cancellation overwrote the authoritative result")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("commit-won watcher did not publish its result")
+	}
+	if got := auth.cancelCalls.Load(); got != 1 {
+		t.Fatalf("commit-won cancellation calls=%d, want 1", got)
 	}
 }
 
@@ -1595,10 +1751,84 @@ func TestRemotePasswordCaptchaCancelAuthoritativeOwnerMismatchPreservesOwnerCont
 	if got := auth.cancelCalls.Load(); got != 1 || auth.cancelState != state || auth.cancelUser != owner {
 		t.Fatalf("authoritative cancellation calls=%d state=%q user=%q", got, auth.cancelState, auth.cancelUser)
 	}
+	if pending := len(capture.edits); pending != 0 {
+		t.Fatalf("stale embedded owner emitted %d edit(s) over the real owner's controls", pending)
+	}
+}
+
+// Mutation caught: enrolling the watcher before the initial relay controls are
+// confirmed can let an immediate Riot outcome race and overwrite an edit the
+// user never received. The blocked webhook makes enrollment order observable
+// without relying on goroutine scheduling delays.
+func TestRemotePasswordModalEnrollsWatcherOnlyAfterConfirmedEditResponse(t *testing.T) {
+	const (
+		owner     = "123456789012345678"
+		state     = "550e8400-e29b-41d4-a716-446655440000"
+		remoteURL = "https://relay.example.com/captcha/remote#fragment-bearer-secret"
+	)
+	session, initialEditStarted, releaseInitialEdit, initialEditResponded := newGatedInitialEditSession(t)
+	waitStarted := make(chan struct{}, 1)
+	waitRelease := make(chan struct{})
+	waitDone := make(chan struct{}, 1)
+	var waitReleaseOnce sync.Once
+	auth := &passwordButtonAuth{
+		captchaURL:   remoteURL,
+		captchaState: state,
+		waitStarted:  waitStarted,
+		waitRelease:  waitRelease,
+		waitDone:     waitDone,
+	}
+	h := &Handlers{Auth: auth}
+	t.Cleanup(func() {
+		waitReleaseOnce.Do(func() { close(waitRelease) })
+		_ = h.Shutdown(context.Background())
+	})
+	interaction := passwordModalInteractionForDeliveryTest("remote-confirmed-order")
+	interaction.User.ID = owner
+	modalDone := make(chan struct{})
+	go func() {
+		h.onModal(session, interaction)
+		close(modalDone)
+	}()
+
 	select {
-	case edit := <-capture.edits:
-		t.Fatalf("stale embedded owner overwrote the real owner's controls: %+v", edit)
-	case <-time.After(100 * time.Millisecond):
+	case <-initialEditStarted:
+	case <-time.After(time.Second):
+		t.Fatal("initial remote controls edit did not reach Discord")
+	}
+	h.captchaWatchMu.Lock()
+	_, enrolledBeforeResponse := h.captchaWatches[state]
+	h.captchaWatchMu.Unlock()
+	if enrolledBeforeResponse || auth.waits.Load() != 0 {
+		t.Fatalf("watcher enrolled before confirmed response: enrolled=%v waits=%d", enrolledBeforeResponse, auth.waits.Load())
+	}
+
+	releaseInitialEdit()
+	select {
+	case <-modalDone:
+	case <-time.After(time.Second):
+		t.Fatal("remote modal handler did not finish after confirmed edit")
+	}
+	if !initialEditResponded.Load() {
+		t.Fatal("watcher enrollment completed before the initial edit response")
+	}
+	select {
+	case <-waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("confirmed remote edit did not start its watcher")
+	}
+	h.captchaWatchMu.Lock()
+	_, enrolledAfterResponse := h.captchaWatches[state]
+	h.captchaWatchMu.Unlock()
+	if !enrolledAfterResponse || auth.waits.Load() != 1 {
+		t.Fatalf("watcher after confirmed response: enrolled=%v waits=%d", enrolledAfterResponse, auth.waits.Load())
+	}
+
+	waitReleaseOnce.Do(func() { close(waitRelease) })
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("remote watcher did not finish")
 	}
 }
 
@@ -1663,11 +1893,6 @@ func TestRemotePasswordModalStartsWatcherOnlyAfterConfirmedDelivery(t *testing.T
 		t.Fatalf("remote watcher calls=%d, want 1", got)
 	}
 	h.startPasswordCaptchaWatcher(session, interaction, state, i18n.KO)
-	select {
-	case <-waitStarted:
-		t.Fatal("duplicate remote watcher enrollment started a second waiter")
-	case <-time.After(50 * time.Millisecond):
-	}
 	if got := auth.waits.Load(); got != 1 {
 		t.Fatalf("duplicate remote watcher calls=%d, want exactly 1", got)
 	}
@@ -1785,10 +2010,11 @@ func TestRemotePasswordModalDeliveryFailurePreservesOnlyAmbiguousFlowWithoutWatc
 			if got := auth.cancelCalls.Load(); got != wantCancel {
 				t.Fatalf("remote cancellation calls=%d, want %d", got, wantCancel)
 			}
-			select {
-			case <-waitStarted:
-				t.Fatal("unconfirmed remote delivery started a watcher")
-			case <-time.After(50 * time.Millisecond):
+			h.captchaWatchMu.Lock()
+			_, watching := h.captchaWatches[state]
+			h.captchaWatchMu.Unlock()
+			if watching {
+				t.Fatal("unconfirmed remote delivery enrolled a watcher")
 			}
 			if got := auth.waits.Load(); got != 0 {
 				t.Fatalf("unconfirmed remote delivery watcher calls=%d", got)

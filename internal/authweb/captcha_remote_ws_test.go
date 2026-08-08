@@ -1555,8 +1555,8 @@ func TestRemoteCaptchaWebSocketOwnerCancelClosesConnectionStreamAndBrowser(t *te
 	case <-time.After(time.Second):
 		t.Fatal("remote stream did not start")
 	}
-	if err := fixture.server.CancelPasswordLogin(fixture.state, "discord-owner"); err != nil {
-		t.Fatal(err)
+	if canceled, err := fixture.server.CancelPasswordLogin(fixture.state, "discord-owner"); err != nil || !canceled {
+		t.Fatalf("owner cancel canceled=%v error=%v", canceled, err)
 	}
 	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
 	if _, _, err := connection.ReadMessage(); err == nil {

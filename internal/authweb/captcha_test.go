@@ -1306,8 +1306,9 @@ func TestCancelPasswordLoginIsOwnerBoundAndImmediatelyScrubsResources(t *testing
 	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CancelPasswordLogin(state, "intruder-1"); !errors.Is(err, ErrCaptchaOwner) {
-		t.Fatalf("intruder cancel error=%v, want ErrCaptchaOwner", err)
+	canceled, err := s.CancelPasswordLogin(state, "intruder-1")
+	if !errors.Is(err, ErrCaptchaOwner) || canceled {
+		t.Fatalf("intruder cancel canceled=%v error=%v, want false and ErrCaptchaOwner", canceled, err)
 	}
 	s.mu.Lock()
 	stillPending := s.passwordPending[state]
@@ -1316,8 +1317,9 @@ func TestCancelPasswordLoginIsOwnerBoundAndImmediatelyScrubsResources(t *testing
 		t.Fatal("wrong-owner cancellation scrubbed live credentials")
 	}
 
-	if err := s.CancelPasswordLogin(state, "owner-1"); err != nil {
-		t.Fatal(err)
+	canceled, err = s.CancelPasswordLogin(state, "owner-1")
+	if err != nil || !canceled {
+		t.Fatalf("owner cancel canceled=%v error=%v, want true and nil", canceled, err)
 	}
 	s.mu.Lock()
 	_, pending := s.passwordPending[state]
@@ -1332,6 +1334,64 @@ func TestCancelPasswordLoginIsOwnerBoundAndImmediatelyScrubsResources(t *testing
 	}
 	if err := s.Shutdown(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Mutation caught: reporting an idempotent/commit-owned cleanup as canceled
+// lets Discord suppress the already-authoritative Riot success or MFA result.
+func TestCancelPasswordLoginReportsFalseWhenNoLiveCleanupWasClaimed(t *testing.T) {
+	s := newCaptchaServer(&fakePasswordAuth{})
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "riot-user", "secret-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s.mu.Lock()
+	flow := s.passwordPending[state].flow
+	flow.commitClaimed = true
+	s.mu.Unlock()
+
+	canceled, err := s.CancelPasswordLogin(state, "owner-1")
+	if err != nil || canceled {
+		t.Fatalf("commit-owned cancel canceled=%v error=%v, want false and nil", canceled, err)
+	}
+	s.mu.Lock()
+	pending, ok := s.passwordPending[state]
+	s.mu.Unlock()
+	if !ok || pending.flow != flow || !flow.cleanupRequested || flow.ctx.Err() != nil {
+		t.Fatalf("commit-owned state ok=%v flowMatch=%v cleanupRequested=%v ctxErr=%v", ok, pending.flow == flow, flow.cleanupRequested, flow.ctx.Err())
+	}
+
+	s.mu.Lock()
+	flow.commitClaimed = false
+	s.mu.Unlock()
+	s.cleanupPasswordState(state)
+	canceled, err = s.CancelPasswordLogin(state, "owner-1")
+	if err != nil || canceled {
+		t.Fatalf("absent cancel canceled=%v error=%v, want false and nil", canceled, err)
+	}
+}
+
+func TestCancelPasswordLoginReportsFalseAfterOutcomePublication(t *testing.T) {
+	s := newCaptchaServer(&fakePasswordAuth{})
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "riot-user", "secret-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	flow := s.passwordPending[state].flow
+	s.mu.Unlock()
+	if _, err := s.setPasswordOutcome(state, flow, passwordOutcome{display: "Published#AP1"}); err != nil {
+		t.Fatal(err)
+	}
+
+	canceled, err := s.CancelPasswordLogin(state, "owner-1")
+	if err != nil || canceled {
+		t.Fatalf("published-outcome cancel canceled=%v error=%v, want false and nil", canceled, err)
+	}
+	display, mfaState, _, err := s.WaitPasswordLogin(context.Background(), state)
+	if err != nil || display != "Published#AP1" || mfaState != "" {
+		t.Fatalf("authoritative wait display=%q mfaState=%q error=%v", display, mfaState, err)
 	}
 }
 

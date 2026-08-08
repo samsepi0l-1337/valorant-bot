@@ -19,6 +19,7 @@ type AuthStarter interface {
 	// button flow.
 	BeginPasswordLogin(ctx context.Context, discordUserID, username, password string) (captchaURL, state string, err error)
 	LaunchPasswordCaptcha(ctx context.Context, state, discordUserID string) error
+	CancelPasswordLogin(state, discordUserID string) (canceled bool, err error)
 	WaitPasswordLogin(ctx context.Context, state string) (displayName, mfaState, mfaHint string, err error)
 	ValidatePasswordMFA(mfaState, discordUserID string) (hint string, err error)
 	CancelPasswordMFA(mfaState, discordUserID string) error

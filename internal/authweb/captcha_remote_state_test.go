@@ -360,8 +360,8 @@ func TestRemoteCaptchaCancellationAndTerminalOutcomeRemoveViewerState(t *testing
 				if _, err := s.setPasswordOutcome(state, flow, passwordOutcome{err: errors.New("terminal")}); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := s.CancelPasswordLogin(state, "discord-owner"); err != nil {
-				t.Fatal(err)
+			} else if canceled, err := s.CancelPasswordLogin(state, "discord-owner"); err != nil || !canceled {
+				t.Fatalf("owner cancel canceled=%v error=%v", canceled, err)
 			}
 			if _, err := s.lookupRemoteCaptchaViewer(rawSession); !errors.Is(err, errRemoteCaptchaUnavailable) {
 				t.Fatalf("viewer survived terminal transition: %v", err)

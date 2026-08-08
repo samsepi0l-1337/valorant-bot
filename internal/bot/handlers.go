@@ -380,10 +380,6 @@ func (h *Handlers) handlePasswordCaptchaLaunch(ctx context.Context, state, disco
 	return Response{Ephemeral: true, Content: fmt.Sprintf(i18n.T(lang, "auth.captcha.launch_failed"), err), Components: []discordgo.MessageComponent{}}, false, nil
 }
 
-type passwordLoginCanceler interface {
-	CancelPasswordLogin(state, discordUserID string) error
-}
-
 type qrAuthCanceler interface {
 	CancelQRAuth(state, discordUserID string) error
 }
@@ -399,17 +395,16 @@ func (h *Handlers) cancelQRAuth(state, discordUserID string) {
 }
 
 func (h *Handlers) cancelPasswordLogin(state, discordUserID string) {
-	if err := h.cancelPasswordLoginOwned(state, discordUserID); err != nil && !errors.Is(err, authweb.ErrCaptchaOwner) {
+	if _, err := h.cancelPasswordLoginOwned(state, discordUserID); err != nil && !errors.Is(err, authweb.ErrCaptchaOwner) {
 		log.Printf("interaction: cancel password state: %s", discordRESTErrorLog(err))
 	}
 }
 
-func (h *Handlers) cancelPasswordLoginOwned(state, discordUserID string) error {
-	canceler, ok := h.Auth.(passwordLoginCanceler)
-	if !ok {
-		return fmt.Errorf("password auth cancellation not configured")
+func (h *Handlers) cancelPasswordLoginOwned(state, discordUserID string) (bool, error) {
+	if h.Auth == nil {
+		return false, fmt.Errorf("password auth cancellation not configured")
 	}
-	return canceler.CancelPasswordLogin(state, discordUserID)
+	return h.Auth.CancelPasswordLogin(state, discordUserID)
 }
 
 func (h *Handlers) cancelPasswordMFA(mfaState, discordUserID string) bool {

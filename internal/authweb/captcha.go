@@ -192,24 +192,30 @@ func (s *Server) LaunchPasswordCaptcha(ctx context.Context, state, discordUserID
 
 // CancelPasswordLogin immediately seals an owner-bound password flow, scrubs
 // retained credentials, closes its owned browser, and cancels any Riot captcha
-// session. It is idempotent after the state has already reached a terminal path.
-func (s *Server) CancelPasswordLogin(state, discordUserID string) error {
+// session. canceled is true only when this call claimed that live cleanup; an
+// absent, terminal, or commit-owned flow returns false so its waiter remains
+// authoritative for the final Discord result.
+func (s *Server) CancelPasswordLogin(state, discordUserID string) (canceled bool, err error) {
 	state = strings.TrimSpace(state)
 	discordUserID = strings.TrimSpace(discordUserID)
 	s.mu.Lock()
 	pending, ok := s.passwordPending[state]
 	if !ok {
 		s.mu.Unlock()
-		return nil
+		return false, nil
 	}
 	if pending.discordUserID != discordUserID {
 		s.mu.Unlock()
-		return ErrCaptchaOwner
+		return false, ErrCaptchaOwner
+	}
+	if outcome, exists := s.passwordOutcomes[state]; exists && outcome.done {
+		s.mu.Unlock()
+		return false, nil
 	}
 	cleanup := s.claimPasswordStateCleanupLocked(state)
 	s.mu.Unlock()
 	s.finishPasswordStateCleanup(cleanup)
-	return nil
+	return cleanup.claimed, nil
 }
 
 // WaitPasswordLogin blocks until the captcha page completes (success, MFA, or terminal error).

@@ -96,11 +96,11 @@ func (f *fakeAuth) LaunchPasswordCaptcha(ctx context.Context, state, discordUser
 	return f.launchErr
 }
 
-func (f *fakeAuth) CancelPasswordLogin(state, discordUserID string) error {
+func (f *fakeAuth) CancelPasswordLogin(state, discordUserID string) (bool, error) {
 	f.cancels++
 	f.cancelState = state
 	f.cancelUser = discordUserID
-	return f.cancelErr
+	return true, f.cancelErr
 }
 
 func (f *fakeAuth) CompletePasswordMFA(ctx context.Context, mfaState, discordUserID, code string) (string, error) {
