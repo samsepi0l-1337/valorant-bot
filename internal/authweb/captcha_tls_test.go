@@ -286,7 +286,20 @@ func TestStartChromeLoggedWiresOfficialDevToolsThroughPrivatePipe(t *testing.T) 
 	if controller.devToolsPipe == nil {
 		t.Fatal("official Chrome controller has no private DevTools pipe")
 	}
-	client := &chromeDevToolsClient{conn: controller.devToolsPipe}
+	if controller.devToolsClient == nil {
+		t.Fatal("official Chrome controller does not own its generation's DevTools client")
+	}
+	client, err := controller.chromeDevToolsClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondClient, err := controller.chromeDevToolsClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client != controller.devToolsClient || secondClient != client {
+		t.Fatal("official Chrome controller constructed more than one DevTools client")
+	}
 	var version struct {
 		Product string `json:"product"`
 	}
@@ -666,6 +679,9 @@ func TestChromeLaunchHelperProcess(t *testing.T) {
 				os.Exit(24)
 			}
 			if command.Method == "Browser.close" {
+				if err := pipe.WriteJSON(map[string]any{"id": command.ID, "result": map[string]any{}}); err != nil {
+					os.Exit(25)
+				}
 				return
 			}
 			if err := pipe.WriteJSON(map[string]any{

@@ -50,7 +50,10 @@ func (c *chromeBrowserController) RunRiotLogin(ctx context.Context, username, pa
 	if c.devToolsPipe == nil {
 		return riotBrowserLoginResult{}, errors.New("official Riot login requires a private Chrome DevTools pipe")
 	}
-	client := newChromeDevToolsClient(c.devToolsPipe)
+	client, err := c.chromeDevToolsClient()
+	if err != nil {
+		return riotBrowserLoginResult{}, err
+	}
 	if err := client.attachRiotPage(ctx); err != nil {
 		return riotBrowserLoginResult{}, err
 	}

@@ -28,16 +28,17 @@ const (
 )
 
 var (
-	errRemoteCaptchaFrameInvalid  = errors.New("remote CAPTCHA frame is invalid")
-	errRemoteCaptchaFrameTooLarge = errors.New("remote CAPTCHA frame exceeds 2 MiB")
-	errRemoteCaptchaInputInvalid  = errors.New("remote CAPTCHA input is invalid")
-	errRemoteCaptchaInputRate     = errors.New("remote CAPTCHA input rate exceeded")
-	errRemoteCaptchaInputBusy     = errors.New("remote CAPTCHA input queue is full")
+	errRemoteCaptchaFrameInvalid     = errors.New("remote CAPTCHA frame is invalid")
+	errRemoteCaptchaFrameTooLarge    = errors.New("remote CAPTCHA frame exceeds 2 MiB")
+	errRemoteCaptchaInputInvalid     = errors.New("remote CAPTCHA input is invalid")
+	errRemoteCaptchaInputRate        = errors.New("remote CAPTCHA input rate exceeded")
+	errRemoteCaptchaInputBusy        = errors.New("remote CAPTCHA input queue is full")
+	errRemoteCaptchaLifetimeRequired = errors.New("remote CAPTCHA requires all owner lifetimes")
 )
 
 type remoteCaptchaScreencastFrame struct {
-	Data      string `json:"data"`
-	SessionID int64  `json:"sessionId"`
+	Data      json.RawMessage `json:"data"`
+	SessionID int64           `json:"sessionId"`
 }
 
 type remoteCaptchaInputMessage struct {
@@ -71,31 +72,45 @@ type remoteCaptchaInputLimiter struct {
 }
 
 type remoteCaptchaStream struct {
-	client       *chromeDevToolsClient
-	subscription *chromeDevToolsEventSubscription
-	ctx          context.Context
-	cancel       context.CancelFunc
-	parentStops  []func() bool
-	done         chan struct{}
-	frames       chan []byte
-	inputLimiter *remoteCaptchaInputLimiter
-	inputSlots   chan struct{}
+	client         *chromeDevToolsClient
+	subscription   *chromeDevToolsEventSubscription
+	ctx            context.Context
+	cancel         context.CancelFunc
+	parentStops    []func() bool
+	done           chan struct{}
+	frames         chan []byte
+	inputLimiter   *remoteCaptchaInputLimiter
+	inputSlots     chan struct{}
+	commandTimeout time.Duration
 
 	mu             sync.Mutex
 	terminal       error
+	stopErr        error
 	closeRequested bool
 	closeOnce      sync.Once
+	finishOnce     sync.Once
 }
 
-func newRemoteCaptchaStream(client *chromeDevToolsClient, sessionID string, lifetimes ...context.Context) (*remoteCaptchaStream, error) {
+func (c *chromeBrowserController) StartRemoteCaptchaStream(flowCtx, chromeCtx, viewerCtx, shutdownCtx context.Context) (*remoteCaptchaStream, error) {
+	client, err := c.chromeDevToolsClient()
+	if err != nil {
+		return nil, err
+	}
+	return newRemoteCaptchaStream(client, client.currentSessionID(), flowCtx, chromeCtx, viewerCtx, shutdownCtx)
+}
+
+func newRemoteCaptchaStream(client *chromeDevToolsClient, sessionID string, flowCtx, chromeCtx, viewerCtx, shutdownCtx context.Context) (*remoteCaptchaStream, error) {
 	if client == nil {
 		return nil, errChromeDevToolsClientClosed
+	}
+	if flowCtx == nil || chromeCtx == nil || viewerCtx == nil || shutdownCtx == nil {
+		return nil, errRemoteCaptchaLifetimeRequired
 	}
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" || sessionID != client.currentSessionID() {
 		return nil, errors.New("remote CAPTCHA Chrome session is unavailable")
 	}
-	ctx, cancel, parentStops := remoteCaptchaLifetimeContext(lifetimes...)
+	ctx, cancel, parentStops := remoteCaptchaLifetimeContext(flowCtx, chromeCtx, viewerCtx, shutdownCtx)
 	if err := ctx.Err(); err != nil {
 		cancel()
 		stopRemoteCaptchaParentWatches(parentStops)
@@ -120,27 +135,26 @@ func newRemoteCaptchaStream(client *chromeDevToolsClient, sessionID string, life
 		return nil, fmt.Errorf("start remote CAPTCHA screencast: %w", err)
 	}
 	stream := &remoteCaptchaStream{
-		client:       client,
-		subscription: subscription,
-		ctx:          ctx,
-		cancel:       cancel,
-		parentStops:  parentStops,
-		done:         make(chan struct{}),
-		frames:       make(chan []byte, 1),
-		inputLimiter: newRemoteCaptchaInputLimiter(time.Now),
-		inputSlots:   make(chan struct{}, remoteCaptchaMaxOutstandingInput),
+		client:         client,
+		subscription:   subscription,
+		ctx:            ctx,
+		cancel:         cancel,
+		parentStops:    parentStops,
+		done:           make(chan struct{}),
+		frames:         make(chan []byte, 1),
+		inputLimiter:   newRemoteCaptchaInputLimiter(time.Now),
+		inputSlots:     make(chan struct{}, remoteCaptchaMaxOutstandingInput),
+		commandTimeout: remoteCaptchaCommandTimeout,
 	}
 	go stream.run()
 	return stream, nil
 }
 
-func remoteCaptchaLifetimeContext(parents ...context.Context) (context.Context, context.CancelFunc, []func() bool) {
+func remoteCaptchaLifetimeContext(flowCtx, chromeCtx, viewerCtx, shutdownCtx context.Context) (context.Context, context.CancelFunc, []func() bool) {
 	ctx, cancel := context.WithCancel(context.Background())
+	parents := [4]context.Context{flowCtx, chromeCtx, viewerCtx, shutdownCtx}
 	stops := make([]func() bool, 0, len(parents))
 	for _, parent := range parents {
-		if parent == nil {
-			continue
-		}
 		if parent.Err() != nil {
 			cancel()
 			continue
@@ -166,25 +180,33 @@ func (s *remoteCaptchaStream) run() {
 		}
 		terminal = s.handleScreencastFrame(event)
 	}
-	stopCtx, stopCancel := context.WithTimeout(context.Background(), remoteCaptchaCommandTimeout)
+	commandTimeout := s.commandTimeout
+	if commandTimeout <= 0 {
+		commandTimeout = remoteCaptchaCommandTimeout
+	}
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), commandTimeout)
 	stopErr := s.client.Call(stopCtx, "Page.stopScreencast", map[string]any{}, nil)
 	stopCancel()
-	if terminal == nil {
-		terminal = stopErr
-	}
-	s.subscription.Close()
-	stopRemoteCaptchaParentWatches(s.parentStops)
-	s.cancel()
-	s.mu.Lock()
-	s.terminal = terminal
-	s.mu.Unlock()
-	close(s.frames)
-	close(s.done)
+	s.finish(terminal, stopErr)
+}
+
+func (s *remoteCaptchaStream) finish(terminal, stopErr error) {
+	s.finishOnce.Do(func() {
+		s.subscription.Close()
+		stopRemoteCaptchaParentWatches(s.parentStops)
+		s.cancel()
+		s.mu.Lock()
+		s.stopErr = stopErr
+		s.terminal = errors.Join(terminal, stopErr)
+		s.mu.Unlock()
+		close(s.frames)
+		close(s.done)
+	})
 }
 
 func (s *remoteCaptchaStream) handleScreencastFrame(event chromeDevToolsMessage) error {
 	var params remoteCaptchaScreencastFrame
-	if err := json.Unmarshal(event.Params, &params); err != nil || params.SessionID <= 0 || params.Data == "" {
+	if err := json.Unmarshal(event.Params, &params); err != nil || params.SessionID <= 0 {
 		return errRemoteCaptchaFrameInvalid
 	}
 	if err := s.client.Call(s.ctx, "Page.screencastFrameAck", map[string]any{
@@ -192,7 +214,11 @@ func (s *remoteCaptchaStream) handleScreencastFrame(event chromeDevToolsMessage)
 	}, nil); err != nil {
 		return fmt.Errorf("acknowledge remote CAPTCHA frame: %w", err)
 	}
-	frame, err := decodeRemoteCaptchaFrame(params.Data)
+	var encoded string
+	if err := json.Unmarshal(params.Data, &encoded); err != nil || encoded == "" {
+		return errRemoteCaptchaFrameInvalid
+	}
+	frame, err := decodeRemoteCaptchaFrame(encoded)
 	if err != nil {
 		return err
 	}
@@ -297,6 +323,9 @@ func decodeRemoteCaptchaInput(payload []byte) (remoteCaptchaInputMessage, error)
 	if len(payload) == 0 || len(payload) > remoteCaptchaMaxInputPayloadSize {
 		return remoteCaptchaInputMessage{}, errRemoteCaptchaInputInvalid
 	}
+	if !validRemoteCaptchaJSONObject(payload) {
+		return remoteCaptchaInputMessage{}, errRemoteCaptchaInputInvalid
+	}
 	decoder := json.NewDecoder(bytes.NewReader(payload))
 	decoder.DisallowUnknownFields()
 	var input remoteCaptchaInputMessage
@@ -309,17 +338,45 @@ func decodeRemoteCaptchaInput(payload []byte) (remoteCaptchaInputMessage, error)
 	return input, nil
 }
 
+func validRemoteCaptchaJSONObject(payload []byte) bool {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	first, err := decoder.Token()
+	if err != nil || first != json.Delim('{') {
+		return false
+	}
+	seen := make(map[string]struct{})
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok {
+			return false
+		}
+		switch key {
+		case "type", "phase", "x", "y", "width", "height", "button", "deltaY":
+		default:
+			return false
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return false
+		}
+		seen[key] = struct{}{}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return false
+		}
+	}
+	last, err := decoder.Token()
+	if err != nil || last != json.Delim('}') {
+		return false
+	}
+	return errors.Is(decoder.Decode(&struct{}{}), io.EOF)
+}
+
 func validateRemoteCaptchaInput(input remoteCaptchaInputMessage) (*remoteCaptchaMouseEvent, error) {
 	if !validRemoteCaptchaViewportMetadata(input.Width, input.Height) {
 		return nil, errRemoteCaptchaInputInvalid
 	}
 	switch input.Type {
-	case "viewport":
-		if input.Phase != "" || input.X != nil || input.Y != nil || input.Button != nil || input.DeltaY != nil ||
-			input.Width == nil || input.Height == nil {
-			return nil, errRemoteCaptchaInputInvalid
-		}
-		return nil, nil
 	case "pointer":
 		if input.X == nil || input.Y == nil || input.Button == nil || *input.Button != 0 || input.DeltaY != nil ||
 			!finiteRemoteCaptchaNumber(*input.X) || !finiteRemoteCaptchaNumber(*input.Y) {
@@ -439,18 +496,29 @@ func (s *remoteCaptchaStream) Close(ctx context.Context) error {
 		s.mu.Unlock()
 		s.cancel()
 	})
-	if err := ctx.Err(); err != nil {
-		return err
+	select {
+	case <-s.done:
+		return s.closeResult()
+	default:
 	}
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		select {
+		case <-s.done:
+			return s.closeResult()
+		default:
+			return ctx.Err()
+		}
 	case <-s.done:
 	}
+	return s.closeResult()
+}
+
+func (s *remoteCaptchaStream) closeResult() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closeRequested && errors.Is(s.terminal, context.Canceled) {
-		return nil
+		return s.stopErr
 	}
 	return s.terminal
 }

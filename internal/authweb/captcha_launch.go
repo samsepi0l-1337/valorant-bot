@@ -60,6 +60,8 @@ func (e *captchaBrowserCloseError) Unwrap() error {
 type chromeBrowserController struct {
 	cmd              *exec.Cmd
 	devToolsPipe     *chromeDevToolsPipe
+	devToolsClientMu sync.Mutex
+	devToolsClient   *chromeDevToolsClient
 	processOwner     *captchaProcessOwnership
 	ownerUsesSeams   bool
 	profileRoot      string
@@ -261,6 +263,9 @@ func startChromeLoggedWithRemove(cmd *exec.Cmd, profileRoot, profileDir string, 
 		return cleanupFailedChromeLaunch(controller, fmt.Errorf("start chrome: %w", err))
 	}
 	pipeSetup.closeChildEnds()
+	if controller.devToolsPipe != nil {
+		controller.devToolsClient = newChromeDevToolsClient(controller.devToolsPipe)
+	}
 	controller.processOwner = completeCaptchaProcessOwnership(preparedOwner, cmd.Process, controller.exited)
 
 	go func() {
@@ -283,6 +288,18 @@ func startChromeLoggedWithRemove(cmd *exec.Cmd, profileRoot, profileDir string, 
 	case <-timer.C:
 		return controller, nil
 	}
+}
+
+func (c *chromeBrowserController) chromeDevToolsClient() (*chromeDevToolsClient, error) {
+	if c == nil || c.devToolsPipe == nil {
+		return nil, errors.New("private Chrome DevTools pipe is unavailable")
+	}
+	c.devToolsClientMu.Lock()
+	defer c.devToolsClientMu.Unlock()
+	if c.devToolsClient == nil {
+		c.devToolsClient = newChromeDevToolsClient(c.devToolsPipe)
+	}
+	return c.devToolsClient, nil
 }
 
 func cleanupFailedChromeLaunch(controller *chromeBrowserController, launchErr error) (captchaBrowserController, error) {
@@ -390,16 +407,11 @@ func (c *chromeBrowserController) closeViaPrivateDevTools(ctx context.Context) e
 	if c == nil || c.devToolsPipe == nil {
 		return errors.New("private Chrome DevTools pipe is unavailable")
 	}
-	done := make(chan error, 1)
-	go func() {
-		done <- c.devToolsPipe.WriteJSON(map[string]any{"id": 1, "method": "Browser.close"})
-	}()
-	select {
-	case err := <-done:
+	client, err := c.chromeDevToolsClient()
+	if err != nil {
 		return err
-	case <-ctx.Done():
-		return ctx.Err()
 	}
+	return client.Call(ctx, "Browser.close", map[string]any{}, nil)
 }
 
 func (c *chromeBrowserController) ownedProcessOwnership() *captchaProcessOwnership {

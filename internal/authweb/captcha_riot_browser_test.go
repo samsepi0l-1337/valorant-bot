@@ -140,6 +140,10 @@ func TestRiotBrowserRunsOfficialLoginInOneBrowserSession(t *testing.T) {
 	}()
 
 	controller := &chromeBrowserController{profileDir: "private-profile", devToolsPipe: host}
+	ownedClient, err := controller.chromeDevToolsClient()
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	result, err := controller.RunRiotLogin(ctx, "browser-user", "browser-password")
@@ -195,6 +199,12 @@ func TestRiotBrowserRunsOfficialLoginInOneBrowserSession(t *testing.T) {
 	}
 	if result.UserAgent != "official-browser/1" || len(result.Cookies) != 1 || result.Cookies[0].Value != "browser-session" {
 		t.Fatalf("browser result = %+v", result)
+	}
+	ownedClient.mu.Lock()
+	ownedCalls := ownedClient.nextID
+	ownedClient.mu.Unlock()
+	if controller.devToolsClient != ownedClient || ownedCalls == 0 {
+		t.Fatal("Riot login did not reuse the controller-owned DevTools client")
 	}
 }
 
@@ -606,6 +616,84 @@ func TestRiotBrowserControllerCloseUnblocksPrivatePipeWhenOwnedProcessSurvives(t
 		}
 	case <-time.After(250 * time.Millisecond):
 		t.Fatal("controller retained the private pipe after process termination failed")
+	}
+}
+
+func TestChromeBrowserControllerCloseUsesOwnedDevToolsClientSequence(t *testing.T) {
+	root := t.TempDir()
+	profileDir := filepath.Join(root, strings.Repeat("c", 32))
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	host, browser := newTestChromeDevToolsPipes()
+	t.Cleanup(func() {
+		_ = host.Close()
+		_ = browser.Close()
+	})
+	processExited := make(chan struct{})
+	owner := trackCaptchaProcessOwnership(
+		func(timeout time.Duration) bool {
+			if timeout <= 0 {
+				select {
+				case <-processExited:
+					return true
+				default:
+					return false
+				}
+			}
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			select {
+			case <-processExited:
+				return true
+			case <-timer.C:
+				return false
+			}
+		},
+		func(func(time.Duration) bool) error { return errors.New("unexpected process termination") },
+	)
+	controller := &chromeBrowserController{
+		devToolsPipe: host,
+		processOwner: owner,
+		profileRoot:  root,
+		profileDir:   profileDir,
+		exited:       processExited,
+		removeProfile: func(string, string) error {
+			return nil
+		},
+	}
+	client, err := controller.chromeDevToolsClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	versionDone := make(chan error, 1)
+	go func() {
+		versionDone <- client.Call(context.Background(), "Browser.getVersion", map[string]any{}, nil)
+	}()
+	version := nextRemoteCaptchaTestCommand(t, browser)
+	if version.ID != 1 || version.Method != "Browser.getVersion" {
+		t.Fatalf("first command=%+v", version)
+	}
+	replyRemoteCaptchaTestCommand(t, browser, version.ID)
+	if err := <-versionDone; err != nil {
+		t.Fatal(err)
+	}
+
+	closed := make(chan error, 1)
+	go func() { closed <- controller.Close() }()
+	closeCommand := nextRemoteCaptchaTestCommand(t, browser)
+	if closeCommand.ID != 2 || closeCommand.Method != "Browser.close" {
+		t.Fatalf("close command=%+v, want owned-client sequence ID 2", closeCommand)
+	}
+	replyRemoteCaptchaTestCommand(t, browser, closeCommand.ID)
+	close(processExited)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("controller close did not finish")
 	}
 }
 

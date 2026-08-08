@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -71,8 +72,10 @@ func startRemoteCaptchaTestStream(t *testing.T, client *chromeDevToolsClient, br
 		err    error
 	}
 	done := make(chan result, 1)
+	owners := [4]context.Context{context.Background(), context.Background(), context.Background(), context.Background()}
+	copy(owners[:], lifetimes)
 	go func() {
-		stream, err := newRemoteCaptchaStream(client, client.currentSessionID(), lifetimes...)
+		stream, err := newRemoteCaptchaStream(client, client.currentSessionID(), owners[0], owners[1], owners[2], owners[3])
 		done <- result{stream: stream, err: err}
 	}()
 	start := nextRemoteCaptchaTestCommand(t, browser)
@@ -88,6 +91,34 @@ func startRemoteCaptchaTestStream(t *testing.T, client *chromeDevToolsClient, br
 		return result.stream
 	case <-time.After(time.Second):
 		t.Fatal("remote CAPTCHA stream did not start")
+		return nil
+	}
+}
+
+func startRemoteCaptchaControllerTestStream(t *testing.T, controller *chromeBrowserController, browser *chromeDevToolsPipe, owners [4]context.Context) *remoteCaptchaStream {
+	t.Helper()
+	type result struct {
+		stream *remoteCaptchaStream
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		stream, err := controller.StartRemoteCaptchaStream(owners[0], owners[1], owners[2], owners[3])
+		done <- result{stream: stream, err: err}
+	}()
+	start := nextRemoteCaptchaTestCommand(t, browser)
+	if start.Method != "Page.startScreencast" {
+		t.Fatalf("first controller stream command=%q, want Page.startScreencast", start.Method)
+	}
+	replyRemoteCaptchaTestCommand(t, browser, start.ID)
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		return result.stream
+	case <-time.After(time.Second):
+		t.Fatal("controller remote CAPTCHA stream did not start")
 		return nil
 	}
 }
@@ -128,7 +159,7 @@ func TestRemoteCaptchaStreamStartsJPEGAndStopsOnClose(t *testing.T) {
 	}
 	started := make(chan startResult, 1)
 	go func() {
-		stream, err := newRemoteCaptchaStream(client, "riot-session", context.Background())
+		stream, err := newRemoteCaptchaStream(client, "riot-session", context.Background(), context.Background(), context.Background(), context.Background())
 		started <- startResult{stream: stream, err: err}
 	}()
 
@@ -160,6 +191,71 @@ func TestRemoteCaptchaStreamStartsJPEGAndStopsOnClose(t *testing.T) {
 	}
 }
 
+func TestRemoteCaptchaStreamControllerOwnsSharedClientAndRequiresFourLifetimes(t *testing.T) {
+	t.Run("shared controller client", func(t *testing.T) {
+		host, browser := newTestChromeDevToolsPipes()
+		t.Cleanup(func() {
+			_ = host.Close()
+			_ = browser.Close()
+		})
+		controller := &chromeBrowserController{profileDir: "private-profile", devToolsPipe: host}
+		ownedClient, err := controller.chromeDevToolsClient()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ownedClient.setSessionID("riot-session")
+		type startResult struct {
+			stream *remoteCaptchaStream
+			err    error
+		}
+		started := make(chan startResult, 1)
+		go func() {
+			stream, startErr := controller.StartRemoteCaptchaStream(
+				context.Background(), context.Background(), context.Background(), context.Background(),
+			)
+			started <- startResult{stream: stream, err: startErr}
+		}()
+		start := nextRemoteCaptchaTestCommand(t, browser)
+		if start.Method != "Page.startScreencast" {
+			t.Fatalf("controller start method=%q", start.Method)
+		}
+		replyRemoteCaptchaTestCommand(t, browser, start.ID)
+		startedResult := <-started
+		if startedResult.err != nil {
+			t.Fatal(startedResult.err)
+		}
+		if startedResult.stream.client != ownedClient || controller.devToolsClient != ownedClient {
+			t.Fatal("controller and remote stream did not reuse one owned DevTools client")
+		}
+		closeRemoteCaptchaTestStream(t, startedResult.stream, browser)
+	})
+
+	for missing, name := range []string{"password flow", "Chrome process", "viewer session", "server shutdown"} {
+		t.Run("reject nil "+name, func(t *testing.T) {
+			host, browser := newTestChromeDevToolsPipes()
+			t.Cleanup(func() {
+				_ = host.Close()
+				_ = browser.Close()
+			})
+			controller := &chromeBrowserController{profileDir: "private-profile", devToolsPipe: host}
+			client, err := controller.chromeDevToolsClient()
+			if err != nil {
+				t.Fatal(err)
+			}
+			client.setSessionID("riot-session")
+			contexts := []context.Context{context.Background(), context.Background(), context.Background(), context.Background()}
+			contexts[missing] = nil
+			stream, err := controller.StartRemoteCaptchaStream(contexts[0], contexts[1], contexts[2], contexts[3])
+			if stream != nil || !errors.Is(err, errRemoteCaptchaLifetimeRequired) {
+				if stream != nil {
+					_ = stream.Close(context.Background())
+				}
+				t.Fatalf("stream=%p error=%v, want required-lifetime rejection", stream, err)
+			}
+		})
+	}
+}
+
 func TestRemoteCaptchaStreamSubscribesBeforeStartAndAcknowledgesFirstFrame(t *testing.T) {
 	host, browser := newTestChromeDevToolsPipes()
 	t.Cleanup(func() {
@@ -175,7 +271,7 @@ func TestRemoteCaptchaStreamSubscribesBeforeStartAndAcknowledgesFirstFrame(t *te
 	}
 	started := make(chan startResult, 1)
 	go func() {
-		stream, err := newRemoteCaptchaStream(client, "riot-session", context.Background())
+		stream, err := newRemoteCaptchaStream(client, "riot-session", context.Background(), context.Background(), context.Background(), context.Background())
 		started <- startResult{stream: stream, err: err}
 	}()
 	start := nextRemoteCaptchaTestCommand(t, browser)
@@ -390,6 +486,27 @@ func TestRemoteCaptchaStreamRejectsMalformedOrUnsupportedInput(t *testing.T) {
 	closeRemoteCaptchaTestStream(t, stream, browser)
 }
 
+func TestRemoteCaptchaStreamRejectsDuplicateTrailingAndNullJSON(t *testing.T) {
+	for _, payload := range []string{
+		`{"type":"keyboard","type":"pointer","phase":"move","x":1,"y":2,"button":0}`,
+		`{"type":"pointer","phase":"down","x":1,"y":2,"button":1,"button":0}`,
+		`{"type":"keyboard","Type":"pointer","phase":"move","x":1,"y":2,"button":0}`,
+		`{"type":"pointer","phase":"down","x":1,"y":2,"button":1,"Button":0}`,
+		`{"type":"pointer","phase":"move","x":1,"y":2,"button":0,"width":null,"height":null}`,
+		`{"type":null,"phase":"move","x":1,"y":2,"button":0}`,
+		`null`,
+		`{"type":"pointer","phase":"move","x":1,"y":2,"button":0} {}`,
+	} {
+		input, err := decodeRemoteCaptchaInput([]byte(payload))
+		if err == nil {
+			_, err = validateRemoteCaptchaInput(input)
+		}
+		if !errors.Is(err, errRemoteCaptchaInputInvalid) {
+			t.Fatalf("payload %q error=%v, want strict JSON rejection", payload, err)
+		}
+	}
+}
+
 func TestRemoteCaptchaStreamRejectsNonFiniteInputValues(t *testing.T) {
 	for _, value := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
 		input := remoteCaptchaInputMessage{Type: "pointer", Phase: "move", X: &value, Y: float64Pointer(1), Button: intPointer(0)}
@@ -490,15 +607,19 @@ func TestRemoteCaptchaStreamStopsWhenAnyOwnedLifetimeEnds(t *testing.T) {
 				_ = host.Close()
 				_ = browser.Close()
 			})
-			client := newChromeDevToolsClient(host)
+			controller := &chromeBrowserController{profileDir: "private-profile", devToolsPipe: host}
+			client, err := controller.chromeDevToolsClient()
+			if err != nil {
+				t.Fatal(err)
+			}
 			client.setSessionID("riot-session")
-			lifetimes := make([]context.Context, 4)
+			lifetimes := [4]context.Context{}
 			cancels := make([]context.CancelFunc, 4)
 			for index := range lifetimes {
 				lifetimes[index], cancels[index] = context.WithCancel(context.Background())
 				defer cancels[index]()
 			}
-			stream := startRemoteCaptchaTestStream(t, client, browser, lifetimes...)
+			stream := startRemoteCaptchaControllerTestStream(t, controller, browser, lifetimes)
 			cancels[canceledIndex]()
 			stop := nextRemoteCaptchaTestCommand(t, browser)
 			if stop.Method != "Page.stopScreencast" {
@@ -563,6 +684,127 @@ func TestRemoteCaptchaStreamStopsOnSubscriptionOrClientTermination(t *testing.T)
 	})
 }
 
+func TestRemoteCaptchaStreamConcurrentClosePreservesOneStopFailure(t *testing.T) {
+	host, browser := newTestChromeDevToolsPipes()
+	t.Cleanup(func() {
+		_ = host.Close()
+		_ = browser.Close()
+	})
+	client := newChromeDevToolsClient(host)
+	client.setSessionID("riot-session")
+	stream := startRemoteCaptchaTestStream(t, client, browser, context.Background())
+
+	const callers = 12
+	results := make(chan error, callers)
+	for range callers {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			results <- stream.Close(ctx)
+		}()
+	}
+	stop := nextRemoteCaptchaTestCommand(t, browser)
+	if stop.Method != "Page.stopScreencast" {
+		t.Fatalf("close command=%q, want Page.stopScreencast", stop.Method)
+	}
+	if err := browser.WriteJSON(map[string]any{
+		"id": stop.ID, "error": map[string]any{"message": "stop rejected"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for range callers {
+		select {
+		case err := <-results:
+			if err == nil || !strings.Contains(err.Error(), "stop rejected") {
+				t.Fatalf("concurrent Close error=%v, want preserved stop failure", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("concurrent Close did not terminate")
+		}
+	}
+	client.mu.Lock()
+	commands := client.nextID
+	client.mu.Unlock()
+	if commands != 2 {
+		t.Fatalf("DevTools command count=%d, want start plus exactly one stop", commands)
+	}
+	if _, ok := <-stream.Frames(); ok {
+		t.Fatal("frame channel remained open after terminal cleanup")
+	}
+	if err := stream.Err(); err == nil || !strings.Contains(err.Error(), "stop rejected") {
+		t.Fatalf("terminal error=%v, want joined stop failure", err)
+	}
+}
+
+func TestRemoteCaptchaStreamClosePreservesStopTimeout(t *testing.T) {
+	host, browser := newTestChromeDevToolsPipes()
+	t.Cleanup(func() {
+		_ = host.Close()
+		_ = browser.Close()
+	})
+	client := newChromeDevToolsClient(host)
+	client.setSessionID("riot-session")
+	stream := startRemoteCaptchaTestStream(t, client, browser, context.Background())
+	stream.commandTimeout = 10 * time.Millisecond
+
+	result := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		result <- stream.Close(ctx)
+	}()
+	stop := nextRemoteCaptchaTestCommand(t, browser)
+	if stop.Method != "Page.stopScreencast" {
+		t.Fatalf("close command=%q, want Page.stopScreencast", stop.Method)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Close error=%v, want stop timeout", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not return after bounded stop timeout")
+	}
+	if !errors.Is(stream.Err(), context.DeadlineExceeded) {
+		t.Fatalf("terminal error=%v, want joined stop timeout", stream.Err())
+	}
+}
+
+func TestRemoteCaptchaStreamCompletedStopFailureOutranksCanceledCloseContext(t *testing.T) {
+	host, browser := newTestChromeDevToolsPipes()
+	t.Cleanup(func() {
+		_ = host.Close()
+		_ = browser.Close()
+	})
+	client := newChromeDevToolsClient(host)
+	client.setSessionID("riot-session")
+	ownerCtx, cancelOwner := context.WithCancel(context.Background())
+	stream := startRemoteCaptchaTestStream(t, client, browser, ownerCtx)
+
+	cancelOwner()
+	stop := nextRemoteCaptchaTestCommand(t, browser)
+	if stop.Method != "Page.stopScreencast" {
+		t.Fatalf("owner cancellation command=%q, want Page.stopScreencast", stop.Method)
+	}
+	if err := browser.WriteJSON(map[string]any{
+		"id": stop.ID, "error": map[string]any{"message": "completed stop rejected"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-stream.Done():
+	case <-time.After(time.Second):
+		t.Fatal("stream did not finish owner cancellation cleanup")
+	}
+
+	closeCtx, cancelClose := context.WithCancel(context.Background())
+	cancelClose()
+	err := stream.Close(closeCtx)
+	if err == nil || !strings.Contains(err.Error(), "completed stop rejected") {
+		t.Fatalf("Close error=%v, want completed stop failure instead of caller cancellation", err)
+	}
+}
+
 func TestRemoteCaptchaStreamAcknowledgesOversizedFrameBeforeStopping(t *testing.T) {
 	host, browser := newTestChromeDevToolsPipes()
 	t.Cleanup(func() {
@@ -596,6 +838,81 @@ func TestRemoteCaptchaStreamAcknowledgesOversizedFrameBeforeStopping(t *testing.
 	}
 	if !errors.Is(stream.Err(), errRemoteCaptchaFrameTooLarge) {
 		t.Fatalf("terminal error=%v, want oversized frame", stream.Err())
+	}
+}
+
+func TestRemoteCaptchaStreamAcknowledgesEveryPositiveSessionBeforeDataValidation(t *testing.T) {
+	for index, test := range []struct {
+		name string
+		data any
+	}{
+		{name: "empty", data: ""},
+		{name: "malformed base64", data: "%%%"},
+		{name: "null", data: nil},
+		{name: "wrong JSON type", data: map[string]any{"unexpected": true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			host, browser := newTestChromeDevToolsPipes()
+			t.Cleanup(func() {
+				_ = host.Close()
+				_ = browser.Close()
+			})
+			client := newChromeDevToolsClient(host)
+			client.setSessionID("riot-session")
+			stream := startRemoteCaptchaTestStream(t, client, browser, context.Background())
+			sessionID := int64(index + 1)
+			if err := browser.WriteJSON(map[string]any{
+				"method": "Page.screencastFrame", "sessionId": "riot-session",
+				"params": map[string]any{"data": test.data, "sessionId": sessionID},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			ack := nextRemoteCaptchaTestCommand(t, browser)
+			if ack.Method != "Page.screencastFrameAck" || ack.Params.FrameSessionID != sessionID {
+				t.Fatalf("first command=%+v, want ACK for invalid frame", ack)
+			}
+			replyRemoteCaptchaTestCommand(t, browser, ack.ID)
+			stop := nextRemoteCaptchaTestCommand(t, browser)
+			if stop.Method != "Page.stopScreencast" {
+				t.Fatalf("terminal command=%q, want stop after ACK", stop.Method)
+			}
+			replyRemoteCaptchaTestCommand(t, browser, stop.ID)
+			select {
+			case <-stream.Done():
+			case <-time.After(time.Second):
+				t.Fatal("invalid frame did not terminate stream")
+			}
+			if !errors.Is(stream.Err(), errRemoteCaptchaFrameInvalid) {
+				t.Fatalf("terminal error=%v, want invalid frame", stream.Err())
+			}
+		})
+	}
+}
+
+func TestRemoteCaptchaStreamDoesNotAcknowledgeNonPositiveSession(t *testing.T) {
+	for _, sessionID := range []int64{-1, 0} {
+		t.Run(fmt.Sprintf("session_%d", sessionID), func(t *testing.T) {
+			host, browser := newTestChromeDevToolsPipes()
+			t.Cleanup(func() {
+				_ = host.Close()
+				_ = browser.Close()
+			})
+			client := newChromeDevToolsClient(host)
+			client.setSessionID("riot-session")
+			stream := startRemoteCaptchaTestStream(t, client, browser, context.Background())
+			if err := browser.WriteJSON(map[string]any{
+				"method": "Page.screencastFrame", "sessionId": "riot-session",
+				"params": map[string]any{"data": base64.StdEncoding.EncodeToString([]byte("frame")), "sessionId": sessionID},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			first := nextRemoteCaptchaTestCommand(t, browser)
+			if first.Method != "Page.stopScreencast" {
+				t.Fatalf("non-positive session command=%q, must not ACK", first.Method)
+			}
+			replyRemoteCaptchaTestCommand(t, browser, first.ID)
+			<-stream.Done()
+		})
 	}
 }
 
@@ -682,7 +999,7 @@ func TestRemoteCaptchaStreamCancelsPendingInputWithoutPoisoningClient(t *testing
 	closeRemoteCaptchaTestStream(t, stream, browser)
 }
 
-func TestRemoteCaptchaStreamAcceptsViewportMetadataWithoutForwardingCDP(t *testing.T) {
+func TestRemoteCaptchaStreamRejectsViewportMetadataWithoutForwardingCDP(t *testing.T) {
 	host, browser := newTestChromeDevToolsPipes()
 	t.Cleanup(func() {
 		_ = host.Close()
@@ -691,8 +1008,8 @@ func TestRemoteCaptchaStreamAcceptsViewportMetadataWithoutForwardingCDP(t *testi
 	client := newChromeDevToolsClient(host)
 	client.setSessionID("riot-session")
 	stream := startRemoteCaptchaTestStream(t, client, browser, context.Background())
-	if err := stream.DispatchInput(context.Background(), []byte(`{"type":"viewport","width":640,"height":450}`)); err != nil {
-		t.Fatal(err)
+	if err := stream.DispatchInput(context.Background(), []byte(`{"type":"viewport","width":640,"height":450}`)); !errors.Is(err, errRemoteCaptchaInputInvalid) {
+		t.Fatalf("viewport metadata error=%v, want unsupported input", err)
 	}
 
 	dispatched := make(chan error, 1)
