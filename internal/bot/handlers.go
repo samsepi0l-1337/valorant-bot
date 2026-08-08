@@ -307,6 +307,20 @@ type passwordLoginCanceler interface {
 	CancelPasswordLogin(state, discordUserID string) error
 }
 
+type qrAuthCanceler interface {
+	CancelQRAuth(state, discordUserID string) error
+}
+
+func (h *Handlers) cancelQRAuth(state, discordUserID string) {
+	canceler, ok := h.Auth.(qrAuthCanceler)
+	if !ok {
+		return
+	}
+	if err := canceler.CancelQRAuth(state, discordUserID); err != nil && !errors.Is(err, authweb.ErrQROwner) {
+		log.Printf("interaction: cancel QR state: %s", discordRESTErrorLog(err))
+	}
+}
+
 func (h *Handlers) cancelPasswordLogin(state, discordUserID string) {
 	canceler, ok := h.Auth.(passwordLoginCanceler)
 	if !ok {

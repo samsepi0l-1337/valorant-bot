@@ -245,8 +245,12 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 		if rerr != nil {
 			log.Printf("interaction: qr component edit failed: %s", discordRESTErrorLog(rerr))
 		}
-		if qrState != "" && delivery != deliveryRejected {
-			h.startQRLoginWatcher(s, i, qrState, lang)
+		if qrState != "" {
+			if delivery == deliveryRejected {
+				h.cancelQRAuth(qrState, userID)
+			} else {
+				h.startQRLoginWatcher(s, i, qrState, lang)
+			}
 		}
 		return
 	}
@@ -719,14 +723,14 @@ func editInteractionWithFilesOutcome(ctx context.Context, s *discordgo.Session, 
 	}
 	content := resp.Content
 	embeds := resp.Embeds
-	err := interactionEdit(ctx, s, i.Interaction, &discordgo.WebhookEdit{
+	result := interactionEditResult(ctx, s, i.Interaction, &discordgo.WebhookEdit{
 		Content:     &content,
 		Embeds:      &embeds,
 		Components:  &components,
 		Files:       resp.Files,
 		Attachments: attachmentsForFiles(resp.Files),
 	})
-	return interactionDeliveryResult(err), err
+	return result.outcome, result.err
 }
 
 func attachmentsForFiles(files []*discordgo.File) *[]*discordgo.MessageAttachment {
@@ -910,6 +914,9 @@ func (h *Handlers) watchPasswordCaptcha(ctx context.Context, s *discordgo.Sessio
 	resp := h.HandlePasswordCaptchaComplete(display, mfaState, mfaHint, err, lang)
 	deliveryCtx, deliveryDone, ok := h.beginLifecycleWorker(interactionTerminalDeliveryTimeout)
 	if !ok {
+		if mfaState != "" {
+			h.cancelPasswordMFA(mfaState, interactionUserID(i))
+		}
 		return
 	}
 	defer deliveryDone()
@@ -946,7 +953,7 @@ func (h *Handlers) editCaptchaInteractionThenOutcome(ctx context.Context, s *dis
 	guard := h.captchaEditGuard(state)
 	acquired, err := guard.begin(ctx)
 	if err != nil {
-		return deliveryAmbiguous, err
+		return deliveryRejected, err
 	}
 	if !acquired {
 		return deliverySuppressed, nil
@@ -1038,14 +1045,14 @@ func editInteractionOutcome(ctx context.Context, s *discordgo.Session, i *discor
 	content := resp.Content
 	// Always reset attachments: uploads in resp.Files are appended by Discord,
 	// and the completion edit must drop the QR image left by /auth.
-	err := interactionEdit(ctx, s, i.Interaction, &discordgo.WebhookEdit{
+	result := interactionEditResult(ctx, s, i.Interaction, &discordgo.WebhookEdit{
 		Content:     &content,
 		Embeds:      embeds,
 		Components:  components,
 		Files:       resp.Files,
 		Attachments: &[]*discordgo.MessageAttachment{},
 	})
-	return interactionDeliveryResult(err), err
+	return result.outcome, result.err
 }
 
 func (h *Handlers) userLang(discordUserID string) i18n.Lang {

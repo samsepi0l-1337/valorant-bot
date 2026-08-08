@@ -164,6 +164,71 @@ func TestCaptchaBrowserCloseNeverRevivesObservedGoneProcessGroup(t *testing.T) {
 	}
 }
 
+// Mutation caught: only probing ownership inside the first Close can mistake a
+// replacement group for the original when the numeric PGID was reused earlier.
+func TestCaptchaBrowserCloseTracksGroupLossBeforeFirstClose(t *testing.T) {
+	root := t.TempDir()
+	profileDir := filepath.Join(root, strings.Repeat("5", 32))
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var groupGeneration atomic.Int32
+	originalGoneProbed := make(chan struct{})
+	var goneProbeSent atomic.Bool
+	var terminateCalls atomic.Int32
+	owner := trackCaptchaProcessOwnership(
+		func(time.Duration) bool {
+			if groupGeneration.Load() != 1 {
+				return false
+			}
+			if goneProbeSent.CompareAndSwap(false, true) {
+				close(originalGoneProbed)
+			}
+			return true
+		},
+		func(func(time.Duration) bool) error {
+			terminateCalls.Add(1)
+			return errors.New("would signal replacement process group")
+		},
+	)
+	owner.startMonitor(time.Millisecond)
+	groupGeneration.Store(1)
+	select {
+	case <-originalGoneProbed:
+	case <-time.After(time.Second):
+		t.Fatal("ownership monitor did not observe the original group disappear")
+	}
+	owner.mu.Lock()
+	latchedGone := owner.gone
+	owner.mu.Unlock()
+	if !latchedGone {
+		t.Fatal("ownership monitor reported disappearance before latching it")
+	}
+
+	// Generation 2 uses the same numeric PGID but is unrelated to this owner.
+	groupGeneration.Store(2)
+	controller := &chromeBrowserController{
+		cmd:          &exec.Cmd{Process: &os.Process{Pid: 4242}},
+		processOwner: owner,
+		profileRoot:  root,
+		profileDir:   profileDir,
+		exited:       make(chan struct{}),
+		closeDevTools: func(context.Context, string) error {
+			return errors.New("must not contact replacement")
+		},
+		removeProfile: removeCaptchaChromeProfile,
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatalf("first Close after PGID reuse: %v", err)
+	}
+	if got := terminateCalls.Load(); got != 0 {
+		t.Fatalf("signaled replacement process group %d time(s)", got)
+	}
+	if _, err := os.Stat(profileDir); !os.IsNotExist(err) {
+		t.Fatalf("owned profile remains after original group loss: %v", err)
+	}
+}
+
 // Mutation caught: reverting the default production owner to the leader exit
 // channel leaves a real child alive in the launched process group and removes
 // the profile out from under it.

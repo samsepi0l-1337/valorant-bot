@@ -82,6 +82,28 @@ func trackCaptchaProcessOwnership(waitRaw func(time.Duration) bool, terminateRaw
 	return &captchaProcessOwnership{waitRaw: waitRaw, terminateRaw: terminateRaw}
 }
 
+// startMonitor observes ownership loss from launch onward. This closes the
+// window where a delayed first Close could see a reused numeric Unix PGID as
+// live without ever having observed the original group disappear.
+func (o *captchaProcessOwnership) startMonitor(interval time.Duration) {
+	if o == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			if o.waitForExit(0) {
+				return
+			}
+			<-ticker.C
+		}
+	}()
+}
+
 func (o *captchaProcessOwnership) waitForExit(timeout time.Duration) bool {
 	if o == nil {
 		return true

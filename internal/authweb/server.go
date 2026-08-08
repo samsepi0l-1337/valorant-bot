@@ -29,6 +29,8 @@ const (
 var (
 	// ErrServerClosed is returned when an auth operation is canceled by server shutdown.
 	ErrServerClosed = errors.New("auth server is shutting down")
+	// ErrQROwner means a Discord user tried to cancel another user's QR login.
+	ErrQROwner = errors.New("only the login owner can cancel this qr session")
 	// ErrMFAOwner means a Discord user tried to control another user's MFA continuation.
 	ErrMFAOwner = errors.New("only the login owner can continue this mfa session")
 	// ErrMFAExpired covers missing, expired, and already-consumed MFA continuations.
@@ -158,7 +160,7 @@ type Server struct {
 	shutdownDone             chan struct{}
 	shutdownErr              error
 	outcomes                 map[string]authOutcome
-	qrSessions               map[string]*riot.QRSession
+	qrSessions               map[string]qrPending
 	mfaPending               map[string]mfaPending
 	passwordPending          map[string]passwordPending
 	passwordOutcomes         map[string]passwordOutcome
@@ -180,6 +182,11 @@ type Server struct {
 	beforeCaptchaReaperMaxExit func()
 	// Test-only synchronization seam after Shutdown publishes the closed boundary.
 	afterShutdownClosedForTest func()
+	// Test-only synchronization seam after lifecycle enrollment is complete.
+	afterLifecycleAdmissionForTest func()
+	// Test-only synchronization seams immediately around Shutdown's lifecycle join.
+	beforeLifecycleDrainForTest func()
+	afterLifecycleDrainForTest  func()
 }
 
 // New builds an auth web Server.
@@ -206,7 +213,7 @@ func New(d Deps) *Server {
 		mux:                      http.NewServeMux(),
 		captchaMux:               http.NewServeMux(),
 		outcomes:                 make(map[string]authOutcome),
-		qrSessions:               make(map[string]*riot.QRSession),
+		qrSessions:               make(map[string]qrPending),
 		mfaPending:               make(map[string]mfaPending),
 		passwordPending:          make(map[string]passwordPending),
 		passwordOutcomes:         make(map[string]passwordOutcome),
@@ -293,6 +300,11 @@ func (s *Server) BeginAuth(discordUserID string) (loginURL, state string, err er
 	return loginURL, state, nil
 }
 
+type qrPending struct {
+	session       *riot.QRSession
+	discordUserID string
+}
+
 // BeginQRAuth starts a Riot Mobile QR login and returns the URL the user scans.
 // The caller then blocks on WaitQRLogin with the returned state.
 func (s *Server) BeginQRAuth(ctx context.Context, discordUserID string) (loginURL, state string, err error) {
@@ -320,9 +332,40 @@ func (s *Server) BeginQRAuth(ctx context.Context, discordUserID string) (loginUR
 		s.mu.Unlock()
 		return "", "", ErrServerClosed
 	}
-	s.qrSessions[state] = sess
+	s.qrSessions[state] = qrPending{session: sess, discordUserID: discordUserID}
 	s.mu.Unlock()
 	return sess.LoginURL, state, nil
+}
+
+// CancelQRAuth removes a QR flow only for the Discord user that created it.
+// Unknown states are already canceled and therefore succeed idempotently.
+func (s *Server) CancelQRAuth(state, discordUserID string) error {
+	s.mu.Lock()
+	pending, ok := s.qrSessions[state]
+	if !ok {
+		s.mu.Unlock()
+		return nil
+	}
+	if pending.discordUserID != discordUserID {
+		s.mu.Unlock()
+		return ErrQROwner
+	}
+	s.mu.Unlock()
+
+	storedOwner, exists, err := s.store.TakeAuthPending(state)
+	if err != nil {
+		return err
+	}
+	if exists && storedOwner != discordUserID {
+		return ErrQROwner
+	}
+	s.mu.Lock()
+	current, stillLive := s.qrSessions[state]
+	if stillLive && current.session == pending.session && current.discordUserID == pending.discordUserID {
+		delete(s.qrSessions, state)
+	}
+	s.mu.Unlock()
+	return nil
 }
 
 // WaitQRLogin polls Riot until the QR code is approved, then links the account.
@@ -334,11 +377,12 @@ func (s *Server) WaitQRLogin(ctx context.Context, state string) (displayName str
 	}
 	defer done()
 	s.mu.Lock()
-	sess, ok := s.qrSessions[state]
+	pending, ok := s.qrSessions[state]
 	s.mu.Unlock()
 	if !ok {
 		return "", fmt.Errorf("unknown or expired QR session")
 	}
+	sess := pending.session
 	defer func() {
 		s.mu.Lock()
 		delete(s.qrSessions, state)

@@ -130,7 +130,13 @@ func (s *Server) shutdown() {
 		}
 	}
 
+	if beforeDrain := s.beforeLifecycleDrainForTest; beforeDrain != nil {
+		beforeDrain()
+	}
 	s.lifecycleWG.Wait()
+	if afterDrain := s.afterLifecycleDrainForTest; afterDrain != nil {
+		afterDrain()
+	}
 
 	// Lifecycle enrollment and the closed publication gate make this the final
 	// stable set of legacy browser-auth states. Consume persisted pending rows
@@ -201,7 +207,11 @@ func (s *Server) beginLifecycleOperation(parent context.Context) (context.Contex
 	}
 	s.lifecycleWG.Add(1)
 	root := s.lifecycleCtx
+	afterAdmission := s.afterLifecycleAdmissionForTest
 	s.mu.Unlock()
+	if afterAdmission != nil {
+		afterAdmission()
+	}
 	ctx, cancel := context.WithCancel(parent)
 	stop := context.AfterFunc(root, cancel)
 	return ctx, func() {

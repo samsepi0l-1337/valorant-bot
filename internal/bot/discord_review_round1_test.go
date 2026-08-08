@@ -258,6 +258,10 @@ type qrDeliveryAuth struct {
 	passwordButtonAuth
 	waits       atomic.Int32
 	waitStarted chan struct{}
+	cancelCalls atomic.Int32
+	cancelMu    sync.Mutex
+	cancelState string
+	cancelUser  string
 }
 
 func (*qrDeliveryAuth) BeginQRAuth(context.Context, string) (string, string, error) {
@@ -272,6 +276,15 @@ func (a *qrDeliveryAuth) WaitQRLogin(ctx context.Context, _ string) (string, err
 	}
 	<-ctx.Done()
 	return "", ctx.Err()
+}
+
+func (a *qrDeliveryAuth) CancelQRAuth(state, discordUserID string) error {
+	a.cancelCalls.Add(1)
+	a.cancelMu.Lock()
+	a.cancelState = state
+	a.cancelUser = discordUserID
+	a.cancelMu.Unlock()
+	return nil
 }
 
 // Mutation caught: a definite initial QR source-edit rejection must not leave

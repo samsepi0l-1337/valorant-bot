@@ -19,6 +19,12 @@ func configureCaptchaProcess(cmd *exec.Cmd) {
 }
 
 func newCaptchaProcessOwnership(process *os.Process, exited <-chan struct{}) *captchaProcessOwnership {
+	owner := rawCaptchaProcessOwnership(process, exited)
+	owner.startMonitor(captchaProcessGroupPollInterval)
+	return owner
+}
+
+func rawCaptchaProcessOwnership(process *os.Process, exited <-chan struct{}) *captchaProcessOwnership {
 	return trackCaptchaProcessOwnership(
 		func(timeout time.Duration) bool {
 			return waitForCaptchaOwnedProcessExit(process, exited, timeout)
@@ -30,7 +36,7 @@ func newCaptchaProcessOwnership(process *os.Process, exited <-chan struct{}) *ca
 }
 
 func terminateCaptchaProcess(process *os.Process, exited <-chan struct{}) error {
-	return newCaptchaProcessOwnership(process, exited).terminate()
+	return rawCaptchaProcessOwnership(process, exited).terminate()
 }
 
 func terminateCaptchaProcessWithWait(process *os.Process, waitForExit func(time.Duration) bool) error {
