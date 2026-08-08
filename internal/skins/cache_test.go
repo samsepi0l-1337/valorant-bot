@@ -39,10 +39,10 @@ func TestEnsureLoadedAndGet(t *testing.T) {
 		"status": 200,
 		"data": []map[string]any{
 			{
-				"uuid":             "skin-1",
-				"displayName":      "프라임 밴달",
-				"displayIcon":      "https://example.com/icon.png",
-				"contentTierUuid":  "tier-exclusive",
+				"uuid":            "skin-1",
+				"displayName":     "프라임 밴달",
+				"displayIcon":     "https://example.com/icon.png",
+				"contentTierUuid": "tier-exclusive",
 				"levels": []map[string]string{
 					{
 						"uuid":        "level-1",

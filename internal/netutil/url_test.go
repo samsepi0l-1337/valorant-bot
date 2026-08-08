@@ -8,8 +8,8 @@ import (
 
 func TestIsPrivateOrLocalAuthBaseURL(t *testing.T) {
 	cases := []struct {
-		in     string
-		want   bool
+		in   string
+		want bool
 	}{
 		{"http://192.168.0.37:8787", true},
 		{"http://10.0.0.5:8787", true},
