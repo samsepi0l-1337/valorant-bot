@@ -245,26 +245,60 @@ func TestDefaultCaptchaLaunchFailureReclaimsUnixGroupGuardian(t *testing.T) {
 	}
 }
 
-// Mutation caught: allowing a stable owner to repeat its terminal group signal
-// can target a replacement after the guardian and original group are gone.
-func TestStableUnixGroupOwnerNeverSignalsTwiceAfterFailedTerminalWait(t *testing.T) {
-	var signalCalls atomic.Int32
-	owner := trackCaptchaProcessOwnership(
-		func(time.Duration) bool { return false },
-		func(func(time.Duration) bool) error {
-			signalCalls.Add(1)
-			return errors.New("group did not disappear after terminal signal")
-		},
-	)
-	owner.singleUseTermination = true
-	if err := owner.terminate(); err == nil {
-		t.Fatal("first terminal signal unexpectedly reported exit")
+// Mutation caught: removing the production single-use assignment in
+// prepareCaptchaProcess lets a retry signal a numerically reused guardian PGID.
+func TestDefaultCaptchaControllerSignalsTerminalGroupAtMostOnce(t *testing.T) {
+	root := t.TempDir()
+	profileDir := filepath.Join(root, strings.Repeat("2", 32))
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
 	}
-	if err := owner.terminate(); err == nil {
-		t.Fatal("retry unexpectedly reported exit")
+	cmd := exec.Command("sleep", "30")
+	controllerValue, err := startChromeLogged(cmd, root, profileDir)
+	if err != nil {
+		t.Fatalf("start production-wired controller: %v", err)
+	}
+	controller := controllerValue.(*chromeBrowserController)
+	groupPID, err := syscall.Getpgid(cmd.Process.Pid)
+	if err != nil {
+		t.Fatalf("get guardian process group: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(-groupPID, syscall.SIGKILL)
+		controller.processOwner.release()
+	})
+
+	var signalCalls atomic.Int32
+	controller.closeDevTools = func(context.Context, string) error {
+		return errors.New("force terminal group signaling")
+	}
+	// Keep reporting the numeric PGID as live after its original group is gone,
+	// modeling a dangerous replacement probe on the retry.
+	controller.waitProcessExit = func(*os.Process, <-chan struct{}, time.Duration) bool {
+		return false
+	}
+	controller.terminateProcess = func(*os.Process, <-chan struct{}) error {
+		signalCalls.Add(1)
+		killErr := syscall.Kill(-groupPID, syscall.SIGKILL)
+		return errors.Join(killErr, errors.New("terminal wait failed"))
+	}
+
+	if err := controller.Close(); err == nil {
+		t.Fatal("first Close unexpectedly reported the failed terminal wait as complete")
+	}
+	select {
+	case <-controller.exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Chrome did not exit after the simulated terminal signal")
+	}
+	if !waitForCaptchaOwnedProcessExit(&os.Process{Pid: groupPID}, nil, 2*time.Second) {
+		t.Fatal("original guardian group remained after the simulated terminal signal")
+	}
+	if err := controller.Close(); err == nil {
+		t.Fatal("retry unexpectedly trusted the dangerous replacement probe")
 	}
 	if got := signalCalls.Load(); got != 1 {
-		t.Fatalf("terminal group signals=%d, want exactly 1", got)
+		t.Fatalf("production terminal group signals=%d, want exactly 1", got)
 	}
 }
 

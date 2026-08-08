@@ -146,7 +146,10 @@ func launchSystemChrome(widgetURL string) (captchaBrowserController, error) {
 		launchErr := fmt.Errorf("Chrome/Chromium not found — install Google Chrome on the bot machine, or use Riot Mobile QR")
 		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, launchErr)
 	}
-	cmd := chromeCommand(bin, flags)
+	cmd, err := chromeCommand(bin, flags)
+	if err != nil {
+		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, fmt.Errorf("prepare Chrome command: %w", err))
+	}
 	return startChromeLogged(cmd, profileRoot, profileDir)
 }
 
@@ -156,7 +159,11 @@ func launchMacChrome(chromeArgs []string, profileRoot, profileDir string) (captc
 		launchErr := fmt.Errorf("Chrome/Chromium not found — install Google Chrome on the bot machine, or use Riot Mobile QR")
 		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, launchErr)
 	}
-	return startChromeLogged(chromeCommand(bin, chromeArgs), profileRoot, profileDir)
+	cmd, err := chromeCommand(bin, chromeArgs)
+	if err != nil {
+		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, fmt.Errorf("prepare Chrome command: %w", err))
+	}
+	return startChromeLogged(cmd, profileRoot, profileDir)
 }
 
 func startChromeLogged(cmd *exec.Cmd, profileRoot, profileDir string) (captchaBrowserController, error) {
@@ -476,25 +483,6 @@ func removeCaptchaChromeProfile(profileRoot, profileDir string) error {
 	return os.RemoveAll(profileDir)
 }
 
-// chromeCommand runs Chrome as the real desktop user when the bot was started with sudo.
-func chromeCommand(bin string, args []string) *exec.Cmd {
-	if u := desktopUser(); u != "" && u != "root" && os.Geteuid() == 0 {
-		if runtime.GOOS == "darwin" {
-			if uid, err := userUID(u); err == nil {
-				full := append([]string{"asuser", uid, "sudo", "-u", u, bin}, args...)
-				cmd := exec.Command("launchctl", full...)
-				cmd.Env = desktopEnv(u)
-				return cmd
-			}
-		}
-		full := append([]string{"-u", u, bin}, args...)
-		cmd := exec.Command("sudo", full...)
-		cmd.Env = desktopEnv(u)
-		return cmd
-	}
-	return exec.Command(bin, args...)
-}
-
 func chromeLaunchConfig(widgetURL string) (profileRoot, profileDir string, flags []string, err error) {
 	hostRules := fmt.Sprintf(
 		"MAP %s 127.0.0.1",
@@ -645,14 +633,6 @@ func desktopEnv(username string) []string {
 		"LOGNAME="+username,
 	)
 	return filtered
-}
-
-func userUID(username string) (string, error) {
-	u, err := user.Lookup(username)
-	if err != nil {
-		return "", err
-	}
-	return u.Uid, nil
 }
 
 func chownPath(path, username string) error {

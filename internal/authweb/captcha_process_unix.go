@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -23,6 +24,12 @@ func init() {
 		signal.Ignore(syscall.SIGTERM)
 		_, _ = io.Copy(io.Discard, os.Stdin)
 		os.Exit(0)
+	}
+	if len(os.Args) >= 2 && os.Args[1] == captchaChromeExecArgument {
+		if err := runCaptchaChromeExecHelper(os.Args[1:], os.Environ(), defaultCaptchaChromeExecSystem); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "captcha Chrome exec helper: %v\n", err)
+		}
+		os.Exit(126)
 	}
 }
 
@@ -60,6 +67,9 @@ func prepareCaptchaProcess(cmd *exec.Cmd) (*captchaProcessOwnership, error) {
 	owner.singleUseTermination = true
 	owner.releaseRaw = guardianWrite.Close
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: guardian.Process.Pid}
+	if isCaptchaChromeExecCommand(cmd) {
+		cmd.Env = setCaptchaEnvironment(cmd.Env, captchaChromeExecPGIDEnvironment, strconv.Itoa(guardian.Process.Pid))
+	}
 	return owner, nil
 }
 
