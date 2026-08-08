@@ -182,6 +182,9 @@ type Server struct {
 	captchaTLSDone             chan struct{}
 	launchCaptchaBrowser       func(string) (captchaBrowserController, error)
 	launchRemoteCaptchaBrowser func(string, string) (captchaBrowserController, error)
+	remoteCaptchaRandom        io.Reader
+	remoteCaptchaNow           func() time.Time
+	remoteCaptchaAfter         func(time.Duration) <-chan time.Time
 	// Test-only synchronization seam for the cancellation claim critical section.
 	beforePasswordWaitCancellationClaim func()
 	// Test-only synchronization seam for the retained-browser reaper exit handoff.
@@ -243,11 +246,15 @@ func New(d Deps) *Server {
 		captchaTLSConfiguredPort:   d.CaptchaTLSPort,
 		launchCaptchaBrowser:       launchSystemChrome,
 		launchRemoteCaptchaBrowser: launchSystemChromeOnDisplay,
+		remoteCaptchaRandom:        rand.Reader,
+		remoteCaptchaNow:           time.Now,
+		remoteCaptchaAfter:         time.After,
 	}
 	if mode == netutil.CaptchaBrowserRemote {
 		s.launchCaptchaBrowser = func(widgetURL string) (captchaBrowserController, error) {
 			return s.launchRemoteCaptchaBrowser(widgetURL, display)
 		}
+		s.registerRemoteCaptchaHTTPRoutes()
 	}
 	if mode == netutil.CaptchaBrowserDisabled {
 		s.launchCaptchaBrowser = disabledCaptchaBrowserLauncher

@@ -56,6 +56,10 @@ func (s *Server) shutdown() {
 		delete(s.passwordReady, state)
 	}
 	for state, pending := range s.passwordPending {
+		// Remote viewer credentials are invalid at the shutdown boundary even
+		// when an irreversible account commit already owns the flow cleanup.
+		clearRemoteCaptchaState(&pending)
+		s.passwordPending[state] = pending
 		if pending.flow != nil && pending.flow.commitClaimed {
 			pending.flow.cleanupRequested = true
 			commitStates = append(commitStates, state)

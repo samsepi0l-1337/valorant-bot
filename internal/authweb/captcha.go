@@ -2,6 +2,7 @@ package authweb
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dosfsociety/valorant-bot/internal/netutil"
 	"github.com/dosfsociety/valorant-bot/internal/riot"
 )
 
@@ -33,15 +35,19 @@ type passwordPending struct {
 	browserCookies []*http.Cookie
 	flow           *passwordFlow
 	expiresAt      time.Time
+	remoteGrant    remoteCaptchaGrant
+	remoteViewer   remoteCaptchaViewerSessionState
 }
 
 type passwordFlow struct {
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
-	launchMu sync.Mutex
-	submitMu sync.Mutex
-	browser  captchaBrowserController
+	ctx            context.Context
+	cancel         context.CancelFunc
+	wg             sync.WaitGroup
+	remoteDone     chan struct{}
+	remoteDoneOnce sync.Once
+	launchMu       sync.Mutex
+	submitMu       sync.Mutex
+	browser        captchaBrowserController
 	// Browser generation fields are protected by launchMu. Each reopen cancels
 	// the previous CDP worker, and only the controller/generation still owned by
 	// the flow may publish a terminal result.
@@ -79,10 +85,9 @@ var (
 	errPasswordStateExpired = errors.New("captcha session expired; run /auth again")
 )
 
-// BeginPasswordLogin stores credentials and prepares a button-launched
-// bot-host Chrome flow.
-// captchaURL is intentionally empty: Discord uses a custom-ID button to ask the
-// bot process to launch Chrome, never a localhost/public link on the user device.
+// BeginPasswordLogin stores credentials and prepares the configured CAPTCHA
+// browser flow. Remote mode returns a one-time grant in the URL fragment;
+// local and disabled modes retain the existing button-launched behavior.
 func (s *Server) BeginPasswordLogin(ctx context.Context, discordUserID, username, password string) (captchaURL, state string, err error) {
 	_ = ctx
 	if s.passwordAuth == nil {
@@ -98,6 +103,29 @@ func (s *Server) BeginPasswordLogin(ctx context.Context, discordUserID, username
 	}
 	flowCtx, flowCancel := context.WithCancel(context.Background())
 	flow := &passwordFlow{ctx: flowCtx, cancel: flowCancel}
+	var (
+		grant       remoteCaptchaGrant
+		grantSecret string
+		remoteTimer <-chan time.Time
+	)
+	if s.captchaBrowserMode == netutil.CaptchaBrowserRemote {
+		flow.remoteDone = make(chan struct{})
+		hooks := s.remoteCaptchaHooks()
+		var digest [sha256.Size]byte
+		grantSecret, digest, err = newRemoteCaptchaSecret(hooks.random)
+		if err != nil {
+			flowCancel()
+			return "", "", fmt.Errorf("create remote captcha grant: %w", err)
+		}
+		grant = remoteCaptchaGrant{
+			digest:             digest,
+			ownerDiscordUserID: discordUserID,
+			flow:               flow,
+			expiresAt:          hooks.now().Add(remoteCaptchaLifetime(s.pendingTTL)),
+			active:             true,
+		}
+		remoteTimer = hooks.after(remoteCaptchaLifetime(s.pendingTTL))
+	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -105,6 +133,9 @@ func (s *Server) BeginPasswordLogin(ctx context.Context, discordUserID, username
 		return "", "", ErrServerClosed
 	}
 	s.lifecycleWG.Add(1)
+	if grant.active {
+		s.lifecycleWG.Add(1)
+	}
 	if s.passwordPending == nil {
 		s.passwordPending = make(map[string]passwordPending)
 	}
@@ -120,11 +151,16 @@ func (s *Server) BeginPasswordLogin(ctx context.Context, discordUserID, username
 		password:      password,
 		flow:          flow,
 		expiresAt:     time.Now().Add(s.pendingTTL),
+		remoteGrant:   grant,
 	}
 	s.passwordOutcomes[state] = passwordOutcome{}
 	s.passwordReady[state] = make(chan struct{})
 	s.mu.Unlock()
 	go s.expirePasswordState(state)
+	if grant.active {
+		go s.expireRemoteCaptchaState(state, flow, grant.expiresAt, remoteTimer)
+		return s.authBaseURL + "/captcha/remote#" + grantSecret, state, nil
+	}
 
 	return "", state, nil
 }
@@ -257,6 +293,7 @@ func (s *Server) claimPasswordFinalization(state string, flow *passwordFlow) err
 	}
 	flow.sealed = true
 	scrubPasswordCredentials(&pending)
+	clearRemoteCaptchaState(&pending)
 	s.passwordPending[state] = pending
 	return nil
 }
@@ -462,6 +499,7 @@ func (s *Server) claimPasswordStateCleanupLocked(state string) passwordStateClea
 		flow.sealed = true
 	}
 	scrubPasswordCredentials(&pending)
+	clearRemoteCaptchaState(&pending)
 	delete(s.passwordPending, state)
 	delete(s.passwordOutcomes, state)
 	delete(s.passwordReady, state)
