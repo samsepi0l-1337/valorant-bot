@@ -392,7 +392,7 @@ func TestRemoteCaptchaExpiresAtConfiguredOrTenMinuteLifetimeWithDeterministicClo
 		want time.Duration
 	}{
 		{name: "configured lifetime", ttl: 2 * time.Minute, want: 2 * time.Minute},
-		{name: "ten minute maximum", ttl: 30 * time.Minute, want: remoteCaptchaMaxLifetime},
+		{name: "ten minute maximum", ttl: 30 * time.Minute, want: 10 * time.Minute},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			clock := newManualRemoteCaptchaClock(time.Date(2026, 8, 9, 0, 0, 0, 0, time.UTC))
@@ -406,6 +406,12 @@ func TestRemoteCaptchaExpiresAtConfiguredOrTenMinuteLifetimeWithDeterministicClo
 			_, state, err := s.BeginPasswordLogin(context.Background(), "discord-owner", "riot-user", "riot-password")
 			if err != nil {
 				t.Fatal(err)
+			}
+			s.mu.Lock()
+			gotExpiry := s.passwordPending[state].remoteGrant.expiresAt
+			s.mu.Unlock()
+			if wantExpiry := clock.Now().Add(test.want); !gotExpiry.Equal(wantExpiry) {
+				t.Fatalf("remote expiry=%s, want fixed %s", gotExpiry, wantExpiry)
 			}
 			clock.Advance(test.want)
 

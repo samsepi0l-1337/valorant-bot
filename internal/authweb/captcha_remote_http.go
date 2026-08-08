@@ -237,18 +237,26 @@ canvas{display:block;width:100%;height:auto;aspect-ratio:1280/900;background:#11
 const remoteCaptchaViewerScript = `
 (()=>{"use strict";
 const canvas=document.getElementById("viewer"),status=document.getElementById("status"),cancel=document.getElementById("cancel"),context=canvas.getContext("2d");
-let grant=location.hash.startsWith("#")?location.hash.slice(1):"",socket=null;
+const reconnectWindowMs=60000,reconnectDelayMs=1000;
+const pointerMoveIntervalMs=1000/60;
+let grant=location.hash.startsWith("#")?location.hash.slice(1):"",socket=null,reconnectDeadline=0,reconnectTimer=0,stopped=false;
+let pendingPointerMove=null,pointerMoveTimer=0,lastPointerMoveAt=0;
 history.replaceState(null,"",location.pathname);
 const setStatus=value=>{status.textContent=value;};
 const send=value=>{if(socket&&socket.readyState===WebSocket.OPEN)socket.send(JSON.stringify(value));};
 const point=event=>{const bounds=canvas.getBoundingClientRect();return{x:(event.clientX-bounds.left)*canvas.width/bounds.width,y:(event.clientY-bounds.top)*canvas.height/bounds.height,width:bounds.width,height:bounds.height};};
-const pointer=(phase,event)=>{if(event.button!==0&&phase!=="move")return;event.preventDefault();if(phase==="down")canvas.setPointerCapture(event.pointerId);send({type:"pointer",phase,...point(event),button:0});};
-canvas.addEventListener("pointermove",event=>pointer("move",event));
+const discardPointerMove=()=>{clearTimeout(pointerMoveTimer);pointerMoveTimer=0;pendingPointerMove=null;};
+const pointer=(phase,event)=>{if(event.button!==0)return;event.preventDefault();discardPointerMove();if(phase==="down")canvas.setPointerCapture(event.pointerId);send({type:"pointer",phase,...point(event),button:0});};
+const flushPointerMove=()=>{pointerMoveTimer=0;if(!pendingPointerMove)return;lastPointerMoveAt=performance.now();const message=pendingPointerMove;pendingPointerMove=null;send(message);};
+const queuePointerMove=event=>{event.preventDefault();pendingPointerMove={type:"pointer",phase:"move",...point(event),button:0};if(pointerMoveTimer)return;const wait=Math.max(0,pointerMoveIntervalMs-(performance.now()-lastPointerMoveAt));pointerMoveTimer=setTimeout(flushPointerMove,wait);};
+canvas.addEventListener("pointermove",queuePointerMove);
 canvas.addEventListener("pointerdown",event=>pointer("down",event));
 canvas.addEventListener("pointerup",event=>pointer("up",event));
 canvas.addEventListener("wheel",event=>{event.preventDefault();send({type:"wheel",deltaY:event.deltaY,...point(event)});},{passive:false});
-cancel.addEventListener("click",async()=>{cancel.disabled=true;await fetch("/api/auth/captcha/remote/cancel",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).catch(()=>{});if(socket)socket.close();setStatus("Cancelled");});
-const start=async()=>{if(!grant){setStatus("This CAPTCHA link is invalid or expired.");return;}const response=await fetch("/api/auth/captcha/remote/redeem",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:grant})}).catch(()=>null);grant="";if(!response||!response.ok){setStatus("This CAPTCHA link is invalid or expired.");return;}cancel.disabled=false;setStatus("Connecting…");const protocol=location.protocol==="https:"?"wss:":"ws:";socket=new WebSocket(protocol+"//"+location.host+"/api/auth/captcha/remote/ws");socket.binaryType="blob";socket.addEventListener("open",()=>setStatus("Connected"));socket.addEventListener("message",async event=>{if(typeof event.data==="string"){const message=JSON.parse(event.data);if(message.status)setStatus(message.status);return;}const bitmap=await createImageBitmap(event.data);canvas.width=bitmap.width;canvas.height=bitmap.height;context.drawImage(bitmap,0,0);bitmap.close();});socket.addEventListener("close",()=>setStatus("Disconnected"));socket.addEventListener("error",()=>setStatus("Connection failed"));};
+const scheduleReconnect=()=>{if(stopped)return;if(!reconnectDeadline)reconnectDeadline=Date.now()+reconnectWindowMs;if(Date.now()+reconnectDelayMs>=reconnectDeadline){stopped=true;cancel.disabled=true;setStatus("This CAPTCHA session is no longer available.");return;}setStatus("Reconnecting…");clearTimeout(reconnectTimer);reconnectTimer=setTimeout(connect,reconnectDelayMs);};
+const connect=()=>{if(stopped)return;setStatus("Connecting…");const protocol=location.protocol==="https:"?"wss:":"ws:";socket=new WebSocket(protocol+"//"+location.host+"/api/auth/captcha/remote/ws");socket.binaryType="blob";socket.addEventListener("open",()=>{reconnectDeadline=0;setStatus("Connected");});socket.addEventListener("message",async event=>{if(typeof event.data==="string"){const message=JSON.parse(event.data);if(message.status)setStatus(message.status);return;}const bitmap=await createImageBitmap(event.data);canvas.width=bitmap.width;canvas.height=bitmap.height;context.drawImage(bitmap,0,0);bitmap.close();});socket.addEventListener("close",event=>{socket=null;if(stopped)return;if(event.code===1000){stopped=true;cancel.disabled=true;setStatus("CAPTCHA session finished.");return;}scheduleReconnect();});socket.addEventListener("error",()=>setStatus("Connection interrupted"));};
+cancel.addEventListener("click",async()=>{stopped=true;clearTimeout(reconnectTimer);discardPointerMove();cancel.disabled=true;await fetch("/api/auth/captcha/remote/cancel",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).catch(()=>{});if(socket)socket.close();setStatus("Cancelled");});
+const start=async()=>{if(grant){const response=await fetch("/api/auth/captcha/remote/redeem",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:grant})}).catch(()=>null);grant="";if(!response||!response.ok){stopped=true;setStatus("This CAPTCHA link is invalid or expired.");return;}}cancel.disabled=false;connect();};
 start();
 })();
 `

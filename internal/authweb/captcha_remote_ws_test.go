@@ -24,6 +24,7 @@ type testRemoteCaptchaStream struct {
 	done         chan struct{}
 	closeOnce    sync.Once
 	inputs       chan []byte
+	dispatches   chan []byte
 	dispatchErr  error
 	closeStarted chan struct{}
 	closeRelease <-chan struct{}
@@ -50,6 +51,23 @@ type observedRemoteCaptchaWebSocketConnection struct {
 	controls       []int
 	closed         chan struct{}
 	closeOnce      sync.Once
+}
+
+type testRemoteCaptchaDisconnectTimer struct {
+	ch       <-chan time.Time
+	stopOnce sync.Once
+	stopped  chan<- struct{}
+}
+
+func (t *testRemoteCaptchaDisconnectTimer) Chan() <-chan time.Time { return t.ch }
+
+func (t *testRemoteCaptchaDisconnectTimer) Stop() bool {
+	stopped := false
+	t.stopOnce.Do(func() {
+		stopped = true
+		t.stopped <- struct{}{}
+	})
+	return stopped
 }
 
 func newObservedRemoteCaptchaWebSocketConnection() *observedRemoteCaptchaWebSocketConnection {
@@ -149,15 +167,17 @@ func (w *blockingRemoteCaptchaWebSocketWriter) WriteControl(messageType int, _ [
 
 func newTestRemoteCaptchaStream() *testRemoteCaptchaStream {
 	return &testRemoteCaptchaStream{
-		frames: make(chan []byte, 1),
-		done:   make(chan struct{}),
-		inputs: make(chan []byte, 8),
+		frames:     make(chan []byte, 1),
+		done:       make(chan struct{}),
+		inputs:     make(chan []byte, 8),
+		dispatches: make(chan []byte, 8),
 	}
 }
 
 func (s *testRemoteCaptchaStream) Frames() <-chan []byte { return s.frames }
 
 func (s *testRemoteCaptchaStream) DispatchInput(_ context.Context, payload []byte) error {
+	s.dispatches <- append([]byte(nil), payload...)
 	if s.dispatchErr != nil {
 		return s.dispatchErr
 	}
@@ -186,6 +206,18 @@ type testRemoteCaptchaBrowser struct {
 	*testRiotBrowserLoginController
 	processDone chan struct{}
 	exitOnce    sync.Once
+}
+
+type defaultRemoteCaptchaControllerProbe struct {
+	owners [4]context.Context
+	err    error
+}
+
+func (*defaultRemoteCaptchaControllerProbe) Close() error { return nil }
+
+func (p *defaultRemoteCaptchaControllerProbe) StartRemoteCaptchaStream(flowCtx, processCtx, viewerCtx, serverCtx context.Context) (*remoteCaptchaStream, error) {
+	p.owners = [4]context.Context{flowCtx, processCtx, viewerCtx, serverCtx}
+	return nil, p.err
 }
 
 func newTestRemoteCaptchaBrowser() *testRemoteCaptchaBrowser {
@@ -221,6 +253,7 @@ type remoteCaptchaWebSocketFixture struct {
 	graceTimers    chan chan time.Time
 	graceDurations chan time.Duration
 	graceChecks    chan struct{}
+	graceStops     chan struct{}
 }
 
 func newRemoteCaptchaWebSocketFixture(t *testing.T) *remoteCaptchaWebSocketFixture {
@@ -243,6 +276,7 @@ func newRemoteCaptchaWebSocketFixture(t *testing.T) *remoteCaptchaWebSocketFixtu
 		graceTimers:    make(chan chan time.Time, 4),
 		graceDurations: make(chan time.Duration, 4),
 		graceChecks:    make(chan struct{}, 4),
+		graceStops:     make(chan struct{}, 4),
 	}
 	fixture.httpServer = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fixture.server.Handler().ServeHTTP(w, r)
@@ -286,11 +320,11 @@ func newRemoteCaptchaWebSocketFixture(t *testing.T) *remoteCaptchaWebSocketFixtu
 		fixture.streamOwners <- [4]context.Context{flowCtx, processCtx, viewerCtx, serverCtx}
 		return fixture.stream, nil
 	}
-	fixture.server.remoteCaptchaGraceAfter = func(duration time.Duration) <-chan time.Time {
+	fixture.server.remoteCaptchaGraceTimer = func(duration time.Duration) remoteCaptchaDisconnectTimer {
 		timer := make(chan time.Time, 1)
 		fixture.graceDurations <- duration
 		fixture.graceTimers <- timer
-		return timer
+		return &testRemoteCaptchaDisconnectTimer{ch: timer, stopped: fixture.graceStops}
 	}
 	fixture.server.afterRemoteCaptchaGraceTimerForTest = func() {
 		fixture.graceChecks <- struct{}{}
@@ -520,6 +554,24 @@ func TestRemoteCaptchaWebSocketFirstAuthenticatedBindLaunchesOnceAndRejectsConcu
 	}
 }
 
+func TestDefaultRemoteCaptchaStartStreamForwardsAllFourOwnerContexts(t *testing.T) {
+	wantErr := errors.New("probe stream start")
+	controller := &defaultRemoteCaptchaControllerProbe{err: wantErr}
+	owners := [4]context.Context{}
+	for index := range owners {
+		owners[index] = context.WithValue(context.Background(), struct{ index int }{index}, index)
+	}
+	_, err := defaultRemoteCaptchaStartStream(controller, owners[0], owners[1], owners[2], owners[3])
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("default stream error=%v, want probe error", err)
+	}
+	for index := range owners {
+		if controller.owners[index] != owners[index] {
+			t.Fatalf("owner context %d was not forwarded by the default controller path", index)
+		}
+	}
+}
+
 func TestRemoteCaptchaWebSocketRelaysBinaryFramesAndTypedInput(t *testing.T) {
 	fixture := newRemoteCaptchaWebSocketFixture(t)
 	connection, response, err := fixture.dial(t, fixture.cookie, fixture.origin)
@@ -582,6 +634,14 @@ func TestRemoteCaptchaWebSocketReconnectsSameSessionInsideGraceAndExpiresAfterGr
 		t.Fatal(err)
 	}
 	staleTimer := fixture.nextGraceTimer(t)
+	fixture.server.mu.Lock()
+	pending := fixture.server.passwordPending[fixture.state]
+	staleGraceDone := pending.remoteViewer.relay.graceDone
+	staleGraceCancel := pending.remoteViewer.relay.graceCancel
+	fixture.server.mu.Unlock()
+	if staleGraceDone == nil || staleGraceCancel == nil {
+		t.Fatal("disconnect did not publish one cancelable grace worker")
+	}
 
 	otherCookie := &http.Cookie{Name: remoteCaptchaViewerCookieName, Value: strings.Repeat("A", 43)}
 	other, otherResponse, otherErr := fixture.dial(t, otherCookie, fixture.origin)
@@ -604,7 +664,29 @@ func TestRemoteCaptchaWebSocketReconnectsSameSessionInsideGraceAndExpiresAfterGr
 		}
 		t.Fatalf("same-session reconnect status=%d err=%v", status, secondErr)
 	}
-	fixture.fireGraceTimer(t, staleTimer)
+	select {
+	case <-staleGraceDone:
+	default:
+		t.Fatal("same-session reconnect returned before the stale grace worker terminated")
+	}
+	select {
+	case <-fixture.graceStops:
+	default:
+		t.Fatal("same-session reconnect did not stop the stale grace timer")
+	}
+	fixture.server.mu.Lock()
+	pending = fixture.server.passwordPending[fixture.state]
+	if pending.remoteViewer.relay.graceDone != nil || pending.remoteViewer.relay.graceCancel != nil {
+		fixture.server.mu.Unlock()
+		t.Fatal("same-session reconnect retained a stale grace worker")
+	}
+	fixture.server.mu.Unlock()
+	staleTimer <- time.Now().Add(time.Minute)
+	select {
+	case <-fixture.graceChecks:
+		t.Fatal("canceled stale grace worker processed its timer after reconnect")
+	case <-time.After(20 * time.Millisecond):
+	}
 	fixture.server.mu.Lock()
 	_, stillLive := fixture.server.passwordPending[fixture.state]
 	fixture.server.mu.Unlock()
@@ -705,6 +787,61 @@ func TestRemoteCaptchaWebSocketProtocolViolationsFailClosedWithoutGrace(t *testi
 			case duration := <-fixture.graceDurations:
 				t.Fatalf("protocol violation started reconnect grace %s", duration)
 			default:
+			}
+		})
+	}
+}
+
+func TestRemoteCaptchaWebSocketInputRateAndBackpressureAreNonTerminal(t *testing.T) {
+	for _, dispatchErr := range []error{errRemoteCaptchaInputRate, errRemoteCaptchaInputBusy} {
+		t.Run(dispatchErr.Error(), func(t *testing.T) {
+			fixture := newRemoteCaptchaWebSocketFixture(t)
+			fixture.stream.dispatchErr = dispatchErr
+			connection, response, err := fixture.dial(t, fixture.cookie, fixture.origin)
+			if err != nil {
+				t.Fatalf("dial response=%v err=%v", response, err)
+			}
+			select {
+			case <-fixture.streamOwners:
+			case <-time.After(time.Second):
+				t.Fatal("remote stream did not start")
+			}
+			input := []byte(`{"type":"pointer","phase":"move","x":320,"y":225,"width":640,"height":450,"button":0}`)
+			if err := connection.WriteMessage(websocket.TextMessage, input); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case got := <-fixture.stream.dispatches:
+				if !bytes.Equal(got, input) {
+					t.Fatalf("dispatch payload=%q, want %q", got, input)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("pointer move was not dispatched")
+			}
+			select {
+			case <-fixture.browser.closed:
+				t.Fatalf("transient input error %v closed the browser", dispatchErr)
+			case <-time.After(50 * time.Millisecond):
+			}
+			fixture.server.mu.Lock()
+			_, live := fixture.server.passwordPending[fixture.state]
+			fixture.server.mu.Unlock()
+			if !live {
+				t.Fatalf("transient input error %v deleted the flow", dispatchErr)
+			}
+
+			if err := connection.WriteMessage(websocket.BinaryMessage, []byte("malformed")); err != nil {
+				t.Fatal(err)
+			}
+			_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+			if _, _, err := connection.ReadMessage(); err == nil {
+				t.Fatal("definite protocol violation left WebSocket open")
+			}
+			_ = connection.Close()
+			select {
+			case <-fixture.browser.closed:
+			case <-time.After(time.Second):
+				t.Fatal("definite protocol violation did not close browser")
 			}
 		})
 	}
@@ -1054,12 +1191,23 @@ func TestRemoteCaptchaWebSocketRiotCompletionClosesViewerAndContinuesMFAOrPersis
 			case <-time.After(time.Second):
 				t.Fatal("Riot completion did not close stream")
 			}
+			select {
+			case <-fixture.browser.closed:
+			case <-time.After(time.Second):
+				t.Fatal("Riot completion did not close browser")
+			}
 
 			waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 			display, mfaState, _, waitErr := fixture.server.WaitPasswordLogin(waitCtx, fixture.state)
 			cancel()
 			if waitErr != nil {
 				t.Fatal(waitErr)
+			}
+			fixture.server.mu.Lock()
+			_, passwordStateLive := fixture.server.passwordPending[fixture.state]
+			fixture.server.mu.Unlock()
+			if passwordStateLive {
+				t.Fatal("Riot completion retained remote password/viewer state")
 			}
 			if test.wantMFA {
 				if mfaState == "" || display != "" {
@@ -1077,6 +1225,44 @@ func TestRemoteCaptchaWebSocketRiotCompletionClosesViewerAndContinuesMFAOrPersis
 				t.Fatalf("persisted session plaintext=%q", fixture.boxer.lastPlain)
 			}
 		})
+	}
+}
+
+func TestRemoteCaptchaWebSocketUnexpectedStreamEndClosesViewerBrowserAndFlow(t *testing.T) {
+	fixture := newRemoteCaptchaWebSocketFixture(t)
+	connection, response, err := fixture.dial(t, fixture.cookie, fixture.origin)
+	if err != nil {
+		t.Fatalf("dial response=%v err=%v", response, err)
+	}
+	select {
+	case <-fixture.streamOwners:
+	case <-time.After(time.Second):
+		t.Fatal("remote stream did not start")
+	}
+	if err := fixture.stream.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+	if _, _, err := connection.ReadMessage(); err == nil {
+		t.Fatal("unexpected stream end left WebSocket open")
+	}
+	_ = connection.Close()
+	select {
+	case <-fixture.browser.closed:
+	case <-time.After(time.Second):
+		t.Fatal("unexpected stream end did not close browser")
+	}
+	waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, _, _, waitErr := fixture.server.WaitPasswordLogin(waitCtx, fixture.state)
+	if waitErr == nil || !strings.Contains(waitErr.Error(), "stream ended unexpectedly") {
+		t.Fatalf("unexpected stream outcome=%v", waitErr)
+	}
+	fixture.server.mu.Lock()
+	_, live := fixture.server.passwordPending[fixture.state]
+	fixture.server.mu.Unlock()
+	if live {
+		t.Fatal("unexpected stream end retained remote password/viewer state")
 	}
 }
 

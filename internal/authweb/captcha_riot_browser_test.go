@@ -579,11 +579,6 @@ func TestRiotBrowserControllerCloseUnblocksPrivatePipeWhenOwnedProcessSurvives(t
 		var command map[string]any
 		_ = browser.ReadJSON(&command)
 	}()
-	blockedRead := make(chan error, 1)
-	go func() {
-		var response map[string]any
-		blockedRead <- host.ReadJSON(&response)
-	}()
 	owner := trackCaptchaProcessOwnership(
 		func(time.Duration) bool { return false },
 		func(func(time.Duration) bool) error { return errors.New("owned process group survived") },
@@ -600,6 +595,10 @@ func TestRiotBrowserControllerCloseUnblocksPrivatePipeWhenOwnedProcessSurvives(t
 			return nil
 		},
 	}
+	client, err := controller.chromeDevToolsClient()
+	if err != nil {
+		t.Fatal(err)
+	}
 	closeErr := controller.Close()
 	if closeErr == nil || !captchaBrowserMayBeRunning(closeErr) {
 		t.Fatalf("Close error = %v, want retained live-process failure", closeErr)
@@ -610,12 +609,9 @@ func TestRiotBrowserControllerCloseUnblocksPrivatePipeWhenOwnedProcessSurvives(t
 		t.Fatal("private Browser.close command was not consumed")
 	}
 	select {
-	case err := <-blockedRead:
-		if err == nil {
-			t.Fatal("private pipe read unexpectedly succeeded")
-		}
+	case <-client.done:
 	case <-time.After(250 * time.Millisecond):
-		t.Fatal("controller retained the private pipe after process termination failed")
+		t.Fatal("controller-owned private pipe reader remained blocked after process termination failed")
 	}
 }
 

@@ -138,6 +138,65 @@ func TestRemoteCaptchaHTTPShellDisablesCancelUntilDelayedRedemptionCompletes(t *
 	}
 }
 
+func TestRemoteCaptchaHTTPShellReloadAndTransportLossReuseViewerCookieWithoutRedeemingAgain(t *testing.T) {
+	s, bearer, _ := newRemoteCaptchaHTTPFixture(t)
+	cookie := redeemedRemoteCaptchaViewerCookie(t, s, bearer)
+
+	reload := remoteCaptchaHTTPRequest(http.MethodGet, "/captcha/remote", "", "")
+	reload.AddCookie(cookie)
+	recorder := serveRemoteCaptchaHTTP(s, reload)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("cookie-authenticated reload status=%d body=%q", recorder.Code, recorder.Body.String())
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`const reconnectWindowMs=60000,reconnectDelayMs=1000`,
+		`const connect=()=>`,
+		`if(grant){`,
+		`setTimeout(connect,reconnectDelayMs)`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("viewer production script missing reconnect behavior %q", want)
+		}
+	}
+	if strings.Contains(body, `if(!grant){setStatus("This CAPTCHA link is invalid or expired.");return;}`) {
+		t.Fatal("cookie-authenticated reload is rejected before attempting its WebSocket")
+	}
+	if got := strings.Count(body, `/api/auth/captcha/remote/redeem`); got != 1 {
+		t.Fatalf("viewer redeem call sites=%d, want one grant-only redemption", got)
+	}
+	conditional := strings.Index(body, `if(grant){`)
+	redeem := strings.Index(body, `fetch("/api/auth/captcha/remote/redeem"`)
+	connect := strings.LastIndex(body, `connect();`)
+	if conditional < 0 || redeem < conditional || connect < redeem {
+		t.Fatalf("viewer startup order conditional=%d redeem=%d connect=%d", conditional, redeem, connect)
+	}
+	if strings.Contains(body, bearer) || strings.Contains(body, cookie.Value) {
+		t.Fatal("cookie-authenticated reload shell disclosed an authentication secret")
+	}
+}
+
+func TestRemoteCaptchaHTTPShellCoalescesPointerMoveAtSixtyHertz(t *testing.T) {
+	s, _, _ := newRemoteCaptchaHTTPFixture(t)
+	recorder := serveRemoteCaptchaHTTP(s, remoteCaptchaHTTPRequest(http.MethodGet, "/captcha/remote", "", ""))
+	body := recorder.Body.String()
+	for _, want := range []string{
+		`const pointerMoveIntervalMs=1000/60`,
+		`let pendingPointerMove=null,pointerMoveTimer=0,lastPointerMoveAt=0`,
+		`const queuePointerMove=event=>`,
+		`pendingPointerMove={type:"pointer",phase:"move"`,
+		`setTimeout(flushPointerMove,wait)`,
+		`canvas.addEventListener("pointermove",queuePointerMove)`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("viewer production script missing 60 Hz pointer coalescing %q", want)
+		}
+	}
+	if strings.Contains(body, `canvas.addEventListener("pointermove",event=>pointer("move",event))`) {
+		t.Fatal("viewer sends each native pointermove without coalescing")
+	}
+}
+
 func TestRemoteCaptchaHTTPShellRejectsWrongHostWithoutForwardedTrust(t *testing.T) {
 	s, _, _ := newRemoteCaptchaHTTPFixture(t)
 	req := remoteCaptchaHTTPRequest(http.MethodGet, "/captcha/remote", "", "")

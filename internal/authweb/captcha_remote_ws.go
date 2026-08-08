@@ -39,6 +39,21 @@ type remoteCaptchaStreamSession interface {
 type remoteCaptchaStreamStartFunc func(captchaBrowserController, context.Context, context.Context, context.Context, context.Context) (remoteCaptchaStreamSession, error)
 type remoteCaptchaProcessDoneFunc func(captchaBrowserController) <-chan struct{}
 
+type remoteCaptchaDisconnectTimer interface {
+	Chan() <-chan time.Time
+	Stop() bool
+}
+
+type systemRemoteCaptchaDisconnectTimer struct {
+	*time.Timer
+}
+
+func (t *systemRemoteCaptchaDisconnectTimer) Chan() <-chan time.Time { return t.C }
+
+func newRemoteCaptchaDisconnectTimer(duration time.Duration) remoteCaptchaDisconnectTimer {
+	return &systemRemoteCaptchaDisconnectTimer{Timer: time.NewTimer(duration)}
+}
+
 type remoteCaptchaWebSocketWriter interface {
 	SetWriteDeadline(time.Time) error
 	WriteMessage(int, []byte) error
@@ -81,6 +96,8 @@ type remoteCaptchaRelay struct {
 	connectionActive     bool
 	connectionGeneration uint64
 	graceGeneration      uint64
+	graceCancel          context.CancelFunc
+	graceDone            chan struct{}
 }
 
 type remoteCaptchaWebSocketClaim struct {
@@ -204,6 +221,9 @@ func (s *Server) serveRemoteCaptchaWebSocket(connection remoteCaptchaWebSocketCo
 		err = relay.stream.DispatchInput(inputCtx, payload)
 		cancel()
 		if err != nil {
+			if errors.Is(err, errRemoteCaptchaInputRate) || errors.Is(err, errRemoteCaptchaInputBusy) {
+				continue
+			}
 			protocolViolation = true
 			break
 		}
@@ -334,12 +354,21 @@ func (s *Server) claimRemoteCaptchaWebSocket(rawSession string) (remoteCaptchaWe
 			s.mu.Unlock()
 			return remoteCaptchaWebSocketClaim{}, errRemoteCaptchaViewerConflict
 		}
+		s.lifecycleWG.Add(1)
 		relay.connectionActive = true
 		relay.connectionGeneration++
 		relay.graceGeneration++
-		s.lifecycleWG.Add(1)
+		graceCancel := relay.graceCancel
+		graceDone := relay.graceDone
+		relay.graceCancel = nil
+		relay.graceDone = nil
+		claim := remoteCaptchaWebSocketClaim{relay: relay, generation: relay.connectionGeneration}
 		s.mu.Unlock()
-		return remoteCaptchaWebSocketClaim{relay: relay, generation: relay.connectionGeneration}, nil
+		if graceCancel != nil {
+			graceCancel()
+			<-graceDone
+		}
+		return claim, nil
 	}
 	s.mu.Unlock()
 	return remoteCaptchaWebSocketClaim{}, errRemoteCaptchaUnavailable
@@ -371,16 +400,28 @@ func (s *Server) releaseRemoteCaptchaWebSocket(claim remoteCaptchaWebSocketClaim
 			if unexpected && !s.closed && live && pending.flow == claim.relay.flow &&
 				pending.remoteViewer.relay == claim.relay && !pending.flow.sealed &&
 				pending.flow.ctx.Err() == nil && !outcome.done && claim.relay.ctx.Err() == nil &&
-				s.remoteCaptchaHooks().now().Before(claim.relay.expiresAt) {
+				s.remoteCaptchaHooks().now().Before(claim.relay.expiresAt) &&
+				claim.relay.graceCancel == nil && claim.relay.graceDone == nil {
 				claim.relay.graceGeneration++
 				generation := claim.relay.graceGeneration
-				after := s.remoteCaptchaGraceAfter
-				if after == nil {
-					after = time.After
+				timerFactory := s.remoteCaptchaGraceTimer
+				if timerFactory == nil {
+					timerFactory = newRemoteCaptchaDisconnectTimer
 				}
-				timer := after(remoteCaptchaDisconnectGrace)
+				timer := timerFactory(remoteCaptchaDisconnectGrace)
+				graceCtx, cancelGraceContext := context.WithCancel(claim.relay.ctx)
+				var stopGraceOnce sync.Once
+				graceCancel := func() {
+					stopGraceOnce.Do(func() {
+						_ = timer.Stop()
+						cancelGraceContext()
+					})
+				}
+				graceDone := make(chan struct{})
 				s.lifecycleWG.Add(1)
-				go s.expireRemoteCaptchaDisconnectGrace(claim.relay, generation, timer)
+				claim.relay.graceCancel = graceCancel
+				claim.relay.graceDone = graceDone
+				go s.expireRemoteCaptchaDisconnectGrace(claim.relay, generation, timer.Chan(), graceCtx, graceCancel, graceDone)
 			}
 		}
 		s.mu.Unlock()
@@ -388,11 +429,15 @@ func (s *Server) releaseRemoteCaptchaWebSocket(claim remoteCaptchaWebSocketClaim
 	s.lifecycleWG.Done()
 }
 
-func (s *Server) expireRemoteCaptchaDisconnectGrace(relay *remoteCaptchaRelay, generation uint64, timer <-chan time.Time) {
-	defer s.lifecycleWG.Done()
+func (s *Server) expireRemoteCaptchaDisconnectGrace(relay *remoteCaptchaRelay, generation uint64, timer <-chan time.Time, graceCtx context.Context, cancelGrace context.CancelFunc, done chan<- struct{}) {
+	defer func() {
+		cancelGrace()
+		close(done)
+		s.lifecycleWG.Done()
+	}()
 	select {
 	case <-timer:
-	case <-relay.ctx.Done():
+	case <-graceCtx.Done():
 		return
 	case <-s.lifecycleCtx.Done():
 		return

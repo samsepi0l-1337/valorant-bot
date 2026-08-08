@@ -187,7 +187,7 @@ type Server struct {
 	remoteCaptchaRandom           io.Reader
 	remoteCaptchaNow              func() time.Time
 	remoteCaptchaAfter            func(time.Duration) <-chan time.Time
-	remoteCaptchaGraceAfter       func(time.Duration) <-chan time.Time
+	remoteCaptchaGraceTimer       func(time.Duration) remoteCaptchaDisconnectTimer
 	remoteCaptchaStartStream      remoteCaptchaStreamStartFunc
 	remoteCaptchaProcessDone      remoteCaptchaProcessDoneFunc
 	remoteCaptchaStreamRetryAfter func(time.Duration) <-chan time.Time
@@ -271,7 +271,7 @@ func New(d Deps) *Server {
 		remoteCaptchaRandom:           rand.Reader,
 		remoteCaptchaNow:              time.Now,
 		remoteCaptchaAfter:            time.After,
-		remoteCaptchaGraceAfter:       time.After,
+		remoteCaptchaGraceTimer:       newRemoteCaptchaDisconnectTimer,
 		remoteCaptchaStartStream:      defaultRemoteCaptchaStartStream,
 		remoteCaptchaProcessDone:      defaultRemoteCaptchaProcessDone,
 		remoteCaptchaStreamRetryAfter: time.After,
