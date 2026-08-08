@@ -1348,8 +1348,13 @@ func TestCancelPasswordLoginReportsFalseWhenNoLiveCleanupWasClaimed(t *testing.T
 
 	s.mu.Lock()
 	flow := s.passwordPending[state].flow
-	flow.commitClaimed = true
 	s.mu.Unlock()
+	if err := s.claimPasswordFinalization(state, flow); err != nil {
+		t.Fatalf("claim finalization: %v", err)
+	}
+	if err := s.claimPasswordAccountCommit(state, flow); err != nil {
+		t.Fatalf("claim account commit: %v", err)
+	}
 
 	canceled, err := s.CancelPasswordLogin(state, "owner-1")
 	if err != nil || canceled {
@@ -1357,15 +1362,19 @@ func TestCancelPasswordLoginReportsFalseWhenNoLiveCleanupWasClaimed(t *testing.T
 	}
 	s.mu.Lock()
 	pending, ok := s.passwordPending[state]
+	cleanupRequested := flow.cleanupRequested
 	s.mu.Unlock()
-	if !ok || pending.flow != flow || !flow.cleanupRequested || flow.ctx.Err() != nil {
-		t.Fatalf("commit-owned state ok=%v flowMatch=%v cleanupRequested=%v ctxErr=%v", ok, pending.flow == flow, flow.cleanupRequested, flow.ctx.Err())
+	if !ok || pending.flow != flow || cleanupRequested || flow.ctx.Err() != nil {
+		t.Fatalf("commit-owned state ok=%v flowMatch=%v cleanupRequested=%v ctxErr=%v", ok, pending.flow == flow, cleanupRequested, flow.ctx.Err())
 	}
 
-	s.mu.Lock()
-	flow.commitClaimed = false
-	s.mu.Unlock()
-	s.cleanupPasswordState(state)
+	if _, err := s.publishCommittedPasswordOutcome(state, flow, passwordOutcome{display: "Committed#AP1"}); err != nil {
+		t.Fatalf("publish committed outcome: %v", err)
+	}
+	display, mfaState, _, err := s.WaitPasswordLogin(context.Background(), state)
+	if err != nil || display != "Committed#AP1" || mfaState != "" {
+		t.Fatalf("authoritative wait display=%q mfaState=%q error=%v", display, mfaState, err)
+	}
 	canceled, err = s.CancelPasswordLogin(state, "owner-1")
 	if err != nil || canceled {
 		t.Fatalf("absent cancel canceled=%v error=%v, want false and nil", canceled, err)

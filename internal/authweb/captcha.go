@@ -208,6 +208,10 @@ func (s *Server) CancelPasswordLogin(state, discordUserID string) (canceled bool
 		s.mu.Unlock()
 		return false, ErrCaptchaOwner
 	}
+	if pending.flow != nil && pending.flow.commitClaimed {
+		s.mu.Unlock()
+		return false, nil
+	}
 	if outcome, exists := s.passwordOutcomes[state]; exists && outcome.done {
 		s.mu.Unlock()
 		return false, nil
