@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-func TestChromeControllerRunsOfficialRiotLoginInOneBrowserSession(t *testing.T) {
+func TestRiotBrowserRunsOfficialLoginInOneBrowserSession(t *testing.T) {
 	var (
 		mu                        sync.Mutex
 		injectedCredentials       bool
@@ -199,7 +199,7 @@ func TestChromeControllerRunsOfficialRiotLoginInOneBrowserSession(t *testing.T) 
 	}
 }
 
-func TestChromeControllerStopsOnCredentialInjectionProtocolError(t *testing.T) {
+func TestRiotBrowserStopsOnCredentialInjectionProtocolError(t *testing.T) {
 	var evaluateCalls atomic.Int32
 	host, browser := newTestChromeDevToolsPipes()
 	t.Cleanup(func() {
@@ -248,7 +248,7 @@ func TestChromeControllerStopsOnCredentialInjectionProtocolError(t *testing.T) {
 	}
 }
 
-func TestChromeControllerRetriesCredentialInjectionAcrossOneNavigationContext(t *testing.T) {
+func TestRiotBrowserRetriesCredentialInjectionAcrossOneNavigationContext(t *testing.T) {
 	var evaluateCalls atomic.Int32
 	host, browser := newTestChromeDevToolsPipes()
 	t.Cleanup(func() {
@@ -300,7 +300,7 @@ func TestChromeControllerRetriesCredentialInjectionAcrossOneNavigationContext(t 
 	}
 }
 
-func TestChromeControllerRetriesAllChromiumNavigationProtocolErrors(t *testing.T) {
+func TestRiotBrowserRetriesAllChromiumNavigationProtocolErrors(t *testing.T) {
 	for _, message := range []string{
 		"Cannot find default execution context",
 		"Inspected target navigated or closed",
@@ -332,7 +332,7 @@ func TestChromeControllerRetriesAllChromiumNavigationProtocolErrors(t *testing.T
 	}
 }
 
-func TestChromeControllerBoundsRepeatedNavigationContextErrors(t *testing.T) {
+func TestRiotBrowserBoundsRepeatedNavigationContextErrors(t *testing.T) {
 	var evaluateCalls atomic.Int32
 	host, browser := newTestChromeDevToolsPipes()
 	t.Cleanup(func() {
@@ -378,7 +378,7 @@ func TestChromeControllerBoundsRepeatedNavigationContextErrors(t *testing.T) {
 	}
 }
 
-func TestChromeControllerResetsNavigationRetryBudgetBeforeSubmit(t *testing.T) {
+func TestRiotBrowserResetsNavigationRetryBudgetBeforeSubmit(t *testing.T) {
 	var evaluateCalls atomic.Int32
 	var fillErrors atomic.Int32
 	var submitErrors atomic.Int32
@@ -413,7 +413,7 @@ func TestChromeControllerResetsNavigationRetryBudgetBeforeSubmit(t *testing.T) {
 	}
 }
 
-func TestChromeControllerStopsNavigationRetryWhenCanceled(t *testing.T) {
+func TestRiotBrowserStopsNavigationRetryWhenCanceled(t *testing.T) {
 	for _, phase := range []string{"fill", "submit"} {
 		t.Run(phase, func(t *testing.T) {
 			var evaluateCalls atomic.Int32
@@ -553,7 +553,7 @@ func serveCredentialSubmission(t *testing.T, browser chromeDevToolsTransport, ev
 	}
 }
 
-func TestChromeControllerCloseUnblocksPrivatePipeWhenOwnedProcessSurvives(t *testing.T) {
+func TestRiotBrowserControllerCloseUnblocksPrivatePipeWhenOwnedProcessSurvives(t *testing.T) {
 	root := t.TempDir()
 	profileDir := filepath.Join(root, strings.Repeat("a", 32))
 	if err := os.Mkdir(profileDir, 0o700); err != nil {

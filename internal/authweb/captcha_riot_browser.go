@@ -39,33 +39,6 @@ type riotBrowserLoginController interface {
 	RunRiotLogin(ctx context.Context, username, password string) (riotBrowserLoginResult, error)
 }
 
-type chromeDevToolsMessage struct {
-	ID        int64           `json:"id,omitempty"`
-	Method    string          `json:"method,omitempty"`
-	Params    json.RawMessage `json:"params,omitempty"`
-	Result    json.RawMessage `json:"result,omitempty"`
-	SessionID string          `json:"sessionId,omitempty"`
-	Error     *struct {
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
-}
-
-type chromeDevToolsProtocolError struct {
-	Method  string
-	Message string
-}
-
-func (e *chromeDevToolsProtocolError) Error() string {
-	return fmt.Sprintf("Riot Chrome %s: %s", e.Method, e.Message)
-}
-
-type chromeDevToolsClient struct {
-	conn      chromeDevToolsTransport
-	nextID    int64
-	queued    []chromeDevToolsMessage
-	sessionID string
-}
-
 func (c *chromeBrowserController) RunRiotLogin(ctx context.Context, username, password string) (riotBrowserLoginResult, error) {
 	if c == nil || strings.TrimSpace(c.profileDir) == "" {
 		return riotBrowserLoginResult{}, errors.New("captcha Chrome profile is unavailable")
@@ -77,12 +50,12 @@ func (c *chromeBrowserController) RunRiotLogin(ctx context.Context, username, pa
 	if c.devToolsPipe == nil {
 		return riotBrowserLoginResult{}, errors.New("official Riot login requires a private Chrome DevTools pipe")
 	}
-	client := &chromeDevToolsClient{conn: c.devToolsPipe}
+	client := newChromeDevToolsClient(c.devToolsPipe)
 	if err := client.attachRiotPage(ctx); err != nil {
 		return riotBrowserLoginResult{}, err
 	}
 	for _, method := range []string{"Network.enable", "Runtime.enable", "Page.enable"} {
-		if err := client.call(method, map[string]any{}, nil); err != nil {
+		if err := client.Call(ctx, method, map[string]any{}, nil); err != nil {
 			return riotBrowserLoginResult{}, err
 		}
 	}
@@ -103,7 +76,7 @@ func (c *chromeDevToolsClient) attachRiotPage(ctx context.Context) error {
 				URL      string `json:"url"`
 			} `json:"targetInfos"`
 		}
-		if err := c.call("Target.getTargets", map[string]any{}, &targets); err != nil {
+		if err := c.Call(ctx, "Target.getTargets", map[string]any{}, &targets); err != nil {
 			return fmt.Errorf("discover Riot Chrome page: %w", err)
 		}
 		for _, target := range targets.TargetInfos {
@@ -113,7 +86,7 @@ func (c *chromeDevToolsClient) attachRiotPage(ctx context.Context) error {
 			var attached struct {
 				SessionID string `json:"sessionId"`
 			}
-			if err := c.call("Target.attachToTarget", map[string]any{
+			if err := c.Call(ctx, "Target.attachToTarget", map[string]any{
 				"targetId": target.TargetID,
 				"flatten":  true,
 			}, &attached); err != nil {
@@ -122,7 +95,7 @@ func (c *chromeDevToolsClient) attachRiotPage(ctx context.Context) error {
 			if strings.TrimSpace(attached.SessionID) == "" {
 				return errors.New("attach Riot Chrome page: empty session")
 			}
-			c.sessionID = attached.SessionID
+			c.setSessionID(attached.SessionID)
 			return nil
 		}
 		select {
@@ -140,73 +113,6 @@ func allowedRiotBrowserPage(rawURL string) bool {
 	}
 	host := strings.ToLower(parsed.Host)
 	return host == "auth.riotgames.com" || host == RiotCaptchaHost
-}
-
-func (c *chromeDevToolsClient) call(method string, params any, result any) error {
-	c.nextID++
-	id := c.nextID
-	command := map[string]any{"id": id, "method": method, "params": params}
-	if c.sessionID != "" {
-		command["sessionId"] = c.sessionID
-	}
-	if err := c.conn.WriteJSON(command); err != nil {
-		return fmt.Errorf("Riot Chrome %s: %w", method, err)
-	}
-	for {
-		message, err := c.read()
-		if err != nil {
-			return fmt.Errorf("Riot Chrome %s: %w", method, err)
-		}
-		if message.ID == 0 {
-			if c.sessionID != "" && message.SessionID != c.sessionID {
-				continue
-			}
-			c.queued = append(c.queued, message)
-			continue
-		}
-		if message.ID != id {
-			return fmt.Errorf("Riot Chrome %s: unexpected response id", method)
-		}
-		if message.Error != nil {
-			return &chromeDevToolsProtocolError{Method: method, Message: message.Error.Message}
-		}
-		if result != nil && len(message.Result) > 0 {
-			if err := json.Unmarshal(message.Result, result); err != nil {
-				return fmt.Errorf("Riot Chrome %s response: %w", method, err)
-			}
-		}
-		return nil
-	}
-}
-
-func (c *chromeDevToolsClient) read() (chromeDevToolsMessage, error) {
-	var message chromeDevToolsMessage
-	if err := c.conn.ReadJSON(&message); err != nil {
-		return chromeDevToolsMessage{}, err
-	}
-	return message, nil
-}
-
-func (c *chromeDevToolsClient) nextEvent() (chromeDevToolsMessage, error) {
-	for len(c.queued) > 0 {
-		message := c.queued[0]
-		c.queued = c.queued[1:]
-		if c.sessionID == "" || message.SessionID == c.sessionID {
-			return message, nil
-		}
-	}
-	for {
-		message, err := c.read()
-		if err != nil {
-			return chromeDevToolsMessage{}, err
-		}
-		if message.ID == 0 {
-			if c.sessionID != "" && message.SessionID != c.sessionID {
-				continue
-			}
-			return message, nil
-		}
-	}
 }
 
 func (c *chromeDevToolsClient) submitRiotCredentials(ctx context.Context, username, password string) error {
@@ -233,7 +139,7 @@ return {filled:true};
 			} `json:"result"`
 			ExceptionDetails json.RawMessage `json:"exceptionDetails"`
 		}
-		err := c.call("Runtime.evaluate", map[string]any{
+		err := c.Call(ctx, "Runtime.evaluate", map[string]any{
 			"expression":    fillExpression,
 			"returnByValue": true,
 			"awaitPromise":  true,
@@ -294,7 +200,7 @@ return {ready:false};
 			} `json:"result"`
 			ExceptionDetails json.RawMessage `json:"exceptionDetails"`
 		}
-		err := c.call("Runtime.evaluate", map[string]any{
+		err := c.Call(ctx, "Runtime.evaluate", map[string]any{
 			"expression":    submitExpression,
 			"returnByValue": true,
 			"awaitPromise":  true,
@@ -323,7 +229,7 @@ return {ready:false};
 				} else {
 					point["buttons"] = 0
 				}
-				if err := c.call("Input.dispatchMouseEvent", point, nil); err != nil {
+				if err := c.Call(ctx, "Input.dispatchMouseEvent", point, nil); err != nil {
 					return fmt.Errorf("submit Riot browser login: %w", err)
 				}
 			}
@@ -392,7 +298,7 @@ type riotBrowserRequest struct {
 func (c *chromeDevToolsClient) waitForRiotLogin(ctx context.Context) (riotBrowserLoginResult, error) {
 	requests := make(map[string]riotBrowserRequest)
 	for {
-		event, err := c.nextEvent()
+		event, err := c.NextEvent(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return riotBrowserLoginResult{}, ctx.Err()
@@ -442,7 +348,7 @@ func (c *chromeDevToolsClient) waitForRiotLogin(ctx context.Context) (riotBrowse
 			delete(requests, params.RequestID)
 			endpoint, _ := riotBrowserLoginEndpoint(request.rawURL)
 			if request.response && endpoint && request.status == http.StatusOK && request.method != http.MethodPut {
-				body, bodyErr := c.riotResponseBody(params.RequestID)
+				body, bodyErr := c.riotResponseBody(ctx, params.RequestID)
 				if bodyErr != nil {
 					log.Printf("Riot browser login discovery response unavailable: %v", bodyErr)
 				} else {
@@ -458,7 +364,7 @@ func (c *chromeDevToolsClient) waitForRiotLogin(ctx context.Context) (riotBrowse
 				log.Printf("Riot browser login response rejected status=%d", request.status)
 				continue
 			}
-			body, err := c.riotResponseBody(params.RequestID)
+			body, err := c.riotResponseBody(ctx, params.RequestID)
 			if err != nil {
 				return riotBrowserLoginResult{}, err
 			}
@@ -466,11 +372,11 @@ func (c *chromeDevToolsClient) waitForRiotLogin(ctx context.Context) (riotBrowse
 				log.Printf("Riot browser CAPTCHA challenge response received")
 				continue
 			}
-			cookies, err := c.riotBrowserCookies()
+			cookies, err := c.riotBrowserCookies(ctx)
 			if err != nil {
 				return riotBrowserLoginResult{}, err
 			}
-			userAgent, err := c.riotBrowserUserAgent()
+			userAgent, err := c.riotBrowserUserAgent(ctx)
 			if err != nil {
 				return riotBrowserLoginResult{}, err
 			}
@@ -524,12 +430,12 @@ func riotBrowserResponseSummary(body []byte) (string, bool) {
 	return response.Type, len(response.Captcha) > 2 || bytes.Contains(bytes.ToLower(body), []byte(`"hcaptcha"`))
 }
 
-func (c *chromeDevToolsClient) riotResponseBody(requestID string) ([]byte, error) {
+func (c *chromeDevToolsClient) riotResponseBody(ctx context.Context, requestID string) ([]byte, error) {
 	var response struct {
 		Body          string `json:"body"`
 		Base64Encoded bool   `json:"base64Encoded"`
 	}
-	if err := c.call("Network.getResponseBody", map[string]any{"requestId": requestID}, &response); err != nil {
+	if err := c.Call(ctx, "Network.getResponseBody", map[string]any{"requestId": requestID}, &response); err != nil {
 		return nil, err
 	}
 	body := []byte(response.Body)
@@ -546,13 +452,13 @@ func (c *chromeDevToolsClient) riotResponseBody(requestID string) ([]byte, error
 	return body, nil
 }
 
-func (c *chromeDevToolsClient) riotBrowserUserAgent() (string, error) {
+func (c *chromeDevToolsClient) riotBrowserUserAgent(ctx context.Context) (string, error) {
 	var evaluated struct {
 		Result struct {
 			Value string `json:"value"`
 		} `json:"result"`
 	}
-	if err := c.call("Runtime.evaluate", map[string]any{
+	if err := c.Call(ctx, "Runtime.evaluate", map[string]any{
 		"expression":    "navigator.userAgent",
 		"returnByValue": true,
 	}, &evaluated); err != nil {
@@ -565,7 +471,7 @@ func (c *chromeDevToolsClient) riotBrowserUserAgent() (string, error) {
 	return userAgent, nil
 }
 
-func (c *chromeDevToolsClient) riotBrowserCookies() ([]*http.Cookie, error) {
+func (c *chromeDevToolsClient) riotBrowserCookies(ctx context.Context) ([]*http.Cookie, error) {
 	var response struct {
 		Cookies []struct {
 			Name     string  `json:"name"`
@@ -578,7 +484,7 @@ func (c *chromeDevToolsClient) riotBrowserCookies() ([]*http.Cookie, error) {
 			SameSite string  `json:"sameSite"`
 		} `json:"cookies"`
 	}
-	if err := c.call("Network.getCookies", map[string]any{
+	if err := c.Call(ctx, "Network.getCookies", map[string]any{
 		"urls": []string{"https://authenticate.riotgames.com/api/v1/login"},
 	}, &response); err != nil {
 		return nil, err
