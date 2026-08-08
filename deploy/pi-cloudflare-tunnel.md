@@ -42,12 +42,50 @@ sudo apt install xvfb chromium
 
 ## 설치와 활성화
 
-이미 Pi에 설치된 봇을 원격 모드로 바꾸거나, 처음 설치할 때 다음을 실행합니다.
+### 신규 설치
+
+아직 `/etc/valorant-bot/env`가 없는 신규 Pi는 처음 설치할 때 원하는 HTTPS origin을
+넘깁니다.
 
 ```bash
 sudo AUTH_BASE_URL=https://valorant-bot.example.com \
   ./scripts/setup-pi.sh --remote-captcha
 ```
+
+### 기존 설치 마이그레이션
+
+이미 설치된 Pi는 `setup-pi.sh`를 실행하기 **전에** base 환경 파일의
+`AUTH_BASE_URL`을 선택한 공개 HTTPS origin으로 바꿉니다. 아래 명령은 기존 줄을 한 번만
+교체하고, 줄이 없을 때만 하나를 추가합니다. 나머지 환경 값·파일 권한은 유지합니다.
+`https://valorant-bot.example.com`을 운영 origin으로 바꾸되, query, fragment, userinfo,
+공백, `|`, `&`, `\` 문자를 넣지 마세요.
+
+```bash
+CAPTCHA_AUTH_BASE_URL='https://valorant-bot.example.com'
+case "$CAPTCHA_AUTH_BASE_URL" in
+  https://|*'?'*|*'#'*|*'@'*|*' '*|*'|'*|*'&'*|*'\'*)
+    echo 'AUTH_BASE_URL must be an absolute HTTPS origin without userinfo, query, or fragment' >&2
+    exit 1
+    ;;
+  https://*) ;;
+  *)
+    echo 'AUTH_BASE_URL must start with https://' >&2
+    exit 1
+    ;;
+esac
+
+if sudo grep -q '^AUTH_BASE_URL=' /etc/valorant-bot/env; then
+  sudo sed -i "s|^AUTH_BASE_URL=.*$|AUTH_BASE_URL=${CAPTCHA_AUTH_BASE_URL}|" /etc/valorant-bot/env
+else
+  printf 'AUTH_BASE_URL=%s\n' "$CAPTCHA_AUTH_BASE_URL" | sudo tee -a /etc/valorant-bot/env >/dev/null
+fi
+unset CAPTCHA_AUTH_BASE_URL
+
+sudo ./scripts/setup-pi.sh --remote-captcha
+```
+
+마이그레이션 명령 자체는 서비스를 재시작하지 않습니다. 마지막 설치 명령이 원격 display
+유닛과 bot 서비스의 설치·시작을 처리하므로, 그 전에 별도로 bot을 재시작하지 마세요.
 
 `--remote-captcha`는 원격 설정을 두 층으로 설치·관리합니다.
 
