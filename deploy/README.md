@@ -106,6 +106,8 @@ not demonstrate a successful login against a live Riot account.
 
 - `install.sh` / `uninstall.sh` — systemd on Linux
 - `valorant-bot.service` — unit file
+- `remote-captcha.conf` — 원격 모드 전용 환경 파일 (설치 시 base env와 분리)
+- `valorant-captcha-display.service` — private Xvfb display unit
 - `nginx.example.conf` — optional reverse proxy
 - `env.*.example` — environment templates
 - `../scripts/pi-tunnel.sh` — Cloudflare quick tunnel (원격 CAPTCHA 테스트 또는 `/invite`)

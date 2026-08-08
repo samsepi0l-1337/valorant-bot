@@ -49,18 +49,32 @@ sudo AUTH_BASE_URL=https://valorant-bot.example.com \
   ./scripts/setup-pi.sh --remote-captcha
 ```
 
-`--remote-captcha`는 프로젝트의 `deploy/remote-captcha.conf` drop-in도 설치·관리합니다.
-이 drop-in은 `valorant-bot`과 `valorant-captcha-display.service`의 원격 디스플레이
-의존성을 연결하는 systemd 설정이며, `/etc/valorant-bot/env`를 대체하지 않습니다.
-운영 값인 `AUTH_BASE_URL`, `AUTH_PORT`, `CAPTCHA_BROWSER_MODE`, `CAPTCHA_DISPLAY`는 아래처럼
-환경 파일에서 관리합니다. 수동으로 drop-in을 복사하거나 임의의 display unit 이름을 만들지
-말고, 설정 변경 뒤에는 `systemctl daemon-reload`와 봇 재시작을 실행하세요.
+`--remote-captcha`는 원격 설정을 두 층으로 설치·관리합니다.
+
+1. 저장소의 `deploy/remote-captcha.conf`는 **원격 환경 파일**이며
+   `/etc/valorant-bot/remote-captcha.conf`로 설치됩니다. 이 파일만
+   `CAPTCHA_BROWSER_MODE=remote`와 `CAPTCHA_DISPLAY=:99`를 소유합니다.
+2. 설치 프로그램이 별도로 생성하는
+   `/etc/systemd/system/valorant-bot.service.d/remote-captcha.conf`는
+   systemd **drop-in**입니다. 이것이 원격 환경 파일을 읽고,
+   `valorant-captcha-display.service`를 `Requires=`/`After=`로 연결하며,
+   private X11 Unix socket의 bind mount를 두 서비스에 공유합니다.
+
+따라서 `--remote-captcha`는 기본 `/etc/valorant-bot/env`에 원격 모드를 쓰지 않습니다.
+그 파일은 공용 봇 설정만, 원격 환경 파일은 원격 display 설정만 가집니다. 수동으로
+drop-in을 복사하거나 임의의 display unit 이름을 만들지 말고, 설정 변경 뒤에는
+`systemctl daemon-reload`와 봇 재시작을 실행하세요.
 
 설치 후 `/etc/valorant-bot/env`에는 다음 값이 있어야 합니다.
 
 ```dotenv
 AUTH_BASE_URL=https://valorant-bot.example.com
 AUTH_PORT=8787
+```
+
+원격 값은 설치된 `/etc/valorant-bot/remote-captcha.conf`에서 확인합니다.
+
+```dotenv
 CAPTCHA_BROWSER_MODE=remote
 CAPTCHA_DISPLAY=:99
 ```
@@ -108,7 +122,8 @@ quick tunnel 주소는 프로세스를 다시 시작할 때 바뀌므로 지속�
 ```bash
 sudo systemctl is-active valorant-captcha-display.service
 sudo systemctl is-active valorant-bot.service
-sudo grep -E '^(AUTH_BASE_URL|CAPTCHA_BROWSER_MODE|CAPTCHA_DISPLAY)=' /etc/valorant-bot/env
+sudo grep -E '^(AUTH_BASE_URL|AUTH_PORT)=' /etc/valorant-bot/env
+sudo grep -E '^(CAPTCHA_BROWSER_MODE|CAPTCHA_DISPLAY)=' /etc/valorant-bot/remote-captcha.conf
 ```
 
 Discord의 같은 사용자가 받은 링크를 외부 브라우저에서 열어 CAPTCHA 프레임과 클릭/휠이
@@ -118,13 +133,20 @@ Discord의 같은 사용자가 받은 링크를 외부 브라우저에서 열어
 
 ## 즉시 롤백
 
-HTTPS Tunnel 또는 Xvfb를 중단해야 하면 먼저 원격 비밀번호 로그인을 QR 전용으로 바꾸고
-봇을 재시작한 뒤 디스플레이 유닛을 중지합니다.
+HTTPS Tunnel 또는 Xvfb를 중단해야 하면 원격 drop-in과 원격 환경 파일을 제거한 뒤,
+기본 환경 파일에서 QR 전용 모드를 명시합니다. `valorant-bot.service`를 먼저 멈춰
+실행 중인 Chromium을 정리하고, drop-in 제거 후 daemon reload를 해야 display 의존성이
+남지 않습니다.
 
 ```bash
-sudo sed -i 's/^CAPTCHA_BROWSER_MODE=.*/CAPTCHA_BROWSER_MODE=disabled/' /etc/valorant-bot/env
-sudo systemctl restart valorant-bot.service
+sudo systemctl stop valorant-bot.service
 sudo systemctl disable --now valorant-captcha-display.service
+sudo rm -f /etc/systemd/system/valorant-bot.service.d/remote-captcha.conf
+sudo rm -f /etc/valorant-bot/remote-captcha.conf
+sudo sed -i '/^CAPTCHA_BROWSER_MODE=/d; /^CAPTCHA_DISPLAY=/d' /etc/valorant-bot/env
+printf 'CAPTCHA_BROWSER_MODE=disabled\n' | sudo tee -a /etc/valorant-bot/env >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl start valorant-bot.service
 sudo systemctl status valorant-bot.service --no-pager
 ```
 
