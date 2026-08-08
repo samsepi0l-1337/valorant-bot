@@ -59,10 +59,16 @@ func (c *chromeBrowserController) RunRiotLogin(ctx context.Context, username, pa
 			return riotBrowserLoginResult{}, err
 		}
 	}
+	networkEvents, err := client.SubscribeEvents(client.currentSessionID(),
+		"Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished")
+	if err != nil {
+		return riotBrowserLoginResult{}, fmt.Errorf("watch Riot browser login: %w", err)
+	}
+	defer networkEvents.Close()
 	if err := client.submitRiotCredentials(ctx, username, password); err != nil {
 		return riotBrowserLoginResult{}, err
 	}
-	return client.waitForRiotLogin(ctx)
+	return client.waitForRiotLogin(ctx, networkEvents)
 }
 
 func (c *chromeDevToolsClient) attachRiotPage(ctx context.Context) error {
@@ -295,10 +301,10 @@ type riotBrowserRequest struct {
 	status   int
 }
 
-func (c *chromeDevToolsClient) waitForRiotLogin(ctx context.Context) (riotBrowserLoginResult, error) {
+func (c *chromeDevToolsClient) waitForRiotLogin(ctx context.Context, events *chromeDevToolsEventSubscription) (riotBrowserLoginResult, error) {
 	requests := make(map[string]riotBrowserRequest)
 	for {
-		event, err := c.NextEvent(ctx)
+		event, err := events.Next(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return riotBrowserLoginResult{}, ctx.Err()

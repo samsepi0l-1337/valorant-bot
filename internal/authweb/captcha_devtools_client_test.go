@@ -3,12 +3,19 @@ package authweb
 import (
 	"context"
 	"errors"
-	"fmt"
+	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func newTestChromeDevToolsPipes() (*chromeDevToolsPipe, *chromeDevToolsPipe) {
+	browserCommands, hostCommands := io.Pipe()
+	hostResponses, browserResponses := io.Pipe()
+	return newChromeDevToolsPipe(hostResponses, hostCommands), newChromeDevToolsPipe(browserCommands, browserResponses)
+}
 
 func TestChromeDevToolsClientCorrelatesConcurrentOutOfOrderReplies(t *testing.T) {
 	host, browser := newTestChromeDevToolsPipes()
@@ -73,7 +80,7 @@ func TestChromeDevToolsClientCorrelatesConcurrentOutOfOrderReplies(t *testing.T)
 	}
 }
 
-func TestChromeDevToolsClientPublishesUnsolicitedEventsWhileCallIsPending(t *testing.T) {
+func TestChromeDevToolsClientFansOutFilteredEventsToIndependentSubscribers(t *testing.T) {
 	host, browser := newTestChromeDevToolsPipes()
 	t.Cleanup(func() {
 		_ = host.Close()
@@ -82,44 +89,82 @@ func TestChromeDevToolsClientPublishesUnsolicitedEventsWhileCallIsPending(t *tes
 	client := newChromeDevToolsClient(host)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-
-	done := make(chan error, 1)
-	go func() { done <- client.Call(ctx, "Runtime.evaluate", map[string]any{}, nil) }()
-	var command struct {
-		ID int64 `json:"id"`
-	}
-	if err := browser.ReadJSON(&command); err != nil {
+	networkA, err := client.SubscribeEvents("riot-session",
+		"Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished")
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer networkA.Close()
+	networkB, err := client.SubscribeEvents("riot-session", "Network.responseReceived")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer networkB.Close()
+	page, err := client.SubscribeEvents("riot-session", "Page.screencastFrame")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer page.Close()
+
+	for _, event := range []map[string]any{
+		{"method": "Network.responseReceived", "sessionId": "other-session", "params": map[string]any{"requestId": "wrong-session"}},
+		{"method": "Runtime.consoleAPICalled", "sessionId": "riot-session", "params": map[string]any{"type": "log"}},
+		{"method": "Network.responseReceived", "sessionId": "riot-session", "params": map[string]any{"requestId": "network-1"}},
+		{"method": "Page.screencastFrame", "sessionId": "riot-session", "params": map[string]any{"sessionId": 7}},
+	} {
+		if err := browser.WriteJSON(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for name, subscription := range map[string]*chromeDevToolsEventSubscription{
+		"network A": networkA,
+		"network B": networkB,
+	} {
+		event, err := subscription.Next(ctx)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if event.Method != "Network.responseReceived" || !strings.Contains(string(event.Params), "network-1") {
+			t.Fatalf("%s event = %+v, want matching network event", name, event)
+		}
+	}
+	pageEvent, err := page.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pageEvent.Method != "Page.screencastFrame" {
+		t.Fatalf("page event = %+v, want filtered screencast event", pageEvent)
+	}
+
+	networkA.Close()
+	if _, err := networkA.Next(context.Background()); !errors.Is(err, errChromeDevToolsEventSubscriptionClosed) {
+		t.Fatalf("unsubscribed Next error = %v, want subscription closed", err)
+	}
 	if err := browser.WriteJSON(map[string]any{
-		"method": "Network.loadingFinished", "sessionId": "riot-session",
-		"params": map[string]any{"requestId": "request-1"},
+		"method": "Network.responseReceived", "sessionId": "riot-session",
+		"params": map[string]any{"requestId": "network-2"},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := browser.WriteJSON(map[string]any{"id": command.ID, "result": map[string]any{}}); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case event := <-client.Events():
-		if event.Method != "Network.loadingFinished" || !strings.Contains(string(event.Params), "request-1") {
-			t.Fatalf("event = %+v, want unsolicited Network.loadingFinished", event)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("unsolicited event was not published")
+	event, err := networkB.Next(ctx)
+	if err != nil || !strings.Contains(string(event.Params), "network-2") {
+		t.Fatalf("remaining subscriber event/error = %+v/%v", event, err)
 	}
 }
 
 func TestChromeDevToolsClientCancellationDoesNotPoisonLaterCalls(t *testing.T) {
 	host, browser := newTestChromeDevToolsPipes()
+	transport := &signalingChromeDevToolsTransport{
+		chromeDevToolsPipe: host,
+		writeStarted:       make(chan struct{}),
+		writeFinished:      make(chan struct{}),
+	}
 	t.Cleanup(func() {
 		_ = host.Close()
 		_ = browser.Close()
 	})
-	client := newChromeDevToolsClient(host)
+	client := newChromeDevToolsClient(transport)
 	ctx, cancel := context.WithCancel(context.Background())
 	firstDone := make(chan error, 1)
 	go func() { firstDone <- client.Call(ctx, "Runtime.canceled", map[string]any{}, nil) }()
@@ -128,6 +173,11 @@ func TestChromeDevToolsClientCancellationDoesNotPoisonLaterCalls(t *testing.T) {
 	}
 	if err := browser.ReadJSON(&first); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-transport.writeFinished:
+	case <-time.After(time.Second):
+		t.Fatal("first command was read but its private-pipe write did not finish")
 	}
 	cancel()
 	select {
@@ -283,28 +333,60 @@ func TestChromeDevToolsClientPipeCloseUnblocksEveryWaiter(t *testing.T) {
 	}
 }
 
-func TestChromeDevToolsClientBoundsEventDeliveryWithoutBlockingReplies(t *testing.T) {
+func TestChromeDevToolsClientSubscriberOverflowIsExplicitAndPreservesQueuedOrder(t *testing.T) {
 	host, browser := newTestChromeDevToolsPipes()
 	t.Cleanup(func() {
 		_ = host.Close()
 		_ = browser.Close()
 	})
 	client := newChromeDevToolsClient(host)
-	events := client.Events()
-	const extra = 37
-	for i := 0; i < chromeDevToolsEventBuffer+extra; i++ {
-		if err := browser.WriteJSON(map[string]any{
-			"method": fmt.Sprintf("Network.event.%03d", i),
-		}); err != nil {
+	network, err := client.subscribeEvents("riot-session", 3,
+		"Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished", "Network.dataReceived")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer network.Close()
+	page, err := client.SubscribeEvents("riot-session", "Page.screencastFrame")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer page.Close()
+
+	for _, event := range []map[string]any{
+		{"method": "Network.requestWillBeSent", "sessionId": "other-session"},
+		{"method": "Page.screencastFrame", "sessionId": "riot-session", "params": map[string]any{"sessionId": 9}},
+		{"method": "Network.requestWillBeSent", "sessionId": "riot-session", "params": map[string]any{"requestId": "login"}},
+		{"method": "Network.responseReceived", "sessionId": "riot-session", "params": map[string]any{"requestId": "login"}},
+		{"method": "Network.loadingFinished", "sessionId": "riot-session", "params": map[string]any{"requestId": "login"}},
+		{"method": "Network.dataReceived", "sessionId": "riot-session", "params": map[string]any{"requestId": "overflow"}},
+	} {
+		if err := browser.WriteJSON(event); err != nil {
 			t.Fatal(err)
 		}
 	}
-	deadline := time.Now().Add(time.Second)
-	for len(events) != chromeDevToolsEventBuffer && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	select {
+	case <-network.Done():
+	case <-time.After(time.Second):
+		t.Fatal("overflow did not terminate the bounded subscriber")
 	}
-	if got := len(events); got != chromeDevToolsEventBuffer {
-		t.Fatalf("buffered events = %d, want bounded capacity %d", got, chromeDevToolsEventBuffer)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	for _, method := range []string{"Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished"} {
+		event, err := network.Next(ctx)
+		if err != nil {
+			t.Fatalf("ordered %s event: %v", method, err)
+		}
+		if event.Method != method || !strings.Contains(string(event.Params), "login") {
+			t.Fatalf("ordered event = %+v, want %s for login", event, method)
+		}
+	}
+	if _, err := network.Next(ctx); !errors.Is(err, errChromeDevToolsEventOverflow) {
+		t.Fatalf("overflow terminal error = %v, want explicit overflow", err)
+	}
+	pageEvent, err := page.Next(ctx)
+	if err != nil || pageEvent.Method != "Page.screencastFrame" {
+		t.Fatalf("independent page subscriber event/error = %+v/%v", pageEvent, err)
 	}
 
 	done := make(chan error, 1)
@@ -324,16 +406,149 @@ func TestChromeDevToolsClientBoundsEventDeliveryWithoutBlockingReplies(t *testin
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("full event channel blocked response dispatch")
+		t.Fatal("overflowed subscriber blocked response dispatch")
+	}
+}
+
+type signalingChromeDevToolsTransport struct {
+	*chromeDevToolsPipe
+	writeStarted  chan struct{}
+	writeFinished chan struct{}
+	startOnce     sync.Once
+	finishOnce    sync.Once
+}
+
+func (t *signalingChromeDevToolsTransport) WriteJSON(value any) error {
+	t.startOnce.Do(func() { close(t.writeStarted) })
+	err := t.chromeDevToolsPipe.WriteJSON(value)
+	if t.writeFinished != nil {
+		t.finishOnce.Do(func() { close(t.writeFinished) })
+	}
+	return err
+}
+
+func TestChromeDevToolsClientCancellationInterruptsBlockedPrivatePipeWrite(t *testing.T) {
+	host, browser := newTestChromeDevToolsPipes()
+	transport := &signalingChromeDevToolsTransport{chromeDevToolsPipe: host, writeStarted: make(chan struct{})}
+	t.Cleanup(func() {
+		_ = host.Close()
+		_ = browser.Close()
+	})
+	client := newChromeDevToolsClient(transport)
+	ctx, cancel := context.WithCancel(context.Background())
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- client.Call(ctx, "Runtime.blockedWrite", map[string]any{}, nil) }()
+	select {
+	case <-transport.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("call did not enter the production private-pipe write")
+	}
+	cancel()
+	select {
+	case err := <-firstDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("blocked-write cancellation error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("context cancellation did not interrupt blocked private-pipe write")
 	}
 
-	var last chromeDevToolsMessage
-	for len(events) > 0 {
-		last = <-events
+	client.mu.Lock()
+	pending := len(client.pending)
+	client.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending calls after blocked-write cancellation = %d, want 0", pending)
 	}
-	wantLast := fmt.Sprintf("Network.event.%03d", chromeDevToolsEventBuffer+extra-1)
-	if last.Method != wantLast {
-		t.Fatalf("latest buffered event = %q, want %q", last.Method, wantLast)
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- client.Call(context.Background(), "Runtime.afterBlockedWrite", map[string]any{}, nil)
+	}()
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, errChromeDevToolsClientClosed) {
+			t.Fatalf("later writer error = %v, want stable terminal error", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled blocked write stalled a later writer")
+	}
+}
+
+type barrierChromeDevToolsTransport struct {
+	writeStarted chan struct{}
+	releaseWrite chan struct{}
+	closed       chan struct{}
+	startOnce    sync.Once
+	closeOnce    sync.Once
+}
+
+func newBarrierChromeDevToolsTransport() *barrierChromeDevToolsTransport {
+	return &barrierChromeDevToolsTransport{
+		writeStarted: make(chan struct{}),
+		releaseWrite: make(chan struct{}),
+		closed:       make(chan struct{}),
+	}
+}
+
+func (t *barrierChromeDevToolsTransport) ReadJSON(any) error {
+	<-t.closed
+	return errors.New("barrier reader closed")
+}
+
+func (t *barrierChromeDevToolsTransport) WriteJSON(any) error {
+	t.startOnce.Do(func() { close(t.writeStarted) })
+	<-t.releaseWrite
+	return errors.New("barrier write failed")
+}
+
+func (t *barrierChromeDevToolsTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+	return nil
+}
+
+func TestChromeDevToolsClientCloseAndWriteFailureShareOneTerminalError(t *testing.T) {
+	transport := newBarrierChromeDevToolsTransport()
+	client := newChromeDevToolsClient(transport)
+	calls := make(chan error, 2)
+	go func() { calls <- client.Call(context.Background(), "Runtime.first", map[string]any{}, nil) }()
+	go func() { calls <- client.Call(context.Background(), "Runtime.second", map[string]any{}, nil) }()
+	select {
+	case <-transport.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("write did not reach barrier")
+	}
+
+	closeDone := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() { closeDone <- client.Close(ctx) }()
+	close(transport.releaseWrite)
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close stayed blocked during write failure")
+	}
+
+	var terminal string
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-calls:
+			if !errors.Is(err, errChromeDevToolsClientClosed) {
+				t.Fatalf("in-flight call error = %v, want stable terminal", err)
+			}
+			if i == 0 {
+				terminal = err.Error()
+			} else if err.Error() != terminal {
+				t.Fatalf("in-flight terminal errors differ: %q and %q", terminal, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("in-flight call stayed blocked")
+		}
+	}
+	if err := client.Call(context.Background(), "Runtime.later", map[string]any{}, nil); err.Error() != terminal {
+		t.Fatalf("later call error = %v, want stable %q", err, terminal)
 	}
 }
 
@@ -392,18 +607,17 @@ func TestChromeDevToolsClientCloseStopsReaderWithoutReadablePeer(t *testing.T) {
 	host, browser := newTestChromeDevToolsPipes()
 	t.Cleanup(func() { _ = browser.Close() })
 	client := newChromeDevToolsClient(host)
+	subscription, err := client.SubscribeEvents("", "Page.screencastFrame")
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	if err := client.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case _, ok := <-client.Events():
-		if ok {
-			t.Fatal("event subscription remained open after close")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("client close waited for the peer to read or respond")
+	if _, err := subscription.Next(context.Background()); !errors.Is(err, errChromeDevToolsClientClosed) {
+		t.Fatalf("subscription error after client close = %v, want stable terminal", err)
 	}
 	if err := client.Call(context.Background(), "Runtime.afterClose", map[string]any{}, nil); !errors.Is(err, errChromeDevToolsClientClosed) {
 		t.Fatalf("call after close error = %v, want stable terminal error", err)

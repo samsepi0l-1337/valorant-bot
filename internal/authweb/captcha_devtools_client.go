@@ -10,7 +10,11 @@ import (
 
 const chromeDevToolsEventBuffer = 256
 
-var errChromeDevToolsClientClosed = errors.New("Riot Chrome DevTools client closed")
+var (
+	errChromeDevToolsClientClosed            = errors.New("Riot Chrome DevTools client closed")
+	errChromeDevToolsEventSubscriptionClosed = errors.New("Riot Chrome DevTools event subscription closed")
+	errChromeDevToolsEventOverflow           = errors.New("Riot Chrome DevTools event subscription overflow")
+)
 
 type chromeDevToolsMessage struct {
 	ID        int64           `json:"id,omitempty"`
@@ -37,6 +41,29 @@ type chromeDevToolsResponse struct {
 	err     error
 }
 
+type chromeDevToolsWriteRequest struct {
+	ctx     context.Context
+	command map[string]any
+	done    chan error
+}
+
+type chromeDevToolsEventSubscription struct {
+	client *chromeDevToolsClient
+	id     uint64
+	events chan chromeDevToolsMessage
+	done   chan struct{}
+	filter chromeDevToolsEventFilter
+
+	finishOnce sync.Once
+	mu         sync.Mutex
+	terminal   error
+}
+
+type chromeDevToolsEventFilter struct {
+	sessionID string
+	methods   map[string]struct{}
+}
+
 type chromeDevToolsClient struct {
 	conn chromeDevToolsTransport
 
@@ -47,12 +74,19 @@ type chromeDevToolsClient struct {
 	sessionID string
 	closed    bool
 	terminal  error
-	events    chan chromeDevToolsMessage
-	done      chan struct{}
 
-	closeOnce     sync.Once
-	closeFinished chan struct{}
-	closeErr      error
+	nextSubscriberID uint64
+	subscribers      map[uint64]*chromeDevToolsEventSubscription
+	done             chan struct{}
+	closedSignal     chan struct{}
+
+	writesMu    sync.Mutex
+	activeWrite *chromeDevToolsWriteRequest
+	writeQueue  chan *chromeDevToolsWriteRequest
+
+	transportCloseOnce sync.Once
+	transportClosed    chan struct{}
+	transportCloseErr  error
 }
 
 func newChromeDevToolsClient(conn chromeDevToolsTransport) *chromeDevToolsClient {
@@ -64,10 +98,13 @@ func newChromeDevToolsClient(conn chromeDevToolsTransport) *chromeDevToolsClient
 func (c *chromeDevToolsClient) start() {
 	c.startOnce.Do(func() {
 		c.pending = make(map[int64]chan chromeDevToolsResponse)
-		c.events = make(chan chromeDevToolsMessage, chromeDevToolsEventBuffer)
+		c.subscribers = make(map[uint64]*chromeDevToolsEventSubscription)
 		c.done = make(chan struct{})
-		c.closeFinished = make(chan struct{})
+		c.closedSignal = make(chan struct{})
+		c.writeQueue = make(chan *chromeDevToolsWriteRequest)
+		c.transportClosed = make(chan struct{})
 		go c.readLoop()
+		go c.writeLoop()
 	})
 }
 
@@ -97,14 +134,38 @@ func (c *chromeDevToolsClient) Call(ctx context.Context, method string, params a
 	if sessionID != "" {
 		command["sessionId"] = sessionID
 	}
-	if err := c.conn.WriteJSON(command); err != nil {
-		c.mu.Lock()
-		if c.pending[id] == response {
-			delete(c.pending, id)
+	writeRequest := &chromeDevToolsWriteRequest{
+		ctx: ctx, command: command, done: make(chan error, 1),
+	}
+	select {
+	case c.writeQueue <- writeRequest:
+	case <-ctx.Done():
+		c.removePending(id, response)
+		return fmt.Errorf("Riot Chrome %s: %w", method, ctx.Err())
+	case <-c.closedSignal:
+		return c.terminalError()
+	}
+
+	select {
+	case err := <-writeRequest.done:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			c.removePending(id, response)
+			return fmt.Errorf("Riot Chrome %s: %w", method, ctxErr)
 		}
-		c.mu.Unlock()
-		c.failTransport(fmt.Errorf("%w: write command: %v", errChromeDevToolsClientClosed, err))
-		return fmt.Errorf("Riot Chrome %s: %w", method, err)
+		if err != nil {
+			return err
+		}
+	case <-ctx.Done():
+		c.removePending(id, response)
+		c.abortWrite(writeRequest)
+		return fmt.Errorf("Riot Chrome %s: %w", method, ctx.Err())
+	case <-c.closedSignal:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			c.removePending(id, response)
+			c.abortWrite(writeRequest)
+			return fmt.Errorf("Riot Chrome %s: %w", method, ctxErr)
+		}
+		return c.terminalError()
 	}
 
 	select {
@@ -125,19 +186,38 @@ func (c *chromeDevToolsClient) Call(ctx context.Context, method string, params a
 		}
 		return nil
 	case <-ctx.Done():
-		c.mu.Lock()
-		if c.pending[id] == response {
-			delete(c.pending, id)
-			c.mu.Unlock()
+		if c.removePending(id, response) {
 			return fmt.Errorf("Riot Chrome %s: %w", method, ctx.Err())
 		}
-		c.mu.Unlock()
 		reply := <-response
 		if reply.err != nil {
 			return reply.err
 		}
 		return fmt.Errorf("Riot Chrome %s: %w", method, ctx.Err())
+	case <-c.closedSignal:
+		return c.terminalError()
 	}
+}
+
+func (c *chromeDevToolsClient) removePending(id int64, response chan chromeDevToolsResponse) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pending[id] != response {
+		return false
+	}
+	delete(c.pending, id)
+	return true
+}
+
+func (c *chromeDevToolsClient) abortWrite(request *chromeDevToolsWriteRequest) {
+	c.writesMu.Lock()
+	active := c.activeWrite == request
+	c.writesMu.Unlock()
+	if !active {
+		return
+	}
+	c.terminate(fmt.Errorf("%w: canceled blocked write", errChromeDevToolsClientClosed))
+	c.shutdownTransport()
 }
 
 // call preserves the package-private synchronous helper while all pipe reads
@@ -146,40 +226,122 @@ func (c *chromeDevToolsClient) call(method string, params any, result any) error
 	return c.Call(context.Background(), method, params, result)
 }
 
-func (c *chromeDevToolsClient) Events() <-chan chromeDevToolsMessage {
-	c.start()
-	return c.events
+func (c *chromeDevToolsClient) SubscribeEvents(sessionID string, methods ...string) (*chromeDevToolsEventSubscription, error) {
+	return c.subscribeEvents(sessionID, chromeDevToolsEventBuffer, methods...)
 }
 
-func (c *chromeDevToolsClient) NextEvent(ctx context.Context) (chromeDevToolsMessage, error) {
+func (c *chromeDevToolsClient) subscribeEvents(sessionID string, buffer int, methods ...string) (*chromeDevToolsEventSubscription, error) {
 	if c == nil || c.conn == nil {
-		return chromeDevToolsMessage{}, errChromeDevToolsClientClosed
+		return nil, errChromeDevToolsClientClosed
 	}
 	c.start()
-	for {
+	if buffer <= 0 {
+		return nil, errors.New("Riot Chrome DevTools event subscription buffer must be positive")
+	}
+	methodSet := make(map[string]struct{}, len(methods))
+	for _, method := range methods {
+		if method != "" {
+			methodSet[method] = struct{}{}
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil, c.terminal
+	}
+	c.nextSubscriberID++
+	subscription := &chromeDevToolsEventSubscription{
+		client: c,
+		id:     c.nextSubscriberID,
+		events: make(chan chromeDevToolsMessage, buffer),
+		done:   make(chan struct{}),
+		filter: chromeDevToolsEventFilter{sessionID: sessionID, methods: methodSet},
+	}
+	c.subscribers[subscription.id] = subscription
+	return subscription, nil
+}
+
+func (s *chromeDevToolsEventSubscription) Next(ctx context.Context) (chromeDevToolsMessage, error) {
+	if s == nil {
+		return chromeDevToolsMessage{}, errChromeDevToolsEventSubscriptionClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return chromeDevToolsMessage{}, err
+	}
+	select {
+	case <-ctx.Done():
+		return chromeDevToolsMessage{}, ctx.Err()
+	case event, ok := <-s.events:
+		if !ok {
+			return chromeDevToolsMessage{}, s.terminalError()
+		}
 		if err := ctx.Err(); err != nil {
 			return chromeDevToolsMessage{}, err
 		}
-		select {
-		case <-ctx.Done():
-			return chromeDevToolsMessage{}, ctx.Err()
-		case event, ok := <-c.events:
-			if !ok {
-				return chromeDevToolsMessage{}, c.terminalError()
-			}
-			if err := ctx.Err(); err != nil {
-				return chromeDevToolsMessage{}, err
-			}
-			if sessionID := c.currentSessionID(); sessionID != "" && event.SessionID != sessionID {
-				continue
-			}
-			return event, nil
-		}
+		return event, nil
 	}
 }
 
-func (c *chromeDevToolsClient) nextEvent() (chromeDevToolsMessage, error) {
-	return c.NextEvent(context.Background())
+func (s *chromeDevToolsEventSubscription) Close() {
+	if s == nil {
+		return
+	}
+	if s.client == nil {
+		s.finish(errChromeDevToolsEventSubscriptionClosed)
+		return
+	}
+	s.client.unsubscribe(s, errChromeDevToolsEventSubscriptionClosed)
+}
+
+func (s *chromeDevToolsEventSubscription) Done() <-chan struct{} {
+	if s == nil {
+		closed := make(chan struct{})
+		close(closed)
+		return closed
+	}
+	return s.done
+}
+
+func (s *chromeDevToolsEventSubscription) matches(message chromeDevToolsMessage) bool {
+	if s.filter.sessionID != "" && message.SessionID != s.filter.sessionID {
+		return false
+	}
+	if len(s.filter.methods) == 0 {
+		return true
+	}
+	_, ok := s.filter.methods[message.Method]
+	return ok
+}
+
+func (s *chromeDevToolsEventSubscription) finish(err error) {
+	s.finishOnce.Do(func() {
+		if err == nil {
+			err = errChromeDevToolsEventSubscriptionClosed
+		}
+		s.mu.Lock()
+		s.terminal = err
+		s.mu.Unlock()
+		close(s.events)
+		close(s.done)
+	})
+}
+
+func (s *chromeDevToolsEventSubscription) terminalError() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.terminal != nil {
+		return s.terminal
+	}
+	return errChromeDevToolsEventSubscriptionClosed
+}
+
+func (c *chromeDevToolsClient) unsubscribe(subscription *chromeDevToolsEventSubscription, terminal error) {
+	c.mu.Lock()
+	if c.subscribers[subscription.id] == subscription {
+		delete(c.subscribers, subscription.id)
+	}
+	c.mu.Unlock()
+	subscription.finish(terminal)
 }
 
 func (c *chromeDevToolsClient) setSessionID(sessionID string) {
@@ -203,15 +365,56 @@ func (c *chromeDevToolsClient) terminalError() error {
 	return errChromeDevToolsClientClosed
 }
 
+func (c *chromeDevToolsClient) writeLoop() {
+	for {
+		select {
+		case <-c.closedSignal:
+			return
+		case request := <-c.writeQueue:
+			if err := request.ctx.Err(); err != nil {
+				request.done <- err
+				continue
+			}
+			select {
+			case <-c.closedSignal:
+				request.done <- c.terminalError()
+				return
+			default:
+			}
+			c.writesMu.Lock()
+			if err := request.ctx.Err(); err != nil {
+				c.writesMu.Unlock()
+				request.done <- err
+				continue
+			}
+			c.activeWrite = request
+			c.writesMu.Unlock()
+
+			err := c.conn.WriteJSON(request.command)
+
+			c.writesMu.Lock()
+			if c.activeWrite == request {
+				c.activeWrite = nil
+			}
+			c.writesMu.Unlock()
+			if err != nil {
+				terminal := c.terminate(fmt.Errorf("%w: write command: %v", errChromeDevToolsClientClosed, err))
+				request.done <- terminal
+				c.shutdownTransport()
+				return
+			}
+			request.done <- nil
+		}
+	}
+}
+
 func (c *chromeDevToolsClient) readLoop() {
-	defer func() {
-		close(c.events)
-		close(c.done)
-	}()
+	defer close(c.done)
 	for {
 		var message chromeDevToolsMessage
 		if err := c.conn.ReadJSON(&message); err != nil {
 			c.terminate(fmt.Errorf("%w: read response: %v", errChromeDevToolsClientClosed, err))
+			c.shutdownTransport()
 			return
 		}
 		if message.ID != 0 {
@@ -224,43 +427,51 @@ func (c *chromeDevToolsClient) readLoop() {
 			c.mu.Unlock()
 			continue
 		}
+		c.dispatchEvent(message)
+	}
+}
+
+func (c *chromeDevToolsClient) dispatchEvent(message chromeDevToolsMessage) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id, subscription := range c.subscribers {
+		if !subscription.matches(message) {
+			continue
+		}
 		select {
-		case c.events <- message:
+		case subscription.events <- message:
 		default:
-			select {
-			case <-c.events:
-			default:
-			}
-			select {
-			case c.events <- message:
-			default:
-			}
+			delete(c.subscribers, id)
+			subscription.finish(errChromeDevToolsEventOverflow)
 		}
 	}
 }
 
-func (c *chromeDevToolsClient) terminate(err error) {
+func (c *chromeDevToolsClient) terminate(err error) error {
 	if err == nil {
 		err = errChromeDevToolsClientClosed
 	}
 	c.mu.Lock()
 	if c.closed {
+		terminal := c.terminal
 		c.mu.Unlock()
-		return
+		return terminal
 	}
 	c.closed = true
 	c.terminal = err
+	close(c.closedSignal)
 	pending := c.pending
 	c.pending = make(map[int64]chan chromeDevToolsResponse)
 	for _, response := range pending {
 		response <- chromeDevToolsResponse{err: err}
 	}
+	subscribers := c.subscribers
+	c.subscribers = make(map[uint64]*chromeDevToolsEventSubscription)
+	for _, subscription := range subscribers {
+		subscription.finish(err)
+	}
 	c.mu.Unlock()
-}
-
-func (c *chromeDevToolsClient) failTransport(err error) {
-	c.terminate(err)
-	go func() { _ = closeChromeDevToolsTransport(c.conn) }()
+	return err
 }
 
 func closeChromeDevToolsTransport(transport chromeDevToolsTransport) error {
@@ -271,28 +482,32 @@ func closeChromeDevToolsTransport(transport chromeDevToolsTransport) error {
 	return closer.Close()
 }
 
+func (c *chromeDevToolsClient) shutdownTransport() {
+	c.transportCloseOnce.Do(func() {
+		go func() {
+			err := closeChromeDevToolsTransport(c.conn)
+			c.mu.Lock()
+			c.transportCloseErr = err
+			c.mu.Unlock()
+			close(c.transportClosed)
+		}()
+	})
+}
+
 func (c *chromeDevToolsClient) Close(ctx context.Context) error {
 	if c == nil || c.conn == nil {
 		return nil
 	}
 	c.start()
 	c.terminate(errChromeDevToolsClientClosed)
-	c.closeOnce.Do(func() {
-		go func() {
-			err := closeChromeDevToolsTransport(c.conn)
-			c.mu.Lock()
-			c.closeErr = err
-			c.mu.Unlock()
-			close(c.closeFinished)
-		}()
-	})
+	c.shutdownTransport()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
-	case <-c.closeFinished:
+	case <-c.transportClosed:
 	}
 	select {
 	case <-ctx.Done():
@@ -301,5 +516,5 @@ func (c *chromeDevToolsClient) Close(ctx context.Context) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.closeErr
+	return c.transportCloseErr
 }

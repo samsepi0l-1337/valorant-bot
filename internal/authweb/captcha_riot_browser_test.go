@@ -3,7 +3,6 @@ package authweb
 import (
 	"context"
 	"errors"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -608,12 +607,6 @@ func TestRiotBrowserControllerCloseUnblocksPrivatePipeWhenOwnedProcessSurvives(t
 	case <-time.After(250 * time.Millisecond):
 		t.Fatal("controller retained the private pipe after process termination failed")
 	}
-}
-
-func newTestChromeDevToolsPipes() (*chromeDevToolsPipe, *chromeDevToolsPipe) {
-	browserCommands, hostCommands := io.Pipe()
-	hostResponses, browserResponses := io.Pipe()
-	return newChromeDevToolsPipe(hostResponses, hostCommands), newChromeDevToolsPipe(browserCommands, browserResponses)
 }
 
 func writeRiotLoginEvents(t *testing.T, conn chromeDevToolsTransport, sessionID, requestID, method string) {
