@@ -11,7 +11,11 @@ import (
 
 const captchaProcessTerminateTimeout = 2 * time.Second
 
-func configureCaptchaProcess(_ *exec.Cmd) {}
+func prepareCaptchaProcess(_ *exec.Cmd) (*captchaProcessOwnership, error) { return nil, nil }
+
+func completeCaptchaProcessOwnership(_ *captchaProcessOwnership, process *os.Process, exited <-chan struct{}) *captchaProcessOwnership {
+	return newCaptchaProcessOwnership(process, exited)
+}
 
 func newCaptchaProcessOwnership(process *os.Process, exited <-chan struct{}) *captchaProcessOwnership {
 	return trackCaptchaProcessOwnership(

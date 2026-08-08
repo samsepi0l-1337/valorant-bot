@@ -5,23 +5,70 @@ package authweb
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"syscall"
 	"time"
 )
 
 const captchaProcessTerminateTimeout = time.Second
 const captchaProcessGroupPollInterval = 10 * time.Millisecond
+const captchaProcessGuardianArgument = "--valorant-internal-captcha-process-group-guardian"
+const captchaProcessGuardianEnvironment = "VALORANT_INTERNAL_CAPTCHA_PROCESS_GROUP_GUARDIAN"
 
-func configureCaptchaProcess(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+func init() {
+	if len(os.Args) == 2 && os.Args[1] == captchaProcessGuardianArgument && os.Getenv(captchaProcessGuardianEnvironment) == "1" {
+		signal.Ignore(syscall.SIGTERM)
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		os.Exit(0)
+	}
+}
+
+func prepareCaptchaProcess(cmd *exec.Cmd) (*captchaProcessOwnership, error) {
+	guardianRead, guardianWrite, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("create CAPTCHA process guardian pipe: %w", err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		_ = guardianRead.Close()
+		_ = guardianWrite.Close()
+		return nil, fmt.Errorf("resolve CAPTCHA process guardian executable: %w", err)
+	}
+	guardian := exec.Command(executable, captchaProcessGuardianArgument)
+	guardian.Env = []string{captchaProcessGuardianEnvironment + "=1"}
+	guardian.Stdin = guardianRead
+	guardian.Stdout = io.Discard
+	guardian.Stderr = io.Discard
+	guardian.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := guardian.Start(); err != nil {
+		_ = guardianRead.Close()
+		_ = guardianWrite.Close()
+		return nil, fmt.Errorf("start CAPTCHA process guardian: %w", err)
+	}
+	_ = guardianRead.Close()
+	guardianExited := make(chan struct{})
+	go func() {
+		_ = guardian.Wait()
+		close(guardianExited)
+	}()
+
+	owner := rawCaptchaProcessOwnership(guardian.Process, guardianExited)
+	owner.stableGroup = true
+	owner.singleUseTermination = true
+	owner.releaseRaw = guardianWrite.Close
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: guardian.Process.Pid}
+	return owner, nil
+}
+
+func completeCaptchaProcessOwnership(prepared *captchaProcessOwnership, _ *os.Process, _ <-chan struct{}) *captchaProcessOwnership {
+	return prepared
 }
 
 func newCaptchaProcessOwnership(process *os.Process, exited <-chan struct{}) *captchaProcessOwnership {
-	owner := rawCaptchaProcessOwnership(process, exited)
-	owner.startMonitor(captchaProcessGroupPollInterval)
-	return owner
+	return rawCaptchaProcessOwnership(process, exited)
 }
 
 func rawCaptchaProcessOwnership(process *os.Process, exited <-chan struct{}) *captchaProcessOwnership {

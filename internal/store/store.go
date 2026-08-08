@@ -48,7 +48,6 @@ type GuildSettings struct {
 // DefaultDailyHourKST is used when a guild has no explicit schedule.
 const DefaultDailyHourKST = 9
 
-
 // Open opens (or creates) a SQLite database at path and migrates the schema.
 func Open(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil && filepath.Dir(path) != "." {
@@ -245,6 +244,20 @@ func (s *Store) TakeAuthPending(state string) (discordUserID string, ok bool, er
 		return "", false, err
 	}
 	return discordUserID, true, nil
+}
+
+// TakeAuthPendingForOwner atomically deletes a pending state only when both
+// its state and Discord owner match. The boolean reports whether a row changed.
+func (s *Store) TakeAuthPendingForOwner(state, discordUserID string) (bool, error) {
+	result, err := s.db.Exec(`DELETE FROM auth_pending WHERE state = ? AND discord_user_id = ?`, state, discordUserID)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows != 0, nil
 }
 
 // AddWishlist adds a skin to a user's wishlist (idempotent).

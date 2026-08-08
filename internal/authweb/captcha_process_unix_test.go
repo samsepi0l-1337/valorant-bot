@@ -164,68 +164,107 @@ func TestCaptchaBrowserCloseNeverRevivesObservedGoneProcessGroup(t *testing.T) {
 	}
 }
 
-// Mutation caught: only probing ownership inside the first Close can mistake a
-// replacement group for the original when the numeric PGID was reused earlier.
-func TestCaptchaBrowserCloseTracksGroupLossBeforeFirstClose(t *testing.T) {
+// Mutation caught: wiring Chrome itself as the process-group leader allows its
+// numeric PGID to disappear and be reused before a delayed first Close.
+func TestDefaultCaptchaControllerUsesDurableUnixGroupGuardian(t *testing.T) {
 	root := t.TempDir()
-	profileDir := filepath.Join(root, strings.Repeat("5", 32))
+	profileDir := filepath.Join(root, strings.Repeat("4", 32))
 	if err := os.Mkdir(profileDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	var groupGeneration atomic.Int32
-	originalGoneProbed := make(chan struct{})
-	var goneProbeSent atomic.Bool
-	var terminateCalls atomic.Int32
-	owner := trackCaptchaProcessOwnership(
-		func(time.Duration) bool {
-			if groupGeneration.Load() != 1 {
-				return false
-			}
-			if goneProbeSent.CompareAndSwap(false, true) {
-				close(originalGoneProbed)
-			}
-			return true
-		},
-		func(func(time.Duration) bool) error {
-			terminateCalls.Add(1)
-			return errors.New("would signal replacement process group")
-		},
-	)
-	owner.startMonitor(time.Millisecond)
-	groupGeneration.Store(1)
-	select {
-	case <-originalGoneProbed:
-	case <-time.After(time.Second):
-		t.Fatal("ownership monitor did not observe the original group disappear")
+	cmd := exec.Command("sleep", "30")
+	controllerValue, err := startChromeLogged(cmd, root, profileDir)
+	if err != nil {
+		t.Fatalf("start production-wired controller: %v", err)
 	}
-	owner.mu.Lock()
-	latchedGone := owner.gone
-	owner.mu.Unlock()
-	if !latchedGone {
-		t.Fatal("ownership monitor reported disappearance before latching it")
+	controller := controllerValue.(*chromeBrowserController)
+	controller.closeDevTools = func(context.Context, string) error { return errors.New("close through owned group") }
+	chromePID := cmd.Process.Pid
+	groupPID, err := syscall.Getpgid(chromePID)
+	if err != nil {
+		t.Fatalf("get Chrome process group: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = controller.Close()
+		_ = syscall.Kill(-groupPID, syscall.SIGKILL)
+	})
+
+	if groupPID == chromePID {
+		t.Fatalf("Chrome PID %d is still the reusable process-group leader", chromePID)
+	}
+	guardianGroup, err := syscall.Getpgid(groupPID)
+	if err != nil {
+		t.Fatalf("stable guardian PID %d is not alive: %v", groupPID, err)
+	}
+	if guardianGroup != groupPID {
+		t.Fatalf("guardian PID %d belongs to group %d", groupPID, guardianGroup)
 	}
 
-	// Generation 2 uses the same numeric PGID but is unrelated to this owner.
-	groupGeneration.Store(2)
-	controller := &chromeBrowserController{
-		cmd:          &exec.Cmd{Process: &os.Process{Pid: 4242}},
-		processOwner: owner,
-		profileRoot:  root,
-		profileDir:   profileDir,
-		exited:       make(chan struct{}),
-		closeDevTools: func(context.Context, string) error {
-			return errors.New("must not contact replacement")
-		},
-		removeProfile: removeCaptchaChromeProfile,
+	unrelated := exec.Command("sleep", "30")
+	unrelated.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := unrelated.Start(); err != nil {
+		t.Fatalf("start unrelated process group: %v", err)
 	}
+	unrelatedPID := unrelated.Process.Pid
+	t.Cleanup(func() {
+		_ = syscall.Kill(-unrelatedPID, syscall.SIGKILL)
+		_, _ = unrelated.Process.Wait()
+	})
 	if err := controller.Close(); err != nil {
-		t.Fatalf("first Close after PGID reuse: %v", err)
+		t.Fatalf("delayed first Close: %v", err)
 	}
-	if got := terminateCalls.Load(); got != 0 {
-		t.Fatalf("signaled replacement process group %d time(s)", got)
+	if err := unrelated.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("delayed Close signaled unrelated group: %v", err)
 	}
-	if _, err := os.Stat(profileDir); !os.IsNotExist(err) {
-		t.Fatalf("owned profile remains after original group loss: %v", err)
+}
+
+// Mutation caught: starting the guardian but failing to attach it to the
+// controller's failed-launch cleanup leaks a stable process group indefinitely.
+func TestDefaultCaptchaLaunchFailureReclaimsUnixGroupGuardian(t *testing.T) {
+	root := t.TempDir()
+	profileDir := filepath.Join(root, strings.Repeat("3", 32))
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(filepath.Join(root, "missing-chrome"))
+	controller, err := startChromeLogged(cmd, root, profileDir)
+	if err == nil {
+		t.Fatal("missing Chrome command unexpectedly started")
+	}
+	if controller != nil {
+		t.Fatalf("failed launch retained controller %T", controller)
+	}
+	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Pgid <= 0 {
+		t.Fatal("failed launch was not prepared with a stable guardian")
+	}
+	if alive, probeErr := captchaProcessGroupExists(cmd.SysProcAttr.Pgid); probeErr != nil || alive {
+		t.Fatalf("failed launch retained guardian group: alive=%v err=%v", alive, probeErr)
+	}
+	if _, statErr := os.Stat(profileDir); !os.IsNotExist(statErr) {
+		t.Fatalf("failed launch retained owned profile: %v", statErr)
+	}
+}
+
+// Mutation caught: allowing a stable owner to repeat its terminal group signal
+// can target a replacement after the guardian and original group are gone.
+func TestStableUnixGroupOwnerNeverSignalsTwiceAfterFailedTerminalWait(t *testing.T) {
+	var signalCalls atomic.Int32
+	owner := trackCaptchaProcessOwnership(
+		func(time.Duration) bool { return false },
+		func(func(time.Duration) bool) error {
+			signalCalls.Add(1)
+			return errors.New("group did not disappear after terminal signal")
+		},
+	)
+	owner.singleUseTermination = true
+	if err := owner.terminate(); err == nil {
+		t.Fatal("first terminal signal unexpectedly reported exit")
+	}
+	if err := owner.terminate(); err == nil {
+		t.Fatal("retry unexpectedly reported exit")
+	}
+	if got := signalCalls.Load(); got != 1 {
+		t.Fatalf("terminal group signals=%d, want exactly 1", got)
 	}
 }
 
@@ -245,8 +284,12 @@ func TestDefaultCaptchaControllerOwnsWholeUnixProcessGroup(t *testing.T) {
 	}
 	controller := controllerValue.(*chromeBrowserController)
 	pid := cmd.Process.Pid
+	groupPID, err := syscall.Getpgid(pid)
+	if err != nil {
+		t.Fatalf("get owned process group: %v", err)
+	}
 	t.Cleanup(func() {
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		_ = syscall.Kill(-groupPID, syscall.SIGKILL)
 		select {
 		case <-controller.exited:
 		case <-time.After(2 * time.Second):
@@ -259,7 +302,7 @@ func TestDefaultCaptchaControllerOwnsWholeUnixProcessGroup(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("process-group leader did not exit")
 	}
-	if alive, probeErr := captchaProcessGroupExists(pid); probeErr != nil || !alive {
+	if alive, probeErr := captchaProcessGroupExists(groupPID); probeErr != nil || !alive {
 		t.Fatalf("child process group not alive after leader exit: alive=%v err=%v", alive, probeErr)
 	}
 	controller.closeDevTools = func(context.Context, string) error { return errors.New("leader already exited") }
@@ -267,7 +310,7 @@ func TestDefaultCaptchaControllerOwnsWholeUnixProcessGroup(t *testing.T) {
 	if err := controller.Close(); err != nil {
 		t.Fatalf("close production-wired process group: %v", err)
 	}
-	if alive, probeErr := captchaProcessGroupExists(pid); probeErr != nil || alive {
+	if alive, probeErr := captchaProcessGroupExists(groupPID); probeErr != nil || alive {
 		t.Fatalf("owned child process group remains after Close: alive=%v err=%v", alive, probeErr)
 	}
 	if _, err := os.Stat(profileDir); !os.IsNotExist(err) {

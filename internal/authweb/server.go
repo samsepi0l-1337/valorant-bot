@@ -45,6 +45,7 @@ const RiotRedirectURI = "http://localhost/redirect"
 type Store interface {
 	PutAuthPending(state, discordUserID string, expiresAt time.Time) error
 	TakeAuthPending(state string) (discordUserID string, ok bool, err error)
+	TakeAuthPendingForOwner(state, discordUserID string) (deleted bool, err error)
 	UpsertRiotAccount(a store.Account) error
 }
 
@@ -342,26 +343,19 @@ func (s *Server) BeginQRAuth(ctx context.Context, discordUserID string) (loginUR
 func (s *Server) CancelQRAuth(state, discordUserID string) error {
 	s.mu.Lock()
 	pending, ok := s.qrSessions[state]
-	if !ok {
-		s.mu.Unlock()
-		return nil
-	}
-	if pending.discordUserID != discordUserID {
+	if ok && pending.discordUserID != discordUserID {
 		s.mu.Unlock()
 		return ErrQROwner
 	}
 	s.mu.Unlock()
 
-	storedOwner, exists, err := s.store.TakeAuthPending(state)
+	_, err := s.store.TakeAuthPendingForOwner(state, discordUserID)
 	if err != nil {
 		return err
 	}
-	if exists && storedOwner != discordUserID {
-		return ErrQROwner
-	}
 	s.mu.Lock()
 	current, stillLive := s.qrSessions[state]
-	if stillLive && current.session == pending.session && current.discordUserID == pending.discordUserID {
+	if ok && stillLive && current.session == pending.session && current.discordUserID == pending.discordUserID {
 		delete(s.qrSessions, state)
 	}
 	s.mu.Unlock()

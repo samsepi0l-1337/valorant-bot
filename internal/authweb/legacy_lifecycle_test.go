@@ -55,6 +55,17 @@ func (s *legacyLifecycleStore) TakeAuthPending(state string) (string, bool, erro
 	return discordUserID, ok, nil
 }
 
+func (s *legacyLifecycleStore) TakeAuthPendingForOwner(state, discordUserID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	owner, ok := s.pending[state]
+	if !ok || owner != discordUserID {
+		return false, nil
+	}
+	delete(s.pending, state)
+	return true, nil
+}
+
 func (s *legacyLifecycleStore) UpsertRiotAccount(account store.Account) error {
 	if s.upsertStarted != nil {
 		select {

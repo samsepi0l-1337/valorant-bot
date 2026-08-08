@@ -72,36 +72,19 @@ type chromeBrowserController struct {
 // controller. A numeric Unix PGID can be reused, so after this owner observes
 // its group gone it must never consult or signal that number again.
 type captchaProcessOwnership struct {
-	mu           sync.Mutex
-	gone         bool
-	waitRaw      func(time.Duration) bool
-	terminateRaw func(func(time.Duration) bool) error
+	mu                   sync.Mutex
+	gone                 bool
+	stableGroup          bool
+	singleUseTermination bool
+	terminationAttempted bool
+	waitRaw              func(time.Duration) bool
+	terminateRaw         func(func(time.Duration) bool) error
+	releaseRaw           func() error
+	releaseOnce          sync.Once
 }
 
 func trackCaptchaProcessOwnership(waitRaw func(time.Duration) bool, terminateRaw func(func(time.Duration) bool) error) *captchaProcessOwnership {
 	return &captchaProcessOwnership{waitRaw: waitRaw, terminateRaw: terminateRaw}
-}
-
-// startMonitor observes ownership loss from launch onward. This closes the
-// window where a delayed first Close could see a reused numeric Unix PGID as
-// live without ever having observed the original group disappear.
-func (o *captchaProcessOwnership) startMonitor(interval time.Duration) {
-	if o == nil {
-		return
-	}
-	if interval <= 0 {
-		interval = time.Millisecond
-	}
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			if o.waitForExit(0) {
-				return
-			}
-			<-ticker.C
-		}
-	}()
 }
 
 func (o *captchaProcessOwnership) waitForExit(timeout time.Duration) bool {
@@ -109,14 +92,18 @@ func (o *captchaProcessOwnership) waitForExit(timeout time.Duration) bool {
 		return true
 	}
 	o.mu.Lock()
-	defer o.mu.Unlock()
 	if o.gone {
+		o.mu.Unlock()
+		o.release()
 		return true
 	}
 	if o.waitRaw != nil && o.waitRaw(timeout) {
 		o.gone = true
+		o.mu.Unlock()
+		o.release()
 		return true
 	}
+	o.mu.Unlock()
 	return false
 }
 
@@ -127,7 +114,23 @@ func (o *captchaProcessOwnership) terminate() error {
 	if o.terminateRaw == nil {
 		return errors.New("captcha Chrome process termination is unavailable")
 	}
+	if o.singleUseTermination {
+		o.mu.Lock()
+		if o.terminationAttempted {
+			o.mu.Unlock()
+			return errors.New("captcha Chrome process group remains after its terminal signal")
+		}
+		o.terminationAttempted = true
+		o.mu.Unlock()
+	}
 	return o.terminateRaw(o.waitForExit)
+}
+
+func (o *captchaProcessOwnership) release() {
+	if o == nil || o.releaseRaw == nil {
+		return
+	}
+	o.releaseOnce.Do(func() { _ = o.releaseRaw() })
 }
 
 func launchSystemChrome(widgetURL string) (captchaBrowserController, error) {
@@ -163,9 +166,13 @@ func startChromeLogged(cmd *exec.Cmd, profileRoot, profileDir string) (captchaBr
 func startChromeLoggedWithRemove(cmd *exec.Cmd, profileRoot, profileDir string, removeProfile func(string, string) error) (captchaBrowserController, error) {
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
-	configureCaptchaProcess(cmd)
+	preparedOwner, err := prepareCaptchaProcess(cmd)
+	if err != nil {
+		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, err)
+	}
 	controller := &chromeBrowserController{
 		cmd:           cmd,
+		processOwner:  preparedOwner,
 		profileRoot:   profileRoot,
 		profileDir:    profileDir,
 		exited:        make(chan struct{}),
@@ -177,7 +184,7 @@ func startChromeLoggedWithRemove(cmd *exec.Cmd, profileRoot, profileDir string, 
 		close(controller.exited)
 		return cleanupFailedChromeLaunch(controller, fmt.Errorf("start chrome: %w", err))
 	}
-	controller.processOwner = newCaptchaProcessOwnership(cmd.Process, controller.exited)
+	controller.processOwner = completeCaptchaProcessOwnership(preparedOwner, cmd.Process, controller.exited)
 
 	go func() {
 		controller.waitErr = cmd.Wait()
@@ -244,7 +251,7 @@ func (c *chromeBrowserController) close() error {
 		closeDevTools = closeChromeViaDevTools
 	}
 
-	ownedProcess := c.cmd != nil && c.cmd.Process != nil
+	ownedProcess := c.processOwner != nil || (c.cmd != nil && c.cmd.Process != nil)
 	processOwner := c.ownedProcessOwnership()
 	processExited := !ownedProcess || processOwner.waitForExit(0)
 	graceful := false
@@ -256,7 +263,7 @@ func (c *chromeBrowserController) close() error {
 
 	var terminateErr error
 	if ownedProcess && !processExited {
-		if !graceful || !processOwner.waitForExit(chromeExitTimeout) {
+		if processOwner.stableGroup || !graceful || !processOwner.waitForExit(chromeExitTimeout) {
 			terminateErr = processOwner.terminate()
 		}
 	}
@@ -280,15 +287,39 @@ func (c *chromeBrowserController) close() error {
 }
 
 func (c *chromeBrowserController) ownedProcessOwnership() *captchaProcessOwnership {
-	if c.cmd == nil || c.cmd.Process == nil {
-		return nil
-	}
 	usesSeams := c.waitProcessExit != nil || c.terminateProcess != nil
 	if c.processOwner != nil && (!usesSeams || c.ownerUsesSeams) {
 		return c.processOwner
 	}
+	if c.cmd == nil || c.cmd.Process == nil {
+		return c.processOwner
+	}
 	if !usesSeams {
 		c.processOwner = newCaptchaProcessOwnership(c.cmd.Process, c.exited)
+		return c.processOwner
+	}
+	if c.processOwner != nil {
+		// Tests may replace one lifecycle operation after the production owner
+		// has been prepared. Overlay only the requested operation: rebuilding
+		// ownership around cmd.Process would discard a Unix guardian's stable
+		// process-group identity and make the Chrome PID look already gone.
+		if c.waitProcessExit != nil {
+			waitProcessExit := c.waitProcessExit
+			process := c.cmd.Process
+			exited := c.exited
+			c.processOwner.waitRaw = func(timeout time.Duration) bool {
+				return waitProcessExit(process, exited, timeout)
+			}
+		}
+		if c.terminateProcess != nil {
+			terminateProcess := c.terminateProcess
+			process := c.cmd.Process
+			exited := c.exited
+			c.processOwner.terminateRaw = func(func(time.Duration) bool) error {
+				return terminateProcess(process, exited)
+			}
+		}
+		c.ownerUsesSeams = true
 		return c.processOwner
 	}
 	waitProcessExit := c.waitProcessExit

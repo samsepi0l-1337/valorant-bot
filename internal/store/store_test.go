@@ -145,6 +145,37 @@ func TestAuthPending_Missing(t *testing.T) {
 	}
 }
 
+// Mutation caught: deleting by state alone lets a Discord user cancel another
+// user's persisted authentication flow after volatile ownership is lost.
+func TestAuthPending_TakeForOwnerIsConditional(t *testing.T) {
+	s := openTemp(t)
+	if err := s.PutAuthPending("owner-state", "owner-1", time.Now().Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	deleted, err := s.TakeAuthPendingForOwner("owner-state", "intruder-1")
+	if err != nil {
+		t.Fatalf("wrong-owner take: %v", err)
+	}
+	if deleted {
+		t.Fatal("wrong owner deleted persisted auth state")
+	}
+	deleted, err = s.TakeAuthPendingForOwner("owner-state", "owner-1")
+	if err != nil {
+		t.Fatalf("owner take: %v", err)
+	}
+	if !deleted {
+		t.Fatal("owner did not delete persisted auth state")
+	}
+	deleted, err = s.TakeAuthPendingForOwner("owner-state", "owner-1")
+	if err != nil {
+		t.Fatalf("idempotent take: %v", err)
+	}
+	if deleted {
+		t.Fatal("missing state reported a deletion")
+	}
+}
+
 func TestWishlist_AddRemoveList(t *testing.T) {
 	s := openTemp(t)
 

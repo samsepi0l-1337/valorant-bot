@@ -41,6 +41,15 @@ func (m *mockStore) TakeAuthPending(state string) (string, bool, error) {
 	return uid, true, nil
 }
 
+func (m *mockStore) TakeAuthPendingForOwner(state, discordUserID string) (bool, error) {
+	owner, ok := m.pending[state]
+	if !ok || owner != discordUserID {
+		return false, nil
+	}
+	delete(m.pending, state)
+	return true, nil
+}
+
 func (m *mockStore) UpsertRiotAccount(a store.Account) error {
 	m.accounts = append(m.accounts, a)
 	return nil
