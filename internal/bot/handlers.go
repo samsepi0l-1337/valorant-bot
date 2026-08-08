@@ -27,12 +27,13 @@ const qrImageSize = 320
 const mfaHintTTL = 15 * time.Minute
 
 const (
-	customIDAuthQR          = "auth:qr"
-	customIDAuthPassword    = "auth:password"
-	customIDAuthPWModal     = "auth:pw"
-	customIDAuthCaptchaPref = "auth:captcha:"
-	customIDAuthMFAPref     = "auth:mfa:"
-	customIDAuthMFAOpenPref = "auth:mfaopen:"
+	customIDAuthQR                = "auth:qr"
+	customIDAuthPassword          = "auth:password"
+	customIDAuthPWModal           = "auth:pw"
+	customIDAuthCaptchaPref       = "auth:captcha:"
+	customIDAuthCaptchaCancelPref = "auth:captchacancel:"
+	customIDAuthMFAPref           = "auth:mfa:"
+	customIDAuthMFAOpenPref       = "auth:mfaopen:"
 )
 
 // HandleAuth returns the dual auth chooser: Riot Mobile QR or Discord modal ID login.
@@ -231,25 +232,50 @@ func mfaRetryComponents(mfaState string, lang i18n.Lang) []discordgo.MessageComp
 	}
 }
 
-// HandlePasswordLogin is step 1: prepare the owner-bound CAPTCHA button after
-// username/password. The button starts bot-host Chrome.
+// HandlePasswordLogin prepares the owner-bound CAPTCHA continuation after
+// username/password: a local launch button or a remote bot-host relay link.
 func (h *Handlers) HandlePasswordLogin(ctx context.Context, discordUserID, username, password string, lang i18n.Lang) (Response, string, error) {
+	resp, state, _, err := h.handlePasswordLogin(ctx, discordUserID, username, password, lang)
+	return resp, state, err
+}
+
+func (h *Handlers) handlePasswordLogin(ctx context.Context, discordUserID, username, password string, lang i18n.Lang) (Response, string, bool, error) {
 	if h.Auth == nil {
-		return Response{}, "", fmt.Errorf("auth not configured")
+		return Response{}, "", false, fmt.Errorf("auth not configured")
 	}
-	_, state, err := h.Auth.BeginPasswordLogin(ctx, discordUserID, username, password)
+	captchaURL, state, err := h.Auth.BeginPasswordLogin(ctx, discordUserID, username, password)
 	if err != nil {
 		errText := strings.ToLower(err.Error())
 		if strings.Contains(errText, "chrome") || strings.Contains(errText, "chromium") {
 			return Response{
 				Ephemeral: true,
 				Content:   i18n.T(lang, "auth.captcha.need_chrome"),
-			}, "", nil
+			}, "", false, nil
 		}
 		return Response{
 			Ephemeral: true,
 			Content:   fmt.Sprintf(i18n.T(lang, "auth.password.failed"), err),
-		}, "", nil
+		}, "", false, nil
+	}
+	if captchaURL != "" {
+		return Response{
+			Ephemeral: true,
+			Content:   i18n.T(lang, "auth.captcha.remote.prompt"),
+			Components: []discordgo.MessageComponent{
+				discordgo.ActionsRow{Components: []discordgo.MessageComponent{
+					discordgo.Button{
+						Label: i18n.T(lang, "auth.captcha.remote.open"),
+						Style: discordgo.LinkButton,
+						URL:   captchaURL,
+					},
+					discordgo.Button{
+						Label:    i18n.T(lang, "auth.captcha.cancel"),
+						Style:    discordgo.DangerButton,
+						CustomID: passwordCaptchaCancelCustomID(discordUserID, state),
+					},
+				}},
+			},
+		}, state, true, nil
 	}
 	resp := Response{
 		Ephemeral: true,
@@ -266,7 +292,58 @@ func (h *Handlers) HandlePasswordLogin(ctx context.Context, discordUserID, usern
 			},
 		},
 	}
-	return resp, state, nil
+	return resp, state, false, nil
+}
+
+func passwordCaptchaCancelCustomID(ownerDiscordUserID, state string) string {
+	return customIDAuthCaptchaCancelPref + ownerDiscordUserID + ":" + state
+}
+
+func parsePasswordCaptchaCancelCustomID(customID string) (ownerDiscordUserID, state string, ok bool) {
+	if len(customID) > 100 || !strings.HasPrefix(customID, customIDAuthCaptchaCancelPref) {
+		return "", "", false
+	}
+	remainder := strings.TrimPrefix(customID, customIDAuthCaptchaCancelPref)
+	separator := strings.IndexByte(remainder, ':')
+	if separator < 1 || strings.IndexByte(remainder[separator+1:], ':') >= 0 {
+		return "", "", false
+	}
+	ownerDiscordUserID, state = remainder[:separator], remainder[separator+1:]
+	if len(ownerDiscordUserID) > 20 || !isASCIIDigits(ownerDiscordUserID) || !isCanonicalLowerUUID(state) {
+		return "", "", false
+	}
+	return ownerDiscordUserID, state, true
+}
+
+func isASCIIDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isCanonicalLowerUUID(value string) bool {
+	if len(value) != 36 {
+		return false
+	}
+	for index, char := range value {
+		switch index {
+		case 8, 13, 18, 23:
+			if char != '-' {
+				return false
+			}
+		default:
+			if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // HandlePasswordCaptchaLaunch handles the Discord custom-ID button by opening
@@ -322,13 +399,17 @@ func (h *Handlers) cancelQRAuth(state, discordUserID string) {
 }
 
 func (h *Handlers) cancelPasswordLogin(state, discordUserID string) {
-	canceler, ok := h.Auth.(passwordLoginCanceler)
-	if !ok {
-		return
-	}
-	if err := canceler.CancelPasswordLogin(state, discordUserID); err != nil && !errors.Is(err, authweb.ErrCaptchaOwner) {
+	if err := h.cancelPasswordLoginOwned(state, discordUserID); err != nil && !errors.Is(err, authweb.ErrCaptchaOwner) {
 		log.Printf("interaction: cancel password state: %s", discordRESTErrorLog(err))
 	}
+}
+
+func (h *Handlers) cancelPasswordLoginOwned(state, discordUserID string) error {
+	canceler, ok := h.Auth.(passwordLoginCanceler)
+	if !ok {
+		return fmt.Errorf("password auth cancellation not configured")
+	}
+	return canceler.CancelPasswordLogin(state, discordUserID)
 }
 
 func (h *Handlers) cancelPasswordMFA(mfaState, discordUserID string) bool {

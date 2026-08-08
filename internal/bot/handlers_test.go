@@ -42,10 +42,14 @@ type fakeAuth struct {
 	validateHint string
 	validateErr  error
 	launchErr    error
+	cancelErr    error
 	launchState  string
 	launchUser   string
+	cancelState  string
+	cancelUser   string
 	pwBegins     int
 	launches     int
+	cancels      int
 	browserRuns  int
 }
 
@@ -68,15 +72,11 @@ func (f *fakeAuth) BeginPasswordLogin(ctx context.Context, discordUserID, userna
 	if f.pwErr != nil {
 		return "", "", f.pwErr
 	}
-	url := f.captchaURL
-	if url == "" {
-		url = "http://127.0.0.1:8787/captcha?state=s1"
-	}
 	st := f.pwState
 	if st == "" {
 		st = "pw-state"
 	}
-	return url, st, nil
+	return f.captchaURL, st, nil
 }
 
 func (f *fakeAuth) WaitPasswordLogin(ctx context.Context, state string) (string, string, string, error) {
@@ -94,6 +94,13 @@ func (f *fakeAuth) LaunchPasswordCaptcha(ctx context.Context, state, discordUser
 		f.browserRuns++
 	}
 	return f.launchErr
+}
+
+func (f *fakeAuth) CancelPasswordLogin(state, discordUserID string) error {
+	f.cancels++
+	f.cancelState = state
+	f.cancelUser = discordUserID
+	return f.cancelErr
 }
 
 func (f *fakeAuth) CompletePasswordMFA(ctx context.Context, mfaState, discordUserID, code string) (string, error) {
@@ -253,7 +260,7 @@ func TestHandleAuthQR_Error(t *testing.T) {
 }
 
 func TestHandlePasswordLogin_CaptchaServerSideButton(t *testing.T) {
-	auth := &fakeAuth{captchaURL: "http://127.0.0.1:8787/captcha/open?state=abc", pwState: "abc"}
+	auth := &fakeAuth{pwState: "abc"}
 	h := &bot.Handlers{Auth: auth}
 	resp, state, err := h.HandlePasswordLogin(context.Background(), "u1", "user", "pass", i18n.KO)
 	if err != nil {
@@ -278,6 +285,50 @@ func TestHandlePasswordLogin_CaptchaServerSideButton(t *testing.T) {
 	}
 	if auth.launches != 1 {
 		t.Fatalf("owner button launches=%d, want 1", auth.launches)
+	}
+}
+
+func TestHandlePasswordLogin_RemoteRelayLinkAndOwnerCancelContainNoBearerCustomID(t *testing.T) {
+	const (
+		remoteURL = "https://relay.example.com/captcha/remote#fragment-bearer-secret"
+		state     = "captcha-state-abc"
+		owner     = "123456789012345678"
+	)
+	auth := &fakeAuth{captchaURL: remoteURL, pwState: state}
+	h := &bot.Handlers{Auth: auth}
+	resp, gotState, err := h.HandlePasswordLogin(context.Background(), owner, "riot-user", "riot-password", i18n.EN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotState != state || !resp.Ephemeral {
+		t.Fatalf("remote response state=%q ephemeral=%v", gotState, resp.Ephemeral)
+	}
+	if resp.Content != "Open the secure relay below to complete Riot's captcha in Chrome running on the bot host. Only rendered captcha frames and pointer input are relayed. This link expires shortly." {
+		t.Fatalf("remote response content=%q", resp.Content)
+	}
+	if len(resp.Components) != 1 {
+		t.Fatalf("remote components=%#v", resp.Components)
+	}
+	row, ok := resp.Components[0].(discordgo.ActionsRow)
+	if !ok || len(row.Components) != 2 {
+		t.Fatalf("remote row=%#v", resp.Components[0])
+	}
+	open, ok := row.Components[0].(discordgo.Button)
+	if !ok || open.Style != discordgo.LinkButton || open.URL != remoteURL || open.CustomID != "" || open.Label != "Open remote captcha" {
+		t.Fatalf("remote link button=%#v", row.Components[0])
+	}
+	cancel, ok := row.Components[1].(discordgo.Button)
+	if !ok || cancel.Style != discordgo.DangerButton || cancel.URL != "" ||
+		cancel.CustomID != "auth:captchacancel:"+owner+":"+state || cancel.Label != "Cancel login" {
+		t.Fatalf("remote cancel button=%#v", row.Components[1])
+	}
+	for _, secret := range []string{remoteURL, "fragment-bearer-secret", "captcha/remote", "cookie"} {
+		if strings.Contains(cancel.CustomID, secret) {
+			t.Fatalf("cancel custom ID disclosed %q: %q", secret, cancel.CustomID)
+		}
+	}
+	if auth.pwBegins != 1 || auth.launches != 0 || auth.browserRuns != 0 {
+		t.Fatalf("remote submit begins=%d launches=%d browserRuns=%d", auth.pwBegins, auth.launches, auth.browserRuns)
 	}
 }
 
@@ -323,6 +374,24 @@ func TestHandlePasswordCaptchaLaunchExpiredClearsControls(t *testing.T) {
 	}
 	if resp.Content != i18n.T(i18n.KO, "auth.captcha.expired") || resp.Components == nil || len(resp.Components) != 0 {
 		t.Fatalf("expired CAPTCHA retained stale controls: %+v", resp)
+	}
+}
+
+func TestHandlePasswordCaptchaLaunchDisabledPreservesQRFallbackAndSealsState(t *testing.T) {
+	auth := &fakeAuth{launchErr: errors.New("password CAPTCHA is disabled (CAPTCHA_BROWSER_MODE=disabled); use Riot Mobile QR or set CAPTCHA_BROWSER_MODE=local or remote")}
+	h := &bot.Handlers{Auth: auth}
+	resp, err := h.HandlePasswordCaptchaLaunch(context.Background(), "captcha-state", "owner-1", i18n.EN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Components == nil || len(resp.Components) != 0 {
+		t.Fatalf("disabled CAPTCHA retained launch controls: %+v", resp)
+	}
+	if !strings.Contains(resp.Content, "CAPTCHA_BROWSER_MODE=disabled") || !strings.Contains(resp.Content, "Riot Mobile QR") {
+		t.Fatalf("disabled CAPTCHA response lost configuration/QR fallback: %q", resp.Content)
+	}
+	if auth.cancels != 1 || auth.cancelState != "captcha-state" || auth.cancelUser != "owner-1" {
+		t.Fatalf("disabled CAPTCHA cancellation calls=%d state=%q user=%q", auth.cancels, auth.cancelState, auth.cancelUser)
 	}
 }
 

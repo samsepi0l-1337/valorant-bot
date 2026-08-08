@@ -254,6 +254,58 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 		}
 		return
 	}
+	if strings.HasPrefix(data.CustomID, customIDAuthCaptchaCancelPref) {
+		owner, state, ok := parsePasswordCaptchaCancelCustomID(data.CustomID)
+		if !ok {
+			if err := respondEphemeral(ctx, s, i, i18n.T(lang, "auth.captcha.expired")); err != nil {
+				log.Printf("interaction: malformed captcha cancel response: %s", discordRESTErrorLog(err))
+			}
+			return
+		}
+		if owner != userID {
+			if err := respondEphemeral(ctx, s, i, i18n.T(lang, "auth.captcha.cancel.denied")); err != nil {
+				log.Printf("interaction: captcha cancel owner response: %s", discordRESTErrorLog(err))
+			}
+			return
+		}
+		if err := deferComponentUpdate(ctx, s, i); err != nil {
+			log.Printf("interaction: defer captcha cancel: %s", discordRESTErrorLog(err))
+			return
+		}
+		lang = h.userLang(userID)
+		guard := h.captchaEditGuard(state)
+		acquired, guardErr := guard.begin(ctx)
+		if guardErr != nil {
+			log.Printf("interaction: captcha cancel guard: %s", discordRESTErrorLog(guardErr))
+			return
+		}
+		if !acquired {
+			return
+		}
+		terminalApplied := false
+		defer func() { guard.finish(terminalApplied) }()
+
+		cancelErr := h.cancelPasswordLoginOwned(state, userID)
+		if errors.Is(cancelErr, authweb.ErrCaptchaOwner) {
+			return
+		}
+		resp := Response{
+			Content:    i18n.T(lang, "auth.captcha.cancelled"),
+			Embeds:     []*discordgo.MessageEmbed{},
+			Components: []discordgo.MessageComponent{},
+		}
+		if cancelErr != nil {
+			resp.Content = i18n.T(lang, "auth.captcha.expired")
+		}
+		delivery, editErr := editInteractionOutcome(ctx, s, i, resp)
+		if delivery == deliveryApplied || delivery == deliveryAmbiguous {
+			terminalApplied = true
+		}
+		if editErr != nil {
+			log.Printf("interaction: captcha cancel edit: %s", discordRESTErrorLog(editErr))
+		}
+		return
+	}
 	if strings.HasPrefix(data.CustomID, customIDAuthCaptchaPref) {
 		if err := deferComponentUpdate(ctx, s, i); err != nil {
 			log.Printf("interaction: defer captcha component: %s", discordRESTErrorLog(err))
@@ -445,7 +497,7 @@ func (h *Handlers) onModalContext(ctx context.Context, s *discordgo.Session, i *
 		lang := h.userLang(userID)
 		authCtx, cancel := context.WithTimeout(ctx, interactionCallbackTimeout)
 		defer cancel()
-		resp, passwordState, err := h.HandlePasswordLogin(authCtx, userID, modalValue(data, "username"), modalValue(data, "password"), lang)
+		resp, passwordState, remote, err := h.handlePasswordLogin(authCtx, userID, modalValue(data, "username"), modalValue(data, "password"), lang)
 		if err != nil {
 			resp = Response{
 				Content:    i18n.T(lang, "error.prefix") + err.Error(),
@@ -457,8 +509,13 @@ func (h *Handlers) onModalContext(ctx context.Context, s *discordgo.Session, i *
 		if rerr != nil {
 			log.Printf("interaction: password captcha edit: %s", discordRESTErrorLog(rerr))
 		}
-		if passwordState != "" && delivery == deliveryRejected {
-			h.cancelPasswordLogin(passwordState, userID)
+		if passwordState != "" {
+			switch {
+			case delivery == deliveryRejected:
+				h.cancelPasswordLogin(passwordState, userID)
+			case remote && delivery == deliveryApplied:
+				h.startPasswordCaptchaWatcher(s, i, passwordState, lang)
+			}
 		}
 	case strings.HasPrefix(data.CustomID, customIDAuthMFAPref):
 		mfaState := strings.TrimPrefix(data.CustomID, customIDAuthMFAPref)
@@ -538,6 +595,8 @@ func (h *Handlers) onModalContext(ctx context.Context, s *discordgo.Session, i *
 
 func interactionLogCustomID(customID string) string {
 	switch {
+	case strings.HasPrefix(customID, customIDAuthCaptchaCancelPref):
+		return strings.TrimSuffix(customIDAuthCaptchaCancelPref, ":")
 	case strings.HasPrefix(customID, customIDAuthCaptchaPref):
 		return strings.TrimSuffix(customIDAuthCaptchaPref, ":")
 	case strings.HasPrefix(customID, customIDAuthMFAOpenPref):
@@ -836,7 +895,7 @@ const interactionCallbackTimeout = 45 * time.Second
 // qrLoginTimeout bounds how long the bot waits for a Riot Mobile approval.
 const qrLoginTimeout = 3 * time.Minute
 
-// passwordCaptchaTimeout bounds how long the bot waits for the local Chrome captcha.
+// passwordCaptchaTimeout bounds how long the bot waits for a local or remote Chrome captcha.
 const passwordCaptchaTimeout = 10 * time.Minute
 
 // interactionTerminalDeliveryTimeout gives a naturally-timed-out auth wait a

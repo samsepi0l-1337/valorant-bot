@@ -36,12 +36,20 @@ type acknowledgementCheckingAuth struct {
 }
 
 type passwordButtonAuth struct {
+	captchaURL           string
+	captchaState         string
 	launchErr            error
+	cancelErr            error
+	cancelHook           func()
 	launches             atomic.Int32
 	waits                atomic.Int32
 	waitStarted          chan<- struct{}
 	waitRelease          <-chan struct{}
 	waitDone             chan<- struct{}
+	waitDisplay          string
+	waitMFAState         string
+	waitMFAHint          string
+	waitErr              error
 	launchEditResponded  *atomic.Bool
 	waitBeforeLaunchEdit atomic.Bool
 	cancelCalls          atomic.Int32
@@ -356,6 +364,8 @@ type capturedInteractionEdit struct {
 	Components []struct {
 		Components []struct {
 			CustomID string `json:"custom_id"`
+			URL      string `json:"url"`
+			Style    int    `json:"style"`
 		} `json:"components"`
 	} `json:"components"`
 }
@@ -471,8 +481,12 @@ func (*passwordButtonAuth) WaitQRLogin(context.Context, string) (string, error) 
 	return "", nil
 }
 
-func (*passwordButtonAuth) BeginPasswordLogin(context.Context, string, string, string) (string, string, error) {
-	return "", "captcha-state", nil
+func (a *passwordButtonAuth) BeginPasswordLogin(context.Context, string, string, string) (string, string, error) {
+	state := a.captchaState
+	if state == "" {
+		state = "captcha-state"
+	}
+	return a.captchaURL, state, nil
 }
 
 func (a *passwordButtonAuth) LaunchPasswordCaptcha(context.Context, string, string) error {
@@ -484,7 +498,10 @@ func (a *passwordButtonAuth) CancelPasswordLogin(state, discordUserID string) er
 	a.cancelCalls.Add(1)
 	a.cancelState = state
 	a.cancelUser = discordUserID
-	return nil
+	if a.cancelHook != nil {
+		a.cancelHook()
+	}
+	return a.cancelErr
 }
 
 func (a *passwordButtonAuth) WaitPasswordLogin(context.Context, string) (string, string, string, error) {
@@ -498,6 +515,9 @@ func (a *passwordButtonAuth) WaitPasswordLogin(context.Context, string) (string,
 	<-a.waitRelease
 	if a.waitDone != nil {
 		a.waitDone <- struct{}{}
+	}
+	if a.waitDisplay != "" || a.waitMFAState != "" || a.waitMFAHint != "" || a.waitErr != nil {
+		return a.waitDisplay, a.waitMFAState, a.waitMFAHint, a.waitErr
 	}
 	return "", "", "", context.Canceled
 }
@@ -1376,6 +1396,7 @@ func TestInteractionLogCustomIDRedactsAuthContinuationState(t *testing.T) {
 		want     string
 	}{
 		{customID: customIDAuthCaptchaPref + "captcha-secret-state", want: "auth:captcha"},
+		{customID: customIDAuthCaptchaCancelPref + "123456789012345678:550e8400-e29b-41d4-a716-446655440000", want: "auth:captchacancel"},
 		{customID: customIDAuthMFAOpenPref + "mfa-secret-state", want: "auth:mfaopen"},
 		{customID: customIDAuthMFAPref + "mfa-secret-state", want: "auth:mfa"},
 		{customID: customIDAuthPassword, want: customIDAuthPassword},
@@ -1385,6 +1406,397 @@ func TestInteractionLogCustomIDRedactsAuthContinuationState(t *testing.T) {
 		if got := interactionLogCustomID(tt.customID); got != tt.want {
 			t.Errorf("interactionLogCustomID(%q)=%q, want %q", tt.customID, got, tt.want)
 		}
+	}
+}
+
+func TestPasswordCaptchaCancelCustomIDParsesExactOwnerAndStateOnly(t *testing.T) {
+	const (
+		owner = "123456789012345678"
+		state = "550e8400-e29b-41d4-a716-446655440000"
+	)
+	customID := passwordCaptchaCancelCustomID(owner, state)
+	gotOwner, gotState, ok := parsePasswordCaptchaCancelCustomID(customID)
+	if !ok || gotOwner != owner || gotState != state {
+		t.Fatalf("parsed owner=%q state=%q ok=%v", gotOwner, gotState, ok)
+	}
+	if len(customID) > 100 {
+		t.Fatalf("cancel custom ID length=%d, want Discord maximum 100", len(customID))
+	}
+	for _, invalid := range []string{
+		"",
+		customIDAuthCaptchaCancelPref,
+		customIDAuthCaptchaCancelPref + ":" + state,
+		customIDAuthCaptchaCancelPref + "owner-not-snowflake:" + state,
+		customIDAuthCaptchaCancelPref + owner + ":",
+		customIDAuthCaptchaCancelPref + owner + ":550e8400e29b41d4a716446655440000",
+		customIDAuthCaptchaCancelPref + owner + ":550E8400-E29B-41D4-A716-446655440000",
+		customIDAuthCaptchaCancelPref + owner + ":" + state + ":extra",
+		customIDAuthCaptchaCancelPref + owner + ":https://relay.example/#bearer",
+		customIDAuthCaptchaPref + state,
+	} {
+		if parsedOwner, parsedState, parsed := parsePasswordCaptchaCancelCustomID(invalid); parsed {
+			t.Errorf("malformed cancel ID parsed owner=%q state=%q: %q", parsedOwner, parsedState, invalid)
+		}
+	}
+}
+
+func TestRemotePasswordCaptchaOwnerCancelIsTerminalAndWatcherCannotOverwriteIt(t *testing.T) {
+	const (
+		owner = "123456789012345678"
+		state = "550e8400-e29b-41d4-a716-446655440000"
+	)
+	var acknowledged atomic.Bool
+	session, capture := newMFAInteractionCapture(t, &acknowledged)
+	waitStarted := make(chan struct{}, 1)
+	waitRelease := make(chan struct{})
+	waitDone := make(chan struct{}, 1)
+	var releaseOnce sync.Once
+	auth := &passwordButtonAuth{
+		waitStarted: waitStarted,
+		waitRelease: waitRelease,
+		waitDone:    waitDone,
+		cancelHook:  func() { releaseOnce.Do(func() { close(waitRelease) }) },
+	}
+	h := &Handlers{Auth: auth}
+	t.Cleanup(func() {
+		releaseOnce.Do(func() { close(waitRelease) })
+		_ = h.Shutdown(context.Background())
+	})
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "remote-cancel-owner",
+		AppID: "application-1",
+		Token: "remote-cancel-owner-token",
+		Type:  discordgo.InteractionMessageComponent,
+		Data: discordgo.MessageComponentInteractionData{
+			CustomID: passwordCaptchaCancelCustomID(owner, state),
+		},
+		User: &discordgo.User{ID: owner},
+	}}
+	h.startPasswordCaptchaWatcher(session, interaction, state, i18n.KO)
+	select {
+	case <-waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("remote watcher did not start")
+	}
+
+	h.onComponent(session, interaction)
+
+	select {
+	case response := <-capture.responses:
+		if response.Type != discordgo.InteractionResponseDeferredMessageUpdate {
+			t.Fatalf("owner cancel ACK type=%d, want deferred update", response.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("owner cancel was not acknowledged")
+	}
+	select {
+	case edit := <-capture.edits:
+		if edit.Content != i18n.T(i18n.KO, "auth.captcha.cancelled") || len(edit.Components) != 0 {
+			t.Fatalf("owner cancel edit=%+v", edit)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("owner cancel did not remove remote controls")
+	}
+	if got := auth.cancelCalls.Load(); got != 1 || auth.cancelState != state || auth.cancelUser != owner {
+		t.Fatalf("owner cancellation calls=%d state=%q user=%q", got, auth.cancelState, auth.cancelUser)
+	}
+	if got := auth.launches.Load(); got != 0 {
+		t.Fatalf("owner cancel launched local Chrome %d time(s)", got)
+	}
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("canceled remote watcher did not finish")
+	}
+	select {
+	case edit := <-capture.edits:
+		t.Fatalf("canceled watcher overwrote terminal cancel: %+v", edit)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestRemotePasswordCaptchaCancelRejectsWrongOwnerAndMalformedIDBeforeAuth(t *testing.T) {
+	const (
+		owner = "123456789012345678"
+		state = "550e8400-e29b-41d4-a716-446655440000"
+	)
+	for _, test := range []struct {
+		name     string
+		customID string
+		userID   string
+		want     string
+	}{
+		{name: "wrong owner", customID: passwordCaptchaCancelCustomID(owner, state), userID: "999999999999999999", want: i18n.T(i18n.KO, "auth.captcha.cancel.denied")},
+		{name: "malformed", customID: customIDAuthCaptchaCancelPref + owner + ":not-a-state", userID: owner, want: i18n.T(i18n.KO, "auth.captcha.expired")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			session, responses := newInteractionResponseCapture(t)
+			auth := &passwordButtonAuth{}
+			h := &Handlers{Auth: auth}
+			interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+				ID:    "remote-cancel-" + test.name,
+				AppID: "application-1",
+				Token: "remote-cancel-token",
+				Type:  discordgo.InteractionMessageComponent,
+				Data: discordgo.MessageComponentInteractionData{
+					CustomID: test.customID,
+				},
+				User: &discordgo.User{ID: test.userID},
+			}}
+
+			h.onComponent(session, interaction)
+
+			select {
+			case response := <-responses:
+				if response.Type != discordgo.InteractionResponseChannelMessageWithSource ||
+					response.Data.Content != test.want || response.Data.Flags != discordgo.MessageFlagsEphemeral {
+					t.Fatalf("rejected cancel response=%+v", response)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("rejected cancel did not receive an ephemeral response")
+			}
+			if got := auth.cancelCalls.Load(); got != 0 {
+				t.Fatalf("rejected cancel reached auth %d time(s)", got)
+			}
+		})
+	}
+}
+
+func TestRemotePasswordCaptchaCancelAuthoritativeOwnerMismatchPreservesOwnerControls(t *testing.T) {
+	const (
+		owner = "123456789012345678"
+		state = "550e8400-e29b-41d4-a716-446655440000"
+	)
+	session, capture := newMFAInteractionCapture(t, nil)
+	auth := &passwordButtonAuth{cancelErr: authweb.ErrCaptchaOwner}
+	h := &Handlers{Auth: auth}
+	t.Cleanup(func() { _ = h.Shutdown(context.Background()) })
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "remote-cancel-stale-owner-binding",
+		AppID: "application-1",
+		Token: "remote-cancel-stale-owner-binding-token",
+		Type:  discordgo.InteractionMessageComponent,
+		Data: discordgo.MessageComponentInteractionData{
+			CustomID: passwordCaptchaCancelCustomID(owner, state),
+		},
+		User: &discordgo.User{ID: owner},
+	}}
+
+	h.onComponent(session, interaction)
+
+	select {
+	case response := <-capture.responses:
+		if response.Type != discordgo.InteractionResponseDeferredMessageUpdate {
+			t.Fatalf("authoritative owner mismatch ACK type=%d", response.Type)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("authoritative owner mismatch was not acknowledged")
+	}
+	if got := auth.cancelCalls.Load(); got != 1 || auth.cancelState != state || auth.cancelUser != owner {
+		t.Fatalf("authoritative cancellation calls=%d state=%q user=%q", got, auth.cancelState, auth.cancelUser)
+	}
+	select {
+	case edit := <-capture.edits:
+		t.Fatalf("stale embedded owner overwrote the real owner's controls: %+v", edit)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestRemotePasswordModalStartsWatcherOnlyAfterConfirmedDelivery(t *testing.T) {
+	const (
+		owner     = "123456789012345678"
+		state     = "550e8400-e29b-41d4-a716-446655440000"
+		remoteURL = "https://relay.example.com/captcha/remote#fragment-bearer-secret"
+	)
+	var acknowledged atomic.Bool
+	session, capture := newMFAInteractionCapture(t, &acknowledged)
+	waitStarted := make(chan struct{}, 2)
+	waitRelease := make(chan struct{})
+	waitDone := make(chan struct{}, 1)
+	auth := &passwordButtonAuth{
+		captchaURL:   remoteURL,
+		captchaState: state,
+		waitStarted:  waitStarted,
+		waitRelease:  waitRelease,
+		waitDone:     waitDone,
+		waitDisplay:  "Remote#AP1",
+	}
+	h := &Handlers{Auth: auth}
+	t.Cleanup(func() { _ = h.Shutdown(context.Background()) })
+	interaction := passwordModalInteractionForDeliveryTest("remote-applied")
+	interaction.User.ID = owner
+
+	h.onModal(session, interaction)
+
+	select {
+	case response := <-capture.responses:
+		if response.Type != discordgo.InteractionResponseDeferredChannelMessageWithSource || response.Data.Flags != discordgo.MessageFlagsEphemeral {
+			t.Fatalf("remote modal ACK type=%d flags=%d", response.Type, response.Data.Flags)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remote modal was not acknowledged")
+	}
+	select {
+	case edit := <-capture.edits:
+		if len(edit.Components) != 1 || len(edit.Components[0].Components) != 2 {
+			t.Fatalf("remote modal components=%+v", edit.Components)
+		}
+		open, cancel := edit.Components[0].Components[0], edit.Components[0].Components[1]
+		if open.URL != remoteURL || open.CustomID != "" || open.Style != int(discordgo.LinkButton) {
+			t.Fatalf("remote open button=%+v", open)
+		}
+		if cancel.CustomID != passwordCaptchaCancelCustomID(owner, state) || cancel.URL != "" || cancel.Style != int(discordgo.DangerButton) {
+			t.Fatalf("remote cancel button=%+v", cancel)
+		}
+		if strings.Contains(cancel.CustomID, "fragment-bearer-secret") || strings.Contains(cancel.CustomID, remoteURL) {
+			t.Fatalf("remote cancel custom ID disclosed bearer: %q", cancel.CustomID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remote modal response was not delivered")
+	}
+	select {
+	case <-waitStarted:
+	case <-time.After(time.Second):
+		t.Fatal("confirmed remote delivery did not start its watcher")
+	}
+	if got := auth.waits.Load(); got != 1 {
+		t.Fatalf("remote watcher calls=%d, want 1", got)
+	}
+	h.startPasswordCaptchaWatcher(session, interaction, state, i18n.KO)
+	select {
+	case <-waitStarted:
+		t.Fatal("duplicate remote watcher enrollment started a second waiter")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := auth.waits.Load(); got != 1 {
+		t.Fatalf("duplicate remote watcher calls=%d, want exactly 1", got)
+	}
+	if got := auth.launches.Load(); got != 0 {
+		t.Fatalf("remote modal launched local Chrome path %d time(s)", got)
+	}
+	if got := auth.cancelCalls.Load(); got != 0 {
+		t.Fatalf("confirmed remote delivery canceled flow %d time(s)", got)
+	}
+	close(waitRelease)
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("remote watcher did not finish")
+	}
+	select {
+	case edit := <-capture.edits:
+		if !strings.Contains(edit.Content, "Remote#AP1") || len(edit.Components) != 0 {
+			t.Fatalf("remote watcher terminal edit retained controls: %+v", edit)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remote watcher terminal edit did not finish")
+	}
+}
+
+func TestRemotePasswordModalWatcherReplacesRelayControlsWithMFA(t *testing.T) {
+	const (
+		owner     = "123456789012345678"
+		state     = "550e8400-e29b-41d4-a716-446655440000"
+		remoteURL = "https://relay.example.com/captcha/remote#fragment-bearer-secret"
+		mfaState  = "mfa-state-after-remote-captcha"
+		mfaHint   = "a***@example.com"
+	)
+	session, capture := newMFAInteractionCapture(t, nil)
+	waitRelease := make(chan struct{})
+	close(waitRelease)
+	auth := &passwordButtonAuth{
+		captchaURL:   remoteURL,
+		captchaState: state,
+		waitRelease:  waitRelease,
+		waitMFAState: mfaState,
+		waitMFAHint:  mfaHint,
+	}
+	h := &Handlers{Auth: auth}
+	t.Cleanup(func() { _ = h.Shutdown(context.Background()) })
+	interaction := passwordModalInteractionForDeliveryTest("remote-mfa")
+	interaction.User.ID = owner
+
+	h.onModal(session, interaction)
+
+	select {
+	case response := <-capture.responses:
+		if response.Type != discordgo.InteractionResponseDeferredChannelMessageWithSource || response.Data.Flags != discordgo.MessageFlagsEphemeral {
+			t.Fatalf("remote MFA modal ACK type=%d flags=%d", response.Type, response.Data.Flags)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remote MFA modal was not acknowledged")
+	}
+	select {
+	case edit := <-capture.edits:
+		if len(edit.Components) != 1 || len(edit.Components[0].Components) != 2 || edit.Components[0].Components[0].URL != remoteURL {
+			t.Fatalf("initial remote controls=%+v", edit.Components)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initial remote controls were not delivered")
+	}
+	select {
+	case edit := <-capture.edits:
+		if !strings.Contains(edit.Content, mfaHint) || len(edit.Components) != 1 || len(edit.Components[0].Components) != 1 {
+			t.Fatalf("remote MFA edit=%+v", edit)
+		}
+		button := edit.Components[0].Components[0]
+		if button.CustomID != customIDAuthMFAOpenPref+mfaState || button.URL != "" {
+			t.Fatalf("remote MFA continuation button=%+v", button)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remote watcher did not replace relay controls with MFA")
+	}
+	if got := auth.launches.Load(); got != 0 {
+		t.Fatalf("remote MFA path launched local Chrome %d time(s)", got)
+	}
+	if got := auth.waits.Load(); got != 1 {
+		t.Fatalf("remote MFA watcher calls=%d, want 1", got)
+	}
+}
+
+func TestRemotePasswordModalDeliveryFailurePreservesOnlyAmbiguousFlowWithoutWatcher(t *testing.T) {
+	const (
+		state     = "550e8400-e29b-41d4-a716-446655440000"
+		remoteURL = "https://relay.example.com/captcha/remote#fragment-bearer-secret"
+	)
+	for _, test := range editDeliveryFailures {
+		t.Run(test.name, func(t *testing.T) {
+			session := newOriginalEditFailureSession(t, test.failure)
+			waitStarted := make(chan struct{}, 1)
+			waitRelease := make(chan struct{})
+			close(waitRelease)
+			auth := &passwordButtonAuth{
+				captchaURL:   remoteURL,
+				captchaState: state,
+				waitStarted:  waitStarted,
+				waitRelease:  waitRelease,
+			}
+			h := &Handlers{Auth: auth}
+			t.Cleanup(func() { _ = h.Shutdown(context.Background()) })
+			interaction := passwordModalInteractionForDeliveryTest("remote-" + test.name)
+			interaction.User.ID = "123456789012345678"
+
+			h.onModal(session, interaction)
+
+			wantCancel := int32(0)
+			if test.definite {
+				wantCancel = 1
+			}
+			if got := auth.cancelCalls.Load(); got != wantCancel {
+				t.Fatalf("remote cancellation calls=%d, want %d", got, wantCancel)
+			}
+			select {
+			case <-waitStarted:
+				t.Fatal("unconfirmed remote delivery started a watcher")
+			case <-time.After(50 * time.Millisecond):
+			}
+			if got := auth.waits.Load(); got != 0 {
+				t.Fatalf("unconfirmed remote delivery watcher calls=%d", got)
+			}
+			if got := auth.launches.Load(); got != 0 {
+				t.Fatalf("remote delivery path launched local Chrome %d time(s)", got)
+			}
+		})
 	}
 }
 
