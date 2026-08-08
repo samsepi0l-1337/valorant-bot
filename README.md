@@ -6,10 +6,11 @@ Docker에서 실행할 수 있습니다.
 
 `/auth`는 **Riot Mobile QR 스캔** 또는 **아이디/비밀번호 로그인**을 제공합니다.
 별도 프로그램 설치, URL 붙여넣기, 사용자 측 localhost/포트 80은 필요 없습니다.
-비밀번호 로그인은 Discord에서 시작하지만, 캡차 창은 **봇이 실행 중인 호스트**의
-GUI Chrome에서 Riot 공식 로그인 페이지로 열립니다. Riot이 요구할 때만 Discord
-모달로 MFA 코드를 받습니다. 디스플레이가 없는 Raspberry Pi·서버와 Windows 호스트는
-QR 방식을 사용하세요.
+기본 `local` 모드의 비밀번호 로그인은 **봇이 실행 중인 호스트**의 GUI Chrome에서
+Riot 공식 로그인 페이지를 엽니다. `remote` 모드는 headless Pi/서버의 GUI Chromium을
+짧은 수명의 Discord 링크로 중계해 Windows·모바일 브라우저에서 CAPTCHA를 완료합니다.
+Riot이 요구할 때만 Discord 모달로 MFA 코드를 받습니다. HTTPS/Xvfb/Chromium을 준비할
+수 없는 headless 호스트는 `disabled`로 두고 QR 방식을 사용하세요.
 
 ## 빠른 시작 (원샷 스크립트)
 
@@ -77,17 +78,24 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID
 | `DISCORD_TOKEN`    | 예     | 봇 토큰                                              |
 | `DISCORD_APP_ID`   | 예     | 애플리케이션 ID                                      |
 | `BOT_SECRET`       | 예     | 세션 암호화 키 (**32자 이상**, 스크립트가 생성 가능) |
-| `AUTH_BASE_URL`    | 예     | `/invite`·선택적 보조 페이지 주소                     |
+| `AUTH_BASE_URL`    | 예     | `/invite` 주소; 원격 모드에서는 정확한 공개 HTTPS 주소 |
 | `AUTH_PORT`        | 아니오 | HTTP 포트 (기본 `8787`)                              |
+| `CAPTCHA_BROWSER_MODE` | 아니오 | `local`(기본), `remote`, `disabled`              |
+| `CAPTCHA_DISPLAY`  | 원격 시 예 | 원격 Chromium 디스플레이 (Pi 기본 `:99`)            |
 | `DATABASE_PATH`    | 아니오 | SQLite 경로                                          |
 | `STORE_RESET_CRON` | 아니오 | 레거시 크론 문자열 (일일 시각은 `/channel time`)     |
 
 템플릿: `deploy/env.local.example`, `deploy/env.pi.example`,
 `deploy/env.server.example`, `.env.example`
 
-`/auth`(QR·아이디 로그인)는 `AUTH_BASE_URL`과 무관합니다. 이 값은 `/invite` 등
-선택적 보조 페이지용이며, Cloudflare Tunnel을 포함한 공개 URL은 캡차에 사용하지
-않습니다.
+`CAPTCHA_BROWSER_MODE=local`은 기존처럼 봇 호스트의 GUI Chrome/Chromium 창을
+사용합니다. `disabled`는 비밀번호 CAPTCHA 시작을 명확히 거절하고 Riot Mobile QR을
+안내합니다. `remote`는 봇 호스트의 GUI Chromium 화면을 Discord 사용자의 브라우저로
+중계합니다. 이 경우 `AUTH_BASE_URL`은 쿼리·fragment·사용자 정보가 없는 절대
+`https://` 공개 주소여야 하며, 프록시/터널은 WebSocket을 통과시켜야 합니다.
+사용자 PC에는 Windows용 다운로드, 확장 프로그램, localhost 리스너가 필요 없습니다.
+Pi 원격 배포는 [`deploy/pi-cloudflare-tunnel.md`](deploy/pi-cloudflare-tunnel.md)를
+따르세요.
 
 ---
 
@@ -135,7 +143,7 @@ systemd 위치: `/usr/local/bin/valorant-bot`, `/etc/valorant-bot/env`,
 Discord에서 `/auth`를 실행한 뒤 원하는 방식을 선택합니다.
 
 - **Riot Mobile QR**: QR을 스캔(또는 **Riot Mobile로 열기**)하고 앱에서 승인합니다.
-- **아이디/비밀번호**: 다음 순서로 진행합니다.
+- **아이디/비밀번호 (`local`)**: 다음 순서로 진행합니다.
   1. Discord 모달에 계정 정보를 입력합니다.
   2. 그 요청의 소유자가 Discord의 **캡차 창 열기/다시 열기** 버튼을 누릅니다.
   3. 봇 호스트에서 Riot 공식 GUI Chrome 창이 열리면 「로봇이 아닙니다」를
@@ -144,16 +152,21 @@ Discord에서 `/auth`를 실행한 뒤 원하는 방식을 선택합니다.
   4. 캡차 결과가 처리되면 봇이 Chrome 창을 닫습니다. Riot이 MFA를 요구한 경우에만
      Discord의 MFA 버튼을 누르고 모달에 이메일 또는 인증 앱 코드를 입력합니다.
 
-Discord 사용자는 Chrome, 인증 도우미, localhost 주소 또는 포트 설정을 설치·실행할
-필요가 없습니다. 반대로 비밀번호 방식에는 **macOS 또는 Linux 봇 호스트의 화면
-세션과 GUI Chrome/Chromium**이 필요합니다. Windows에서는 Riot Mobile QR을
-사용합니다. 설치 스크립트가 만드는 기본 systemd 서비스는
-비로그인 `valorant` 사용자로 실행되므로, 호스트에 화면이 있어도 그 서비스에서는 GUI
-Chrome을 열 수 없습니다. 기본 systemd·headless Raspberry Pi·VPS·Docker 배포에서는
-Riot Mobile QR을 사용하세요. GUI 비밀번호 로그인은 서비스를 중지한 뒤 실제 데스크톱
-로그인 사용자의 세션에서 별도로 실행할 때만 지원합니다. 자세한 안전 실행 절차는
-[`deploy/README.md`](deploy/README.md)를 참조하세요. Arduino 같은 마이크로컨트롤러는
-이 Go 애플리케이션을 실행하는 지원 대상이 아닙니다.
+`remote`에서는 Discord의 같은 사용자가 받은 일회용·짧은 수명의 **Open remote CAPTCHA**
+링크를 엽니다. 링크의 bearer 값은 URL fragment에만 있고 첫 HTTP 요청에 전송되지 않으며,
+교환 직후 브라우저 기록에서 지워집니다. Pi/서버의 GUI Chromium이 Riot 공식 HTTPS
+페이지를 계속 열고, 사용자는 중계된 프레임을 보며 포인터·휠만 조작합니다. CAPTCHA가
+끝나면 뷰어와 Chromium이 닫히며, Riot이 MFA를 요구할 때는 기존처럼 Discord MFA 버튼과
+모달에서만 코드를 입력합니다. Discord 사용자는 Chrome, 인증 도우미, Windows 설치물,
+localhost 주소 또는 포트를 설치·실행하지 않습니다.
+
+원격 뷰어는 Riot 문서나 DevTools를 인터넷에 노출하지 않습니다. Riot 자격 증명, 쿠키,
+MFA 코드, 브라우저 저장소 및 CDP 연결은 봇 호스트에만 남습니다. 중계 채널은 크기가
+제한된 JPEG 프레임과 검증된 기본 포인터/휠 이벤트만 허용하며, 키보드 입력, JavaScript,
+탐색, 클립보드, 파일 전송 및 추가 탭은 허용하지 않습니다. `local`에는 macOS 또는 Linux
+봇 호스트의 GUI Chrome/Chromium이 필요합니다. HTTPS·Xvfb·Chromium을 준비할 수 없는
+headless Pi/VPS/Docker는 `disabled`로 두고 Riot Mobile QR을 사용하세요. Arduino 같은
+마이크로컨트롤러는 이 Go 애플리케이션을 실행하는 지원 대상이 아닙니다.
 
 QR은 약 3분 후 만료됩니다. 여러 Riot 계정은 `/auth`를 계정마다 반복하면 됩니다.
 QR 방식은 봇 서버가 Riot 세션 생성·승인 폴링·토큰 교환을 모두 수행하고 휴대폰은

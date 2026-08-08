@@ -7,11 +7,24 @@
 | Cloud / VPS  | `./scripts/setup-cloud.sh --host user@…` | `env.server.example`         |
 | Docker       | `./scripts/setup-cloud.sh --docker`      | `.env.docker`                |
 
-## Ports
+## CAPTCHA 브라우저 모드와 포트
 
-`/auth` QR login needs **no inbound port**.
+`/auth` QR 로그인은 **인바운드 포트가 필요 없습니다**. 비밀번호 로그인은
+`CAPTCHA_BROWSER_MODE`로 선택합니다.
 
-Password login is a bot-host GUI flow, not a public web flow:
+| 모드 | 동작 | 필요한 조건 |
+| --- | --- | --- |
+| `local` (기본) | 봇 호스트의 GUI Chrome/Chromium 창 | 로그인된 데스크톱 세션 |
+| `remote` | Pi/서버 Chromium 화면을 Discord 링크로 중계 | 공개 HTTPS `AUTH_BASE_URL`, WebSocket 프록시, Chromium, Xvfb |
+| `disabled` | 비밀번호 CAPTCHA를 거절하고 QR 안내 | QR만 사용 |
+
+`remote`에서만 `AUTH_PORT`가 공개 HTTPS 프록시/Cloudflare Tunnel 뒤에 있어야 합니다.
+`AUTH_BASE_URL`은 절대 `https://` 주소여야 하며 userinfo·query·fragment를 넣지 마세요.
+Cloudflare Tunnel은 뷰어 HTML, WebSocket 프레임, 검증된 입력만 전달합니다. Riot 페이지는
+Tunnel 아래에 프록시·프레임·재작성되지 않고 Pi Chromium 안에서 Riot의 실제 HTTPS origin으로
+열립니다. Windows/모바일 사용자는 다운로드·확장·인증서·localhost 리스너가 필요 없습니다.
+
+`local` 비밀번호 로그인은 봇 호스트 GUI 흐름입니다:
 
 1. The Discord user submits the ID/password modal, then the same Discord user
    clicks the CAPTCHA open/re-open button.
@@ -22,17 +35,14 @@ Password login is a bot-host GUI flow, not a public web flow:
 3. After CAPTCHA completion, the bot closes that Chrome window. Only if Riot
    asks for MFA does Discord show an MFA button and modal for the code.
 
-The Discord user installs nothing and never opens a localhost URL. Password
-login needs no inbound port or public tunnel. Riot's registered
+`local` 사용자는 아무 것도 설치하거나 localhost URL을 열 필요가 없습니다. Riot의 등록된
 `http://localhost/redirect` is parsed as a returned token URI; neither the user
-nor the bot opens a localhost callback server. `AUTH_BASE_URL`, reverse proxies,
-and Cloudflare Tunnel are for `/invite` and optional helper pages only; do not
-use a public/tunnel URL for CAPTCHA.
+nor the bot opens a localhost callback server.
 
 | Port               | Role                                      |
 | ------------------ | ----------------------------------------- |
 | Discord / Riot     | outbound only                             |
-| `AUTH_PORT` (8787) | `/invite` + optional local helper pages    |
+| `AUTH_PORT` (8787) | `/invite`, 원격 모드의 HTTPS 프록시 upstream |
 | 80                 | unused                                    |
 
 ### Raspberry Pi and server authentication
@@ -84,8 +94,10 @@ The foreground instance intentionally uses a separate user-owned SQLite
 database, so accounts linked there are not transferred to the system service.
 Real Arduino boards are not supported deployment targets for this Go bot.
 
-For a public `/invite` URL only, run `./scripts/pi-tunnel.sh` and set
-`AUTH_BASE_URL` to the printed HTTPS URL. This does not provide CAPTCHA access.
+원격 CAPTCHA Pi 설정(Cloudflare Tunnel 포함)은
+[`pi-cloudflare-tunnel.md`](pi-cloudflare-tunnel.md)를 따르세요. 빠른 Tunnel URL은
+재시작마다 바뀌므로 테스트용이며, 지속적 Discord 링크에는 이름 있는 Tunnel 또는 소유한
+HTTPS 역방향 프록시를 사용해야 합니다.
 
 Automated tests cover the local flow's state transitions and cleanup; they do
 not demonstrate a successful login against a live Riot account.
@@ -96,6 +108,7 @@ not demonstrate a successful login against a live Riot account.
 - `valorant-bot.service` — unit file
 - `nginx.example.conf` — optional reverse proxy
 - `env.*.example` — environment templates
-- `../scripts/pi-tunnel.sh` — optional Cloudflare quick tunnel for `/invite`
+- `../scripts/pi-tunnel.sh` — Cloudflare quick tunnel (원격 CAPTCHA 테스트 또는 `/invite`)
+- `pi-cloudflare-tunnel.md` — Pi Xvfb/Chromium 및 HTTPS Tunnel 운영 절차
 
 See the root [README](../README.md).
