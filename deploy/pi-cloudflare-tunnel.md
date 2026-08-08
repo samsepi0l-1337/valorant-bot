@@ -49,6 +49,13 @@ sudo AUTH_BASE_URL=https://valorant-bot.example.com \
   ./scripts/setup-pi.sh --remote-captcha
 ```
 
+`--remote-captcha`는 프로젝트의 `deploy/remote-captcha.conf` drop-in도 설치·관리합니다.
+이 drop-in은 `valorant-bot`과 `valorant-captcha-display.service`의 원격 디스플레이
+의존성을 연결하는 systemd 설정이며, `/etc/valorant-bot/env`를 대체하지 않습니다.
+운영 값인 `AUTH_BASE_URL`, `AUTH_PORT`, `CAPTCHA_BROWSER_MODE`, `CAPTCHA_DISPLAY`는 아래처럼
+환경 파일에서 관리합니다. 수동으로 drop-in을 복사하거나 임의의 display unit 이름을 만들지
+말고, 설정 변경 뒤에는 `systemctl daemon-reload`와 봇 재시작을 실행하세요.
+
 설치 후 `/etc/valorant-bot/env`에는 다음 값이 있어야 합니다.
 
 ```dotenv
