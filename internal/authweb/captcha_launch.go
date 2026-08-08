@@ -34,6 +34,11 @@ type captchaBrowserController interface {
 	Close() error
 }
 
+var (
+	findChromeBinaryFn               = findChromeBinary
+	chromeCommandForCaptchaDisplayFn = chromeCommandForCaptchaDisplay
+)
+
 type captchaBrowserCloseError struct {
 	ProcessExited bool
 	Err           error
@@ -156,12 +161,12 @@ func launchSystemChromeWithDisplay(widgetURL, display string) (captchaBrowserCon
 	if runtime.GOOS == "darwin" {
 		return launchMacChromeWithDisplay(flags, profileRoot, profileDir, display)
 	}
-	bin := findChromeBinary()
+	bin := findChromeBinaryFn()
 	if bin == "" {
 		launchErr := fmt.Errorf("Chrome/Chromium not found — install Google Chrome on the bot machine, or use Riot Mobile QR")
 		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, launchErr)
 	}
-	cmd, err := chromeCommandForCaptchaDisplay(bin, flags, display)
+	cmd, err := chromeCommandForCaptchaDisplayFn(bin, flags, display)
 	if err != nil {
 		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, fmt.Errorf("prepare Chrome command: %w", err))
 	}
@@ -173,12 +178,12 @@ func launchMacChrome(chromeArgs []string, profileRoot, profileDir string) (captc
 }
 
 func launchMacChromeWithDisplay(chromeArgs []string, profileRoot, profileDir, display string) (captchaBrowserController, error) {
-	bin := findChromeBinary()
+	bin := findChromeBinaryFn()
 	if bin == "" {
 		launchErr := fmt.Errorf("Chrome/Chromium not found — install Google Chrome on the bot machine, or use Riot Mobile QR")
 		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, launchErr)
 	}
-	cmd, err := chromeCommandForCaptchaDisplay(bin, chromeArgs, display)
+	cmd, err := chromeCommandForCaptchaDisplayFn(bin, chromeArgs, display)
 	if err != nil {
 		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, fmt.Errorf("prepare Chrome command: %w", err))
 	}

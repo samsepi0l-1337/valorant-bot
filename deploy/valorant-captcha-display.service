@@ -1,15 +1,14 @@
 [Unit]
 Description=Valorant CAPTCHA virtual display
+After=systemd-tmpfiles-setup.service
 Before=valorant-bot.service
 
 [Service]
 Type=simple
 User=valorant
 Group=valorant
-RuntimeDirectory=valorant-captcha-display
-RuntimeDirectoryMode=0750
-# PrivateTmp is retained while this bind mount gives the bot service a shared,
-# non-network X11 Unix socket for the :99 display.
+# The installer-owned tmpfiles entry prepares this root:root 1777 directory.
+# It is bind-mounted into both PrivateTmp namespaces as the X11 Unix socket.
 BindPaths=/run/valorant-captcha-display:/tmp/.X11-unix
 ExecStart=/usr/bin/Xvfb :99 -screen 0 1280x900x24 -nolisten tcp
 Restart=on-failure
@@ -24,7 +23,6 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ReadWritePaths=/var/lib/valorant-bot
 
 [Install]
 WantedBy=multi-user.target

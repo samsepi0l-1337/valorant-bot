@@ -25,6 +25,8 @@ REMOTE_CAPTCHA_ENV_SRC="${ROOT}/deploy/remote-captcha.conf"
 REMOTE_CAPTCHA_ENV_DST="${ETC_DIR}/remote-captcha.conf"
 REMOTE_CAPTCHA_DROPIN_DIR=/etc/systemd/system/valorant-bot.service.d
 REMOTE_CAPTCHA_DROPIN_DST="${REMOTE_CAPTCHA_DROPIN_DIR}/remote-captcha.conf"
+REMOTE_CAPTCHA_TMPFILES_SRC="${ROOT}/deploy/valorant-captcha-display.tmpfiles"
+REMOTE_CAPTCHA_TMPFILES_DST=/etc/tmpfiles.d/valorant-captcha-display.conf
 USER_NAME=valorant
 GROUP_NAME=valorant
 
@@ -64,7 +66,7 @@ fi
 
 validate_remote_captcha_dependencies() {
   local missing=0
-  if ! command -v Xvfb >/dev/null 2>&1; then
+  if [[ ! -x /usr/bin/Xvfb ]]; then
     echo "remote CAPTCHA dependency missing: Xvfb" >&2
     missing=1
   fi
@@ -141,12 +143,14 @@ install -m 0755 "$BINARY" "$BIN_DST"
 install -m 0644 "$SERVICE_SRC" "$SERVICE_DST"
 
 if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
-  if [[ ! -f "$DISPLAY_SERVICE_SRC" || ! -f "$REMOTE_CAPTCHA_ENV_SRC" ]]; then
+  if [[ ! -f "$DISPLAY_SERVICE_SRC" || ! -f "$REMOTE_CAPTCHA_ENV_SRC" || ! -f "$REMOTE_CAPTCHA_TMPFILES_SRC" ]]; then
     echo "remote CAPTCHA deployment assets are missing" >&2
     exit 1
   fi
   install -m 0644 "$DISPLAY_SERVICE_SRC" "$DISPLAY_SERVICE_DST"
   install -m 0640 -o root -g "$GROUP_NAME" "$REMOTE_CAPTCHA_ENV_SRC" "$REMOTE_CAPTCHA_ENV_DST"
+  install -m 0644 "$REMOTE_CAPTCHA_TMPFILES_SRC" "$REMOTE_CAPTCHA_TMPFILES_DST"
+  systemd-tmpfiles --create "$REMOTE_CAPTCHA_TMPFILES_DST"
   install -d -m 0755 "$REMOTE_CAPTCHA_DROPIN_DIR"
   REMOTE_CAPTCHA_DROPIN_TMP="$(mktemp)"
   trap 'rm -f "$REMOTE_CAPTCHA_DROPIN_TMP"' EXIT
@@ -157,6 +161,7 @@ After=valorant-captcha-display.service
 
 [Service]
 # Share only the private Xvfb Unix socket; Xvfb has no TCP listener.
+EnvironmentFile=/etc/valorant-bot/remote-captcha.conf
 BindPaths=/run/valorant-captcha-display:/tmp/.X11-unix
 EOF
   install -m 0644 "$REMOTE_CAPTCHA_DROPIN_TMP" "$REMOTE_CAPTCHA_DROPIN_DST"

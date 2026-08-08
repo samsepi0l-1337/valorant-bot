@@ -10,9 +10,6 @@ User=valorant
 Group=valorant
 WorkingDirectory=/var/lib/valorant-bot
 EnvironmentFile=/etc/valorant-bot/env
-# Created only by install.sh --remote-captcha. The optional source keeps local
-# and QR-only deployments unchanged.
-EnvironmentFile=-/etc/valorant-bot/remote-captcha.conf
 ExecStart=/usr/local/bin/valorant-bot
 Restart=on-failure
 RestartSec=5

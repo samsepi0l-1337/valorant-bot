@@ -1,6 +1,8 @@
 package authweb
 
 import (
+	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 )
@@ -43,6 +45,34 @@ func TestRemoteDisplayDoesNotChangeLocalDesktopCommand(t *testing.T) {
 	}
 	if got := remoteDisplayEnvironmentValue(cmd.Env, "DISPLAY"); got != ":42" {
 		t.Fatalf("local Chrome DISPLAY=%q, want inherited desktop :42", got)
+	}
+}
+
+// Mutation caught: routing the local launcher through remote DISPLAY
+// preparation would make a normal desktop CAPTCHA use Xvfb or fail closed.
+func TestRemoteDisplayLocalLauncherLeavesDisplayUnconfigured(t *testing.T) {
+	originalFind := findChromeBinaryFn
+	originalCommand := chromeCommandForCaptchaDisplayFn
+	originalProfileDir := chromeUserDataDirFn
+	t.Cleanup(func() {
+		findChromeBinaryFn = originalFind
+		chromeCommandForCaptchaDisplayFn = originalCommand
+		chromeUserDataDirFn = originalProfileDir
+	})
+	findChromeBinaryFn = func() string { return "/opt/chromium" }
+	chromeUserDataDirFn = func() (string, error) { return t.TempDir(), nil }
+	seenDisplay := "not-called"
+	chromeCommandForCaptchaDisplayFn = func(_ string, _ []string, display string) (*exec.Cmd, error) {
+		seenDisplay = display
+		return nil, errors.New("stop after command preparation")
+	}
+
+	_, err := launchSystemChrome("https://auth.riotgames.com/authorize?nonce=local-launch")
+	if err == nil || !strings.Contains(err.Error(), "stop after command preparation") {
+		t.Fatalf("launchSystemChrome error=%v", err)
+	}
+	if seenDisplay != "" {
+		t.Fatalf("local launcher passed DISPLAY=%q, want empty", seenDisplay)
 	}
 }
 

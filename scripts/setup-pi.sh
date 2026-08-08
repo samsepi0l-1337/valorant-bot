@@ -78,7 +78,7 @@ prompt() {
 
 remote_captcha_dependencies() {
   local missing=0
-  if ! command -v Xvfb >/dev/null 2>&1; then
+  if [[ ! -x /usr/bin/Xvfb ]]; then
     echo "remote CAPTCHA dependency missing: Xvfb" >&2
     missing=1
   fi
@@ -130,17 +130,11 @@ AUTH_PORT=${AUTH_PORT:-8787}
 DATABASE_PATH=/var/lib/valorant-bot/data/bot.db
 STORE_RESET_CRON=${STORE_RESET_CRON:-0 0 * * *}
 EOF
-  if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
-    cat >> "$dest" <<'EOF'
-CAPTCHA_BROWSER_MODE=remote
-CAPTCHA_DISPLAY=:99
-EOF
-  fi
 }
 
 if [[ -n "$HOST" ]]; then
   if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
-    ssh "$HOST" 'if ! command -v Xvfb >/dev/null 2>&1 || (! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1); then echo "remote CAPTCHA dependencies are missing" >&2; echo "Install dependencies first: sudo apt-get update && sudo apt-get install -y xvfb chromium" >&2; exit 1; fi'
+    ssh "$HOST" 'if [[ ! -x /usr/bin/Xvfb ]] || (! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1); then echo "remote CAPTCHA dependencies are missing" >&2; echo "Install dependencies first: sudo apt-get update && sudo apt-get install -y xvfb chromium" >&2; exit 1; fi'
   fi
   prompt DISCORD_TOKEN "Discord bot token (DISCORD_TOKEN)"
   prompt DISCORD_APP_ID "Discord application ID (DISCORD_APP_ID)"
