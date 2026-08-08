@@ -12,6 +12,7 @@ import (
 	"github.com/dosfsociety/valorant-bot/internal/authweb"
 	"github.com/dosfsociety/valorant-bot/internal/bot"
 	"github.com/dosfsociety/valorant-bot/internal/crypto"
+	"github.com/dosfsociety/valorant-bot/internal/netutil"
 	"github.com/dosfsociety/valorant-bot/internal/riot"
 	"github.com/dosfsociety/valorant-bot/internal/scheduler"
 	"github.com/dosfsociety/valorant-bot/internal/skins"
@@ -21,14 +22,16 @@ import (
 // Config holds settings needed to construct the bot.
 // Fields mirror internal/config for public package consumers.
 type Config struct {
-	DiscordToken   string
-	DiscordAppID   string
-	DiscordGuildID string
-	BotSecret      string
-	AuthPort       int
-	AuthBaseURL    string
-	DatabasePath   string
-	StoreResetCron string
+	DiscordToken       string
+	DiscordAppID       string
+	DiscordGuildID     string
+	BotSecret          string
+	AuthPort           int
+	AuthBaseURL        string
+	DatabasePath       string
+	StoreResetCron     string
+	CaptchaBrowserMode string
+	CaptchaDisplay     string
 }
 
 // Bot is the Valorant Discord store bot.
@@ -82,11 +85,19 @@ func New(cfg Config) (*Bot, error) {
 	if cfg.AuthBaseURL == "" {
 		return nil, errors.New("AuthBaseURL is required")
 	}
+	mode, err := netutil.NormalizeCaptchaBrowserMode(cfg.CaptchaBrowserMode, cfg.AuthBaseURL)
+	if err != nil {
+		return nil, err
+	}
+	cfg.CaptchaBrowserMode = string(mode)
 	if cfg.AuthPort <= 0 {
 		cfg.AuthPort = 8787
 	}
 	if cfg.DatabasePath == "" {
 		cfg.DatabasePath = "./data/bot.db"
+	}
+	if cfg.CaptchaDisplay == "" {
+		cfg.CaptchaDisplay = ":99"
 	}
 	return &Bot{cfg: cfg}, nil
 }
@@ -129,12 +140,14 @@ func (b *Bot) Run(ctx context.Context) error {
 	dg.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages
 
 	authServer := authweb.New(authweb.Deps{
-		AuthBaseURL:  b.cfg.AuthBaseURL,
-		Store:        st,
-		Riot:         riotClient,
-		QRAuth:       riot.NewQRClient(nil),
-		PasswordAuth: riot.NewPasswordClient(nil),
-		Boxer:        boxer,
+		AuthBaseURL:        b.cfg.AuthBaseURL,
+		CaptchaBrowserMode: netutil.CaptchaBrowserMode(b.cfg.CaptchaBrowserMode),
+		CaptchaDisplay:     b.cfg.CaptchaDisplay,
+		Store:              st,
+		Riot:               riotClient,
+		QRAuth:             riot.NewQRClient(nil),
+		PasswordAuth:       riot.NewPasswordClient(nil),
+		Boxer:              boxer,
 		OnLinked: func(discordUserID, displayName string) {
 			ch, err := dg.UserChannelCreate(discordUserID)
 			if err != nil {

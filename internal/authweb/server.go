@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/dosfsociety/valorant-bot/internal/netutil"
 	"github.com/dosfsociety/valorant-bot/internal/riot"
 	"github.com/dosfsociety/valorant-bot/internal/store"
 )
@@ -93,7 +94,9 @@ type Deps struct {
 	OnLinked       LinkedNotifier
 	// CaptchaTLSPort is retained for the legacy local-widget test/fallback path.
 	// The production Riot browser flow uses Riot's real DNS/TLS and no listener.
-	CaptchaTLSPort int
+	CaptchaTLSPort     int
+	CaptchaBrowserMode netutil.CaptchaBrowserMode
+	CaptchaDisplay     string
 }
 
 type authOutcome struct {
@@ -141,17 +144,19 @@ func (m *serverMutex) Lock() {
 
 // Server serves login redirect + Riot callback catcher.
 type Server struct {
-	authBaseURL    string
-	pendingTTL     time.Duration
-	store          Store
-	riot           RiotClient
-	qrAuth         QRAuthClient
-	passwordAuth   PasswordAuthClient
-	qrPollInterval time.Duration
-	boxer          Boxer
-	onLinked       LinkedNotifier
-	mux            *http.ServeMux
-	captchaMux     *http.ServeMux
+	authBaseURL        string
+	captchaBrowserMode netutil.CaptchaBrowserMode
+	captchaDisplay     string
+	pendingTTL         time.Duration
+	store              Store
+	riot               RiotClient
+	qrAuth             QRAuthClient
+	passwordAuth       PasswordAuthClient
+	qrPollInterval     time.Duration
+	boxer              Boxer
+	onLinked           LinkedNotifier
+	mux                *http.ServeMux
+	captchaMux         *http.ServeMux
 
 	mu                       serverMutex
 	closed                   bool
@@ -193,6 +198,14 @@ type Server struct {
 
 // New builds an auth web Server.
 func New(d Deps) *Server {
+	mode := d.CaptchaBrowserMode
+	if mode == "" {
+		mode = netutil.CaptchaBrowserLocal
+	}
+	display := d.CaptchaDisplay
+	if display == "" {
+		display = ":99"
+	}
 	ttl := d.PendingTTL
 	if ttl <= 0 {
 		ttl = defaultPendingTTL
@@ -204,6 +217,8 @@ func New(d Deps) *Server {
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	s := &Server{
 		authBaseURL:              strings.TrimRight(d.AuthBaseURL, "/"),
+		captchaBrowserMode:       mode,
+		captchaDisplay:           display,
 		pendingTTL:               ttl,
 		store:                    d.Store,
 		riot:                     d.Riot,
@@ -227,6 +242,14 @@ func New(d Deps) *Server {
 		captchaTLSConfiguredPort: d.CaptchaTLSPort,
 		launchCaptchaBrowser:     launchSystemChrome,
 	}
+	if mode == netutil.CaptchaBrowserRemote {
+		s.launchCaptchaBrowser = func(widgetURL string) (captchaBrowserController, error) {
+			return launchSystemChromeOnDisplay(widgetURL, display)
+		}
+	}
+	if mode == netutil.CaptchaBrowserDisabled {
+		s.launchCaptchaBrowser = disabledCaptchaBrowserLauncher
+	}
 	s.mux.HandleFunc("GET /login", s.handleLogin)
 	s.mux.HandleFunc("GET /redirect", s.handleRedirectCatcher)
 	s.mux.HandleFunc("GET /catcher-ping", s.handleCatcherPing)
@@ -240,6 +263,10 @@ func New(d Deps) *Server {
 	s.captchaMux.HandleFunc("OPTIONS /api/auth/captcha", s.handleCaptchaSubmit)
 	s.mux.HandleFunc("GET /{$}", s.handleIndex)
 	return s
+}
+
+func disabledCaptchaBrowserLauncher(string) (captchaBrowserController, error) {
+	return nil, errors.New("password CAPTCHA is disabled (CAPTCHA_BROWSER_MODE=disabled); use Riot Mobile QR or set CAPTCHA_BROWSER_MODE=local or remote")
 }
 
 // Handler returns the HTTP handler (AUTH_PORT).

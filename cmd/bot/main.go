@@ -22,14 +22,16 @@ func main() {
 	}
 
 	bot, err := valorantbot.New(valorantbot.Config{
-		DiscordToken:   cfg.DiscordToken,
-		DiscordAppID:   cfg.DiscordAppID,
-		DiscordGuildID: cfg.DiscordGuildID,
-		BotSecret:      cfg.BotSecret,
-		AuthPort:       cfg.AuthPort,
-		AuthBaseURL:    cfg.AuthBaseURL,
-		DatabasePath:   cfg.DatabasePath,
-		StoreResetCron: cfg.StoreResetCron,
+		DiscordToken:       cfg.DiscordToken,
+		DiscordAppID:       cfg.DiscordAppID,
+		DiscordGuildID:     cfg.DiscordGuildID,
+		BotSecret:          cfg.BotSecret,
+		AuthPort:           cfg.AuthPort,
+		AuthBaseURL:        cfg.AuthBaseURL,
+		DatabasePath:       cfg.DatabasePath,
+		StoreResetCron:     cfg.StoreResetCron,
+		CaptchaBrowserMode: cfg.CaptchaBrowserMode,
+		CaptchaDisplay:     cfg.CaptchaDisplay,
 	})
 	if err != nil {
 		log.Fatalf("bot: %v", err)

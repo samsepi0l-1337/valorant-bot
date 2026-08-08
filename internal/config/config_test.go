@@ -16,6 +16,8 @@ func clearEnv(t *testing.T) {
 		"AUTH_BASE_URL",
 		"DATABASE_PATH",
 		"STORE_RESET_CRON",
+		"CAPTCHA_BROWSER_MODE",
+		"CAPTCHA_DISPLAY",
 	}
 	for _, k := range keys {
 		t.Setenv(k, "")
@@ -109,6 +111,12 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.StoreResetCron != "0 0 * * *" {
 		t.Errorf("StoreResetCron = %q, want 0 0 * * *", cfg.StoreResetCron)
 	}
+	if cfg.CaptchaBrowserMode != "local" {
+		t.Errorf("CaptchaBrowserMode = %q, want local", cfg.CaptchaBrowserMode)
+	}
+	if cfg.CaptchaDisplay != ":99" {
+		t.Errorf("CaptchaDisplay = %q, want :99", cfg.CaptchaDisplay)
+	}
 }
 
 func TestLoad_Overrides(t *testing.T) {
@@ -118,6 +126,9 @@ func TestLoad_Overrides(t *testing.T) {
 	t.Setenv("AUTH_PORT", "9999")
 	t.Setenv("DATABASE_PATH", "/tmp/custom.db")
 	t.Setenv("STORE_RESET_CRON", "0 8 * * *")
+	t.Setenv("CAPTCHA_BROWSER_MODE", "REMOTE")
+	t.Setenv("CAPTCHA_DISPLAY", ":42")
+	t.Setenv("AUTH_BASE_URL", "https://relay.example.com")
 
 	cfg, err := Load()
 	if err != nil {
@@ -134,6 +145,24 @@ func TestLoad_Overrides(t *testing.T) {
 	}
 	if cfg.StoreResetCron != "0 8 * * *" {
 		t.Errorf("StoreResetCron = %q", cfg.StoreResetCron)
+	}
+	if cfg.CaptchaBrowserMode != "remote" {
+		t.Errorf("CaptchaBrowserMode = %q, want remote", cfg.CaptchaBrowserMode)
+	}
+	if cfg.CaptchaDisplay != ":42" {
+		t.Errorf("CaptchaDisplay = %q, want :42", cfg.CaptchaDisplay)
+	}
+}
+
+func TestLoad_RejectsInvalidRemoteCaptchaOrigin(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("CAPTCHA_BROWSER_MODE", "remote")
+	t.Setenv("AUTH_BASE_URL", "http://relay.example.com")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("expected invalid remote CAPTCHA origin error")
 	}
 }
 
