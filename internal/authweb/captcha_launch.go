@@ -135,19 +135,33 @@ func (o *captchaProcessOwnership) release() {
 }
 
 func launchSystemChrome(widgetURL string) (captchaBrowserController, error) {
+	return launchSystemChromeWithDisplay(widgetURL, "")
+}
+
+// launchSystemChromeOnDisplay launches normal GUI Chrome on the explicitly
+// configured X display. The remote-mode Server path owns the decision to call
+// this helper; local launches retain their desktop-session environment.
+func launchSystemChromeOnDisplay(widgetURL, display string) (captchaBrowserController, error) {
+	if strings.TrimSpace(display) == "" {
+		return nil, errors.New("CAPTCHA_DISPLAY is required for remote CAPTCHA browser mode")
+	}
+	return launchSystemChromeWithDisplay(widgetURL, display)
+}
+
+func launchSystemChromeWithDisplay(widgetURL, display string) (captchaBrowserController, error) {
 	profileRoot, profileDir, flags, err := chromeLaunchConfig(widgetURL)
 	if err != nil {
 		return nil, err
 	}
 	if runtime.GOOS == "darwin" {
-		return launchMacChrome(flags, profileRoot, profileDir)
+		return launchMacChromeWithDisplay(flags, profileRoot, profileDir, display)
 	}
 	bin := findChromeBinary()
 	if bin == "" {
 		launchErr := fmt.Errorf("Chrome/Chromium not found — install Google Chrome on the bot machine, or use Riot Mobile QR")
 		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, launchErr)
 	}
-	cmd, err := chromeCommand(bin, flags)
+	cmd, err := chromeCommandForCaptchaDisplay(bin, flags, display)
 	if err != nil {
 		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, fmt.Errorf("prepare Chrome command: %w", err))
 	}
@@ -155,16 +169,51 @@ func launchSystemChrome(widgetURL string) (captchaBrowserController, error) {
 }
 
 func launchMacChrome(chromeArgs []string, profileRoot, profileDir string) (captchaBrowserController, error) {
+	return launchMacChromeWithDisplay(chromeArgs, profileRoot, profileDir, "")
+}
+
+func launchMacChromeWithDisplay(chromeArgs []string, profileRoot, profileDir, display string) (captchaBrowserController, error) {
 	bin := findChromeBinary()
 	if bin == "" {
 		launchErr := fmt.Errorf("Chrome/Chromium not found — install Google Chrome on the bot machine, or use Riot Mobile QR")
 		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, launchErr)
 	}
-	cmd, err := chromeCommand(bin, chromeArgs)
+	cmd, err := chromeCommandForCaptchaDisplay(bin, chromeArgs, display)
 	if err != nil {
 		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, fmt.Errorf("prepare Chrome command: %w", err))
 	}
 	return startChromeLogged(cmd, profileRoot, profileDir)
+}
+
+// chromeCommandForRemoteDisplay keeps Chrome's environment at the existing
+// explicit allowlist boundary, then replaces only DISPLAY with the Xvfb value
+// selected by trusted configuration. It never derives an environment from the
+// bot service, so bot credentials remain absent.
+func chromeCommandForRemoteDisplay(bin string, args []string, display string) (*exec.Cmd, error) {
+	if strings.TrimSpace(display) == "" {
+		return nil, errors.New("CAPTCHA_DISPLAY is required for remote CAPTCHA browser mode")
+	}
+	return chromeCommandForCaptchaDisplay(bin, args, display)
+}
+
+func chromeCommandForCaptchaDisplay(bin string, args []string, display string) (*exec.Cmd, error) {
+	cmd, err := chromeCommand(bin, args)
+	if err != nil || strings.TrimSpace(display) == "" {
+		return cmd, err
+	}
+	cmd.Env = withCaptchaDisplayEnvironment(cmd.Env, strings.TrimSpace(display))
+	return cmd, nil
+}
+
+func withCaptchaDisplayEnvironment(environment []string, display string) []string {
+	const prefix = "DISPLAY="
+	result := make([]string, 0, len(environment)+1)
+	for _, entry := range environment {
+		if !strings.HasPrefix(entry, prefix) {
+			result = append(result, entry)
+		}
+	}
+	return append(result, prefix+display)
 }
 
 func startChromeLogged(cmd *exec.Cmd, profileRoot, profileDir string) (captchaBrowserController, error) {

@@ -1,0 +1,30 @@
+[Unit]
+Description=Valorant CAPTCHA virtual display
+Before=valorant-bot.service
+
+[Service]
+Type=simple
+User=valorant
+Group=valorant
+RuntimeDirectory=valorant-captcha-display
+RuntimeDirectoryMode=0750
+# PrivateTmp is retained while this bind mount gives the bot service a shared,
+# non-network X11 Unix socket for the :99 display.
+BindPaths=/run/valorant-captcha-display:/tmp/.X11-unix
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1280x900x24 -nolisten tcp
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/valorant-bot
+
+[Install]
+WantedBy=multi-user.target

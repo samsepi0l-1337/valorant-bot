@@ -19,12 +19,19 @@ ETC_DIR=/etc/valorant-bot
 ENV_DST="${ETC_DIR}/env"
 SERVICE_SRC="${ROOT}/deploy/valorant-bot.service"
 SERVICE_DST=/etc/systemd/system/valorant-bot.service
+DISPLAY_SERVICE_SRC="${ROOT}/deploy/valorant-captcha-display.service"
+DISPLAY_SERVICE_DST=/etc/systemd/system/valorant-captcha-display.service
+REMOTE_CAPTCHA_ENV_SRC="${ROOT}/deploy/remote-captcha.conf"
+REMOTE_CAPTCHA_ENV_DST="${ETC_DIR}/remote-captcha.conf"
+REMOTE_CAPTCHA_DROPIN_DIR=/etc/systemd/system/valorant-bot.service.d
+REMOTE_CAPTCHA_DROPIN_DST="${REMOTE_CAPTCHA_DROPIN_DIR}/remote-captcha.conf"
 USER_NAME=valorant
 GROUP_NAME=valorant
 
 BINARY=""
 ENV_SRC=""
 SKIP_START=0
+REMOTE_CAPTCHA=0
 
 usage() {
   cat <<'EOF'
@@ -33,6 +40,7 @@ Install Valorant Discord bot (systemd).
 Options:
   --binary PATH   Binary to install (default: auto-detect dist/ or build native)
   --env PATH      Env template to copy if /etc/valorant-bot/env is missing
+  --remote-captcha Enable the opt-in private Xvfb display for remote CAPTCHA
   --skip-start    Install only; do not systemctl enable --now
   -h, --help      Show this help
 EOF
@@ -42,6 +50,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --binary) BINARY="${2:-}"; shift 2 ;;
     --env) ENV_SRC="${2:-}"; shift 2 ;;
+    --remote-captcha) REMOTE_CAPTCHA=1; shift ;;
     --skip-start) SKIP_START=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1"; usage; exit 1 ;;
@@ -51,6 +60,28 @@ done
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "run as root: sudo $0 ..." >&2
   exit 1
+fi
+
+validate_remote_captcha_dependencies() {
+  local missing=0
+  if ! command -v Xvfb >/dev/null 2>&1; then
+    echo "remote CAPTCHA dependency missing: Xvfb" >&2
+    missing=1
+  fi
+  if ! command -v chromium >/dev/null 2>&1 && \
+     ! command -v chromium-browser >/dev/null 2>&1 && \
+     ! command -v google-chrome >/dev/null 2>&1; then
+    echo "remote CAPTCHA dependency missing: Chromium" >&2
+    missing=1
+  fi
+  if [[ "$missing" -ne 0 ]]; then
+    echo "Install dependencies first: sudo apt-get update && sudo apt-get install -y xvfb chromium" >&2
+    return 1
+  fi
+}
+
+if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
+  validate_remote_captcha_dependencies
 fi
 
 detect_binary() {
@@ -109,6 +140,30 @@ install -d -m 0750 "$ETC_DIR"
 install -m 0755 "$BINARY" "$BIN_DST"
 install -m 0644 "$SERVICE_SRC" "$SERVICE_DST"
 
+if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
+  if [[ ! -f "$DISPLAY_SERVICE_SRC" || ! -f "$REMOTE_CAPTCHA_ENV_SRC" ]]; then
+    echo "remote CAPTCHA deployment assets are missing" >&2
+    exit 1
+  fi
+  install -m 0644 "$DISPLAY_SERVICE_SRC" "$DISPLAY_SERVICE_DST"
+  install -m 0640 -o root -g "$GROUP_NAME" "$REMOTE_CAPTCHA_ENV_SRC" "$REMOTE_CAPTCHA_ENV_DST"
+  install -d -m 0755 "$REMOTE_CAPTCHA_DROPIN_DIR"
+  REMOTE_CAPTCHA_DROPIN_TMP="$(mktemp)"
+  trap 'rm -f "$REMOTE_CAPTCHA_DROPIN_TMP"' EXIT
+  cat > "$REMOTE_CAPTCHA_DROPIN_TMP" <<'EOF'
+[Unit]
+Requires=valorant-captcha-display.service
+After=valorant-captcha-display.service
+
+[Service]
+# Share only the private Xvfb Unix socket; Xvfb has no TCP listener.
+BindPaths=/run/valorant-captcha-display:/tmp/.X11-unix
+EOF
+  install -m 0644 "$REMOTE_CAPTCHA_DROPIN_TMP" "$REMOTE_CAPTCHA_DROPIN_DST"
+  rm -f "$REMOTE_CAPTCHA_DROPIN_TMP"
+  trap - EXIT
+fi
+
 if [[ ! -f "$ENV_DST" ]]; then
   if [[ -z "$ENV_SRC" ]]; then
     arch="$(uname -m)"
@@ -130,8 +185,16 @@ fi
 systemctl daemon-reload
 
 if [[ "$SKIP_START" -eq 1 ]]; then
-  echo "installed. Edit $ENV_DST then: systemctl enable --now valorant-bot"
+  if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
+    echo "installed remote CAPTCHA display. Edit $ENV_DST then: systemctl enable --now valorant-captcha-display valorant-bot"
+  else
+    echo "installed. Edit $ENV_DST then: systemctl enable --now valorant-bot"
+  fi
   exit 0
+fi
+
+if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
+  systemctl enable valorant-captcha-display
 fi
 
 if grep -Eq 'DISCORD_TOKEN=$|DISCORD_TOKEN=\s*$|BOT_SECRET=change-me' "$ENV_DST" 2>/dev/null; then
@@ -141,6 +204,9 @@ if grep -Eq 'DISCORD_TOKEN=$|DISCORD_TOKEN=\s*$|BOT_SECRET=change-me' "$ENV_DST"
   exit 0
 fi
 
+if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
+  systemctl start valorant-captcha-display
+fi
 systemctl enable --now valorant-bot
 systemctl --no-pager --full status valorant-bot || true
 echo "logs: journalctl -u valorant-bot -f"

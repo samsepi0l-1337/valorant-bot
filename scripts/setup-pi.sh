@@ -16,6 +16,7 @@ HOST=""
 ARCH="arm64"
 YES=0
 SKIP_START=0
+REMOTE_CAPTCHA=0
 
 usage() {
   cat <<'EOF'
@@ -25,10 +26,15 @@ Usage: ./scripts/setup-pi.sh [options]
   --arch arm64|armv7  Target arch (default: arm64)
   --yes, -y         Non-interactive (DISCORD_TOKEN / DISCORD_APP_ID required)
   --skip-start      Install only; do not start systemd
+  --remote-captcha  Run Chromium on the private Xvfb :99 display for HTTPS relay
   -h, --help        Show help
 
 /auth needs no inbound port. Password login requires a Pi desktop session with
 Chrome/Chromium; headless Pi installations should use Riot Mobile QR.
+
+--remote-captcha is opt-in. It requires Xvfb and Chromium on the Pi and an
+HTTPS AUTH_BASE_URL. Missing packages are reported; this script never installs
+them automatically.
 EOF
 }
 
@@ -46,6 +52,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --yes|-y) YES=1; shift ;;
     --skip-start) SKIP_START=1; shift ;;
+    --remote-captcha) REMOTE_CAPTCHA=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage; exit 1 ;;
   esac
@@ -67,6 +74,32 @@ prompt() {
   printf "%s: " "$label"
   read -r "$var"
   export "$var"
+}
+
+remote_captcha_dependencies() {
+  local missing=0
+  if ! command -v Xvfb >/dev/null 2>&1; then
+    echo "remote CAPTCHA dependency missing: Xvfb" >&2
+    missing=1
+  fi
+  if ! command -v chromium >/dev/null 2>&1 && \
+     ! command -v chromium-browser >/dev/null 2>&1 && \
+     ! command -v google-chrome >/dev/null 2>&1; then
+    echo "remote CAPTCHA dependency missing: Chromium" >&2
+    missing=1
+  fi
+  if [[ "$missing" -ne 0 ]]; then
+    echo "Install dependencies first: sudo apt-get update && sudo apt-get install -y xvfb chromium" >&2
+    return 1
+  fi
+}
+
+require_remote_captcha_https() {
+  local auth_base="$1"
+  if [[ "$auth_base" != https://* ]]; then
+    echo "--remote-captcha requires HTTPS AUTH_BASE_URL (got ${auth_base})" >&2
+    exit 1
+  fi
 }
 
 detect_lan_ip() {
@@ -97,12 +130,20 @@ AUTH_PORT=${AUTH_PORT:-8787}
 DATABASE_PATH=/var/lib/valorant-bot/data/bot.db
 STORE_RESET_CRON=${STORE_RESET_CRON:-0 0 * * *}
 EOF
+  if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
+    cat >> "$dest" <<'EOF'
+CAPTCHA_BROWSER_MODE=remote
+CAPTCHA_DISPLAY=:99
+EOF
+  fi
 }
 
-prompt DISCORD_TOKEN "Discord bot token (DISCORD_TOKEN)"
-prompt DISCORD_APP_ID "Discord application ID (DISCORD_APP_ID)"
-
 if [[ -n "$HOST" ]]; then
+  if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
+    ssh "$HOST" 'if ! command -v Xvfb >/dev/null 2>&1 || (! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1); then echo "remote CAPTCHA dependencies are missing" >&2; echo "Install dependencies first: sudo apt-get update && sudo apt-get install -y xvfb chromium" >&2; exit 1; fi'
+  fi
+  prompt DISCORD_TOKEN "Discord bot token (DISCORD_TOKEN)"
+  prompt DISCORD_APP_ID "Discord application ID (DISCORD_APP_ID)"
   if [[ "$ARCH" == armv7 ]]; then
     echo "building linux/armv7…"
     make build-pi32
@@ -124,6 +165,9 @@ if [[ -n "$HOST" ]]; then
     PI_IP="127.0.0.1"
   fi
   AUTH_BASE_URL="${AUTH_BASE_URL:-http://${PI_IP}:8787}"
+  if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
+    require_remote_captcha_https "$AUTH_BASE_URL"
+  fi
 
   ENV_TMP="$(mktemp)"
   write_env_file "$ENV_TMP" "$AUTH_BASE_URL"
@@ -133,6 +177,9 @@ if [[ -n "$HOST" ]]; then
   INSTALL_FLAGS=(--binary /tmp/valorant-bot --env /tmp/valorant.env)
   if [[ "$SKIP_START" -eq 1 ]]; then
     INSTALL_FLAGS+=(--skip-start)
+  fi
+  if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
+    INSTALL_FLAGS+=(--remote-captcha)
   fi
   ssh -t "$HOST" "cd ~/${REMOTE_DIR} && sudo ./deploy/install.sh ${INSTALL_FLAGS[*]}"
 
@@ -153,11 +200,20 @@ fi
 
 LAN_IP="$(detect_lan_ip)"
 AUTH_BASE_URL="${AUTH_BASE_URL:-http://${LAN_IP}:8787}"
+if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
+  remote_captcha_dependencies
+  require_remote_captcha_https "$AUTH_BASE_URL"
+fi
+prompt DISCORD_TOKEN "Discord bot token (DISCORD_TOKEN)"
+prompt DISCORD_APP_ID "Discord application ID (DISCORD_APP_ID)"
 ENV_TMP="$(mktemp)"
 write_env_file "$ENV_TMP" "$AUTH_BASE_URL"
 INSTALL_FLAGS=(--env "$ENV_TMP")
 if [[ "$SKIP_START" -eq 1 ]]; then
   INSTALL_FLAGS+=(--skip-start)
+fi
+if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
+  INSTALL_FLAGS+=(--remote-captcha)
 fi
 ./deploy/install.sh "${INSTALL_FLAGS[@]}"
 rm -f "$ENV_TMP"
