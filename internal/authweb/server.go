@@ -178,6 +178,8 @@ type Server struct {
 	beforeCaptchaReaperIdleExit func()
 	// Test-only synchronization seam after the final bounded reaper round.
 	beforeCaptchaReaperMaxExit func()
+	// Test-only synchronization seam after Shutdown publishes the closed boundary.
+	afterShutdownClosedForTest func()
 }
 
 // New builds an auth web Server.

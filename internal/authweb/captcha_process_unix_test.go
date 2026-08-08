@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -101,5 +102,110 @@ func TestCaptchaBrowserCloseRetriesAfterLeaderExitWhileGroupLives(t *testing.T) 
 	}
 	if _, err := os.Stat(profileDir); !os.IsNotExist(err) {
 		t.Fatalf("owned profile remains after complete group exit: %v", err)
+	}
+}
+
+// Mutation caught: re-probing a PGID after this controller already observed
+// its group gone can signal an unrelated process group that reused the number.
+func TestCaptchaBrowserCloseNeverRevivesObservedGoneProcessGroup(t *testing.T) {
+	root := t.TempDir()
+	profileDir := filepath.Join(root, strings.Repeat("7", 32))
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var waitCalls atomic.Int32
+	var terminateCalls atomic.Int32
+	var removeCalls atomic.Int32
+	exited := make(chan struct{})
+	close(exited)
+	controller := &chromeBrowserController{
+		cmd:         &exec.Cmd{Process: &os.Process{Pid: 4242}},
+		profileRoot: root,
+		profileDir:  profileDir,
+		exited:      exited,
+		closeDevTools: func(context.Context, string) error {
+			return errors.New("DevTools unavailable")
+		},
+		// Both probes in the first Close observe the owned group gone. Any
+		// later true result represents a reused, unrelated PGID.
+		waitProcessExit: func(*os.Process, <-chan struct{}, time.Duration) bool {
+			return waitCalls.Add(1) <= 2
+		},
+		terminateProcess: func(*os.Process, <-chan struct{}) error {
+			terminateCalls.Add(1)
+			return errors.New("would signal reused process group")
+		},
+		removeProfile: func(profileRoot, profileDir string) error {
+			if removeCalls.Add(1) == 1 {
+				return errors.New("temporary profile lock")
+			}
+			return removeCaptchaChromeProfile(profileRoot, profileDir)
+		},
+	}
+
+	firstErr := controller.Close()
+	if firstErr == nil || captchaBrowserMayBeRunning(firstErr) {
+		t.Fatalf("first Close error=%v, want gone-group profile failure", firstErr)
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatalf("retry Close after PGID reuse: %v", err)
+	}
+	if got := terminateCalls.Load(); got != 0 {
+		t.Fatalf("signaled reused process group %d time(s)", got)
+	}
+	if got := waitCalls.Load(); got > 2 {
+		t.Fatalf("re-probed observed-gone PGID %d time(s)", got)
+	}
+	if got := removeCalls.Load(); got != 2 {
+		t.Fatalf("profile cleanup calls=%d, want 2", got)
+	}
+	if _, err := os.Stat(profileDir); !os.IsNotExist(err) {
+		t.Fatalf("profile remains after retry: %v", err)
+	}
+}
+
+// Mutation caught: reverting the default production owner to the leader exit
+// channel leaves a real child alive in the launched process group and removes
+// the profile out from under it.
+func TestDefaultCaptchaControllerOwnsWholeUnixProcessGroup(t *testing.T) {
+	root := t.TempDir()
+	profileDir := filepath.Join(root, strings.Repeat("6", 32))
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", "-c", "sleep 30 >/dev/null 2>&1 & exec sleep 0.4")
+	controllerValue, err := startChromeLogged(cmd, root, profileDir)
+	if err != nil {
+		t.Fatalf("start production-wired controller: %v", err)
+	}
+	controller := controllerValue.(*chromeBrowserController)
+	pid := cmd.Process.Pid
+	t.Cleanup(func() {
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
+		select {
+		case <-controller.exited:
+		case <-time.After(2 * time.Second):
+		}
+		_ = os.RemoveAll(root)
+	})
+
+	select {
+	case <-controller.exited:
+	case <-time.After(2 * time.Second):
+		t.Fatal("process-group leader did not exit")
+	}
+	if alive, probeErr := captchaProcessGroupExists(pid); probeErr != nil || !alive {
+		t.Fatalf("child process group not alive after leader exit: alive=%v err=%v", alive, probeErr)
+	}
+	controller.closeDevTools = func(context.Context, string) error { return errors.New("leader already exited") }
+
+	if err := controller.Close(); err != nil {
+		t.Fatalf("close production-wired process group: %v", err)
+	}
+	if alive, probeErr := captchaProcessGroupExists(pid); probeErr != nil || alive {
+		t.Fatalf("owned child process group remains after Close: alive=%v err=%v", alive, probeErr)
+	}
+	if _, err := os.Stat(profileDir); !os.IsNotExist(err) {
+		t.Fatalf("owned profile remains after group exit: %v", err)
 	}
 }

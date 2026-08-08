@@ -127,6 +127,8 @@ func TestShutdownJoinsConcurrentBeginAuthAndRollsBackPendingState(t *testing.T) 
 	st.putStarted = make(chan struct{}, 1)
 	st.putRelease = putRelease
 	s := New(testDeps(st, &mockRiot{}, &mockBoxer{}))
+	closedBoundary := make(chan struct{})
+	s.afterShutdownClosedForTest = func() { close(closedBoundary) }
 
 	beginDone := make(chan error, 1)
 	go func() {
@@ -142,12 +144,11 @@ func TestShutdownJoinsConcurrentBeginAuthAndRollsBackPendingState(t *testing.T) 
 
 	shutdownDone := make(chan error, 1)
 	go func() { shutdownDone <- s.Shutdown(context.Background()) }()
-	shutdownReturnedEarly := false
-	var shutdownErr error
 	select {
-	case shutdownErr = <-shutdownDone:
-		shutdownReturnedEarly = true
-	case <-time.After(50 * time.Millisecond):
+	case <-closedBoundary:
+	case <-time.After(time.Second):
+		close(putRelease)
+		t.Fatal("Shutdown did not publish its closed boundary")
 	}
 	close(putRelease)
 
@@ -159,18 +160,13 @@ func TestShutdownJoinsConcurrentBeginAuthAndRollsBackPendingState(t *testing.T) 
 	case <-time.After(time.Second):
 		t.Fatal("BeginAuth did not leave after persisted-state release")
 	}
-	if !shutdownReturnedEarly {
-		select {
-		case shutdownErr = <-shutdownDone:
-		case <-time.After(time.Second):
-			t.Fatal("Shutdown did not join concurrent BeginAuth")
+	select {
+	case shutdownErr := <-shutdownDone:
+		if shutdownErr != nil {
+			t.Errorf("Shutdown error=%v", shutdownErr)
 		}
-	}
-	if shutdownErr != nil {
-		t.Errorf("Shutdown error=%v", shutdownErr)
-	}
-	if shutdownReturnedEarly {
-		t.Error("Shutdown returned before concurrent BeginAuth left PutAuthPending")
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not join concurrent BeginAuth")
 	}
 	if got := st.pendingCount(); got != 0 {
 		t.Errorf("persisted pending states=%d, want 0", got)
@@ -273,6 +269,8 @@ func TestShutdownJoinsFullCallbackAndPreventsPostCloseOutcome(t *testing.T) {
 		shard:        "kr",
 	}
 	s := New(testDeps(st, ri, &mockBoxer{}))
+	closedBoundary := make(chan struct{})
+	s.afterShutdownClosedForTest = func() { close(closedBoundary) }
 	s.setOutcome("legacy-state", authOutcome{Done: false})
 	redirectURL := "http://localhost/redirect#access_token=" + jwtAccessToken("kr") +
 		"&id_token=" + jwtIDToken("Legacy", "KR1") + "&state=legacy-state"
@@ -294,12 +292,11 @@ func TestShutdownJoinsFullCallbackAndPreventsPostCloseOutcome(t *testing.T) {
 
 	shutdownDone := make(chan error, 1)
 	go func() { shutdownDone <- s.Shutdown(context.Background()) }()
-	shutdownReturnedEarly := false
-	var shutdownErr error
 	select {
-	case shutdownErr = <-shutdownDone:
-		shutdownReturnedEarly = true
-	case <-time.After(50 * time.Millisecond):
+	case <-closedBoundary:
+	case <-time.After(time.Second):
+		close(upsertRelease)
+		t.Fatal("Shutdown did not publish its closed boundary")
 	}
 	close(upsertRelease)
 	select {
@@ -307,23 +304,37 @@ func TestShutdownJoinsFullCallbackAndPreventsPostCloseOutcome(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("callback did not leave after account commit release")
 	}
-	if !shutdownReturnedEarly {
-		select {
-		case shutdownErr = <-shutdownDone:
-		case <-time.After(time.Second):
-			t.Fatal("Shutdown did not join the callback")
+	select {
+	case shutdownErr := <-shutdownDone:
+		if shutdownErr != nil {
+			t.Errorf("Shutdown error=%v", shutdownErr)
 		}
-	}
-	if shutdownErr != nil {
-		t.Errorf("Shutdown error=%v", shutdownErr)
-	}
-	if shutdownReturnedEarly {
-		t.Error("Shutdown returned before the full callback operation completed")
+	case <-time.After(time.Second):
+		t.Fatal("Shutdown did not join the callback")
 	}
 	s.mu.Lock()
 	_, outcomeExists := s.outcomes["legacy-state"]
 	s.mu.Unlock()
 	if outcomeExists {
 		t.Error("callback inserted an outcome after the server closed boundary")
+	}
+}
+
+// Mutation caught: testing setOutcome only after Shutdown clears the map does
+// not detect removal of its closed publication gate. Exercise the gate itself.
+func TestSetOutcomeRejectsAfterClosedBoundary(t *testing.T) {
+	s := New(testDeps(newLegacyLifecycleStore(), &mockRiot{}, &mockBoxer{}))
+	s.mu.Lock()
+	s.closed = true
+	s.mu.Unlock()
+
+	if accepted := s.setOutcome("late-state", authOutcome{Done: true, OK: true, Display: "Late#1"}); accepted {
+		t.Fatal("setOutcome accepted publication after closed boundary")
+	}
+	s.mu.Lock()
+	_, exists := s.outcomes["late-state"]
+	s.mu.Unlock()
+	if exists {
+		t.Fatal("setOutcome inserted an outcome after closed boundary")
 	}
 }

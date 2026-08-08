@@ -18,22 +18,37 @@ func configureCaptchaProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
+func newCaptchaProcessOwnership(process *os.Process, exited <-chan struct{}) *captchaProcessOwnership {
+	return trackCaptchaProcessOwnership(
+		func(timeout time.Duration) bool {
+			return waitForCaptchaOwnedProcessExit(process, exited, timeout)
+		},
+		func(waitForExit func(time.Duration) bool) error {
+			return terminateCaptchaProcessWithWait(process, waitForExit)
+		},
+	)
+}
+
 func terminateCaptchaProcess(process *os.Process, exited <-chan struct{}) error {
-	if process == nil || waitForCaptchaOwnedProcessExit(process, exited, 0) {
+	return newCaptchaProcessOwnership(process, exited).terminate()
+}
+
+func terminateCaptchaProcessWithWait(process *os.Process, waitForExit func(time.Duration) bool) error {
+	if process == nil || waitForExit(0) {
 		return nil
 	}
 	termErr := syscall.Kill(-process.Pid, syscall.SIGTERM)
 	if errors.Is(termErr, syscall.ESRCH) {
 		termErr = nil
 	}
-	if waitForCaptchaOwnedProcessExit(process, exited, captchaProcessTerminateTimeout) {
+	if waitForExit(captchaProcessTerminateTimeout) {
 		return termErr
 	}
 	killErr := syscall.Kill(-process.Pid, syscall.SIGKILL)
 	if errors.Is(killErr, syscall.ESRCH) {
 		killErr = nil
 	}
-	if !waitForCaptchaOwnedProcessExit(process, exited, captchaProcessTerminateTimeout) {
+	if !waitForExit(captchaProcessTerminateTimeout) {
 		killErr = errors.Join(killErr, fmt.Errorf("captcha Chrome process group did not exit"))
 	}
 	return errors.Join(termErr, killErr)

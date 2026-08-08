@@ -75,7 +75,11 @@ func (s *Server) shutdown() {
 	tlsServer = s.captchaTLSServer
 	tlsListener = s.captchaTLSListener
 	tlsDone = s.captchaTLSDone
+	afterClosed := s.afterShutdownClosedForTest
 	s.mu.Unlock()
+	if afterClosed != nil {
+		afterClosed()
+	}
 
 	// Cancel contexts before waiting. None of the calls below run while
 	// Server.mu is held.
