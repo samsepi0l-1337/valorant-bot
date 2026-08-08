@@ -96,7 +96,7 @@ func validateRemoteCaptchaHost(host string) error {
 			return fmt.Errorf("malformed bracketed IPv6 host")
 		}
 		address, err := netip.ParseAddr(host[1:close])
-		if err != nil || !address.Is6() || address.Zone() != "" {
+		if err != nil || !address.Is6() || address.Is4In6() || address.Zone() != "" {
 			return fmt.Errorf("malformed bracketed IPv6 host")
 		}
 		rest := host[close+1:]

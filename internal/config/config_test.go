@@ -196,6 +196,23 @@ func TestLoad_CanonicalizesRemoteCaptchaOrigin(t *testing.T) {
 	}
 }
 
+func TestLoad_RejectsIPv4MappedIPv6RemoteCaptchaOrigin(t *testing.T) {
+	for _, raw := range []string{
+		"https://[::ffff:192.0.2.1]",
+		"https://[::ffff:c000:201]:8443",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			clearEnv(t)
+			setRequired(t)
+			t.Setenv("CAPTCHA_BROWSER_MODE", "remote")
+			t.Setenv("AUTH_BASE_URL", raw)
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load accepted IPv4-mapped IPv6 origin %q", raw)
+			}
+		})
+	}
+}
+
 func TestLoad_InvalidAuthPort(t *testing.T) {
 	clearEnv(t)
 	setRequired(t)

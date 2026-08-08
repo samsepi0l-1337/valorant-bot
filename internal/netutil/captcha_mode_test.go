@@ -47,6 +47,8 @@ func TestNormalizeCaptchaBrowserMode(t *testing.T) {
 		{name: "remote abbreviated IPv4", rawMode: "remote", authBaseURL: "https://127.1", wantErr: true},
 		{name: "remote hexadecimal IPv4", rawMode: "remote", authBaseURL: "https://0x7f.0x0.0x0.0x1", wantErr: true},
 		{name: "remote IPv6 zone", rawMode: "remote", authBaseURL: "https://[fe80::1%25eth0]", wantErr: true},
+		{name: "remote dotted IPv4-mapped IPv6", rawMode: "remote", authBaseURL: "https://[::ffff:192.0.2.1]", wantErr: true},
+		{name: "remote hexadecimal IPv4-mapped IPv6 port", rawMode: "remote", authBaseURL: "https://[::ffff:c000:201]:8443", wantErr: true},
 	}
 
 	for _, tt := range tests {

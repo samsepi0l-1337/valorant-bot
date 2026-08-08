@@ -65,7 +65,7 @@ func TestRemoteCaptchaHTTPShellIsStaticAndHardened(t *testing.T) {
 			t.Errorf("viewer HTML missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"https://", "http://", "<input", "keydown", "keyup", "localStorage", "sessionStorage", "serviceWorker"} {
+	for _, forbidden := range []string{"https://", "http://", "<input", "keydown", "keyup", "localStorage", "sessionStorage", "serviceWorker", `type:"viewport"`} {
 		if strings.Contains(body, forbidden) {
 			t.Errorf("viewer HTML contains forbidden capability %q", forbidden)
 		}
@@ -186,6 +186,31 @@ func TestRemoteCaptchaHTTPCanonicalConfiguredOriginsMatchBrowserRequests(t *test
 				if got := serveRemoteCaptchaHTTP(s, noncanonical).Code; got != http.StatusForbidden {
 					t.Fatalf("noncanonical Host/Origin status = %d, want 403", got)
 				}
+			}
+		})
+	}
+}
+
+func TestRemoteCaptchaHTTPFailsClosedForIPv4MappedIPv6Origins(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		configured    string
+		browserOrigin string
+		browserHost   string
+	}{
+		{name: "default port", configured: "https://[::ffff:192.0.2.1]", browserOrigin: "https://[::ffff:c000:201]", browserHost: "[::ffff:c000:201]"},
+		{name: "explicit nondefault port", configured: "https://[::ffff:192.0.2.1]:8443", browserOrigin: "https://[::ffff:c000:201]:8443", browserHost: "[::ffff:c000:201]:8443"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := New(Deps{AuthBaseURL: test.configured, CaptchaBrowserMode: netutil.CaptchaBrowserRemote})
+			t.Cleanup(func() { _ = s.Close() })
+			if s.remoteCaptchaOrigin != "" || s.remoteCaptchaHost != "" {
+				t.Fatalf("server retained mapped IPv6 origin=%q host=%q", s.remoteCaptchaOrigin, s.remoteCaptchaHost)
+			}
+			req := httptest.NewRequest(http.MethodGet, test.browserOrigin+"/captcha/remote", nil)
+			req.Host = test.browserHost
+			if got := serveRemoteCaptchaHTTP(s, req).Code; got != http.StatusForbidden {
+				t.Fatalf("mapped IPv6 viewer request status = %d, want 403", got)
 			}
 		})
 	}
