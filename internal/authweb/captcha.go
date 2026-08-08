@@ -42,6 +42,11 @@ type passwordFlow struct {
 	launchMu sync.Mutex
 	submitMu sync.Mutex
 	browser  captchaBrowserController
+	// Browser generation fields are protected by launchMu. Each reopen cancels
+	// the previous CDP worker, and only the controller/generation still owned by
+	// the flow may publish a terminal result.
+	browserGeneration uint64
+	browserCancel     context.CancelFunc
 	// Lifecycle fields below are protected by Server.mu.
 	sealed           bool
 	commitClaimed    bool
@@ -124,9 +129,9 @@ func (s *Server) BeginPasswordLogin(ctx context.Context, discordUserID, username
 	return "", state, nil
 }
 
-// LaunchPasswordCaptcha validates the Discord owner and asks the bot host to
-// wait for loopback TLS before opening a fresh Chrome window. It never exposes
-// loopback URLs to Discord users.
+// LaunchPasswordCaptcha validates the Discord owner and opens a fresh Chrome
+// window on the bot host. Production uses Riot's official page; only a legacy
+// custom PasswordAuthClient waits for the private loopback widget listener.
 func (s *Server) LaunchPasswordCaptcha(ctx context.Context, state, discordUserID string) error {
 	state = strings.TrimSpace(state)
 	discordUserID = strings.TrimSpace(discordUserID)
@@ -138,8 +143,10 @@ func (s *Server) LaunchPasswordCaptcha(ctx context.Context, state, discordUserID
 	if pending.discordUserID != discordUserID {
 		return ErrCaptchaOwner
 	}
-	if err := s.waitCaptchaTLS(3 * time.Second); err != nil {
-		return err
+	if _, officialBrowser := s.passwordAuth.(browserPasswordAuthClient); !officialBrowser {
+		if err := s.waitCaptchaTLS(3 * time.Second); err != nil {
+			return err
+		}
 	}
 	return s.ensureCaptchaLaunched(state)
 }
@@ -278,6 +285,10 @@ func (s *Server) setPasswordOutcome(state string, flow *passwordFlow, out passwo
 		return passwordOutcome{}, err
 	}
 	closeErr := s.closeOwnedCaptchaBrowser(flow)
+	return s.publishFinalizedPasswordOutcome(state, flow, out, closeErr)
+}
+
+func (s *Server) publishFinalizedPasswordOutcome(state string, flow *passwordFlow, out passwordOutcome, closeErr error) (passwordOutcome, error) {
 	if closeErr != nil {
 		out = passwordOutcome{err: fmt.Errorf("captcha Chrome could not be closed: %w", closeErr)}
 	}
@@ -340,6 +351,11 @@ func (s *Server) finishPasswordAccount(ctx context.Context, state string, pendin
 		return passwordOutcome{}, err
 	}
 	closeErr := s.closeOwnedCaptchaBrowser(flow)
+	return s.finishFinalizedPasswordAccount(ctx, state, pending, tokens, closeErr)
+}
+
+func (s *Server) finishFinalizedPasswordAccount(ctx context.Context, state string, pending passwordPending, tokens riot.PasswordTokens, closeErr error) (passwordOutcome, error) {
+	flow := pending.flow
 	if closeErr != nil {
 		out := passwordOutcome{err: fmt.Errorf("captcha Chrome could not be closed: %w", closeErr)}
 		published, publishErr := s.publishPasswordOutcome(state, flow, out)
@@ -371,6 +387,12 @@ func (s *Server) finishPasswordMFA(state string, pending passwordPending, mfaSta
 	}
 	scrubPasswordCredentials(&pending)
 	closeErr := s.closeOwnedCaptchaBrowser(flow)
+	return s.finishFinalizedPasswordMFA(state, pending, mfaState, challenge, hint, closeErr)
+}
+
+func (s *Server) finishFinalizedPasswordMFA(state string, pending passwordPending, mfaState string, challenge *riot.MFAChallenge, hint string, closeErr error) (passwordOutcome, error) {
+	flow := pending.flow
+	scrubPasswordCredentials(&pending)
 	if closeErr != nil {
 		out := passwordOutcome{err: fmt.Errorf("captcha Chrome could not be closed: %w", closeErr)}
 		published, publishErr := s.publishPasswordOutcome(state, flow, out)

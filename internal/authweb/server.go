@@ -91,7 +91,8 @@ type Deps struct {
 	QRPollInterval time.Duration
 	Boxer          Boxer
 	OnLinked       LinkedNotifier
-	// CaptchaTLSPort serves the Riot-host captcha widget on 127.0.0.1 (default 8443).
+	// CaptchaTLSPort is retained for the legacy local-widget test/fallback path.
+	// The production Riot browser flow uses Riot's real DNS/TLS and no listener.
 	CaptchaTLSPort int
 }
 

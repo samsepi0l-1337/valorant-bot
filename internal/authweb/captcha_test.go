@@ -56,6 +56,58 @@ type fakePasswordAuth struct {
 	mfaErr          error
 }
 
+type fakeBrowserPasswordAuth struct {
+	*fakePasswordAuth
+	authorizeURL string
+	adoptedBody  atomic.Value
+}
+
+type blockingFirstAdoptBrowserAuth struct {
+	*fakeBrowserPasswordAuth
+	adoptStarted chan struct{}
+	adoptRelease <-chan struct{}
+	adoptCalls   atomic.Int32
+}
+
+func (f *blockingFirstAdoptBrowserAuth) AdoptBrowserLogin(ctx context.Context, body []byte, cookies []*http.Cookie, userAgent string) (riot.PasswordTokens, *riot.MFAChallenge, error) {
+	if f.adoptCalls.Add(1) == 1 {
+		close(f.adoptStarted)
+		select {
+		case <-ctx.Done():
+			return riot.PasswordTokens{}, nil, ctx.Err()
+		case <-f.adoptRelease:
+		}
+	}
+	return f.fakeBrowserPasswordAuth.AdoptBrowserLogin(ctx, body, cookies, userAgent)
+}
+
+func (f *fakeBrowserPasswordAuth) BrowserAuthorizeURL(state string) (string, error) {
+	return f.authorizeURL + "?nonce=" + state, nil
+}
+
+func (f *fakeBrowserPasswordAuth) AdoptBrowserLogin(_ context.Context, body []byte, _ []*http.Cookie, _ string) (riot.PasswordTokens, *riot.MFAChallenge, error) {
+	f.adoptedBody.Store(append([]byte(nil), body...))
+	return f.tokens, f.mfa, f.complete
+}
+
+type testRiotBrowserLoginController struct {
+	*testCaptchaBrowserController
+	result   riotBrowserLoginResult
+	err      error
+	run      func(context.Context, string, string) (riotBrowserLoginResult, error)
+	username atomic.Value
+	password atomic.Value
+}
+
+func (c *testRiotBrowserLoginController) RunRiotLogin(ctx context.Context, username, password string) (riotBrowserLoginResult, error) {
+	c.username.Store(username)
+	c.password.Store(password)
+	if c.run != nil {
+		return c.run(ctx, username, password)
+	}
+	return c.result, c.err
+}
+
 type testCaptchaBrowserController struct {
 	closeOnce    sync.Once
 	closeStarted chan struct{}
@@ -272,6 +324,229 @@ func TestCaptchaChallengeSyncsRiotBrowserSession(t *testing.T) {
 		completeBrowser.Cookies["authenticator.sid"] != "s1" ||
 		completeBrowser.Cookies["tdid"] != "d1" {
 		t.Fatalf("complete browser = %#v", completeBrowser)
+	}
+}
+
+func TestLaunchPasswordCaptchaUsesOfficialBrowserSessionThroughMFA(t *testing.T) {
+	pw := &fakeBrowserPasswordAuth{
+		fakePasswordAuth: &fakePasswordAuth{
+			mfa: &riot.MFAChallenge{Email: "b***@example.com", Method: "email", Methods: []string{"riotmobile", "thirdparty", "email"}},
+		},
+		authorizeURL: "https://auth.riotgames.com/authorize",
+	}
+	s := New(Deps{
+		AuthBaseURL:  "https://bot.example.com",
+		PasswordAuth: pw,
+		PendingTTL:   time.Minute,
+		Store:        newMockStore(),
+		Riot: &mockRiot{
+			entitlements: "ent",
+			puuid:        "puuid-1",
+			names:        []riot.PlayerName{{GameName: "Player", TagLine: "KR1"}},
+			region:       "kr",
+			shard:        "kr",
+		},
+		Boxer: &mockBoxer{},
+	})
+	t.Cleanup(func() { _ = s.Close() })
+	controller := &testRiotBrowserLoginController{
+		testCaptchaBrowserController: newTestCaptchaBrowserController(),
+		result: riotBrowserLoginResult{
+			ResponseBody: []byte(`{"type":"multifactor","multifactor":{"method":"email"}}`),
+			Cookies: []*http.Cookie{
+				{Name: "authenticator.sid", Value: "browser-session", Domain: "authenticate.riotgames.com", Path: "/", Secure: true},
+			},
+			UserAgent: "browser-user-agent",
+		},
+	}
+	var launchedURL atomic.Value
+	s.launchCaptchaBrowser = func(rawURL string) (captchaBrowserController, error) {
+		launchedURL.Store(rawURL)
+		return controller, nil
+	}
+
+	_, state, err := s.BeginPasswordLogin(context.Background(), "discord-1", "browser-user", "browser-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "discord-1"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, mfaState, hint, err := s.WaitPasswordLogin(ctx, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mfaState == "" || hint != "b***@example.com" {
+		t.Fatalf("MFA state=%q hint=%q", mfaState, hint)
+	}
+	if got, _ := launchedURL.Load().(string); got != "https://auth.riotgames.com/authorize?nonce="+state {
+		t.Fatalf("launched URL = %q", got)
+	}
+	if got, _ := controller.username.Load().(string); got != "browser-user" {
+		t.Fatalf("browser username = %q", got)
+	}
+	if got, _ := controller.password.Load().(string); got != "browser-password" {
+		t.Fatalf("browser password mismatch")
+	}
+	if got := pw.beginCalls.Load(); got != 0 {
+		t.Fatalf("legacy BeginCaptcha calls = %d, want 0", got)
+	}
+	if got := controller.closeCalls.Load(); got != 1 {
+		t.Fatalf("browser close calls = %d, want 1 after MFA", got)
+	}
+	if got, _ := pw.adoptedBody.Load().([]byte); !strings.Contains(string(got), `"type":"multifactor"`) {
+		t.Fatalf("adopted body = %q", got)
+	}
+}
+
+func TestReopenOfficialBrowserCancelsAndRejectsStaleWorker(t *testing.T) {
+	pw := &fakeBrowserPasswordAuth{
+		fakePasswordAuth: &fakePasswordAuth{mfa: &riot.MFAChallenge{Email: "b***@example.com", Method: "email"}},
+		authorizeURL:     "https://auth.riotgames.com/authorize",
+	}
+	s := newCaptchaServer(pw.fakePasswordAuth)
+	s.passwordAuth = pw
+	oldStarted := make(chan struct{})
+	oldCanceled := make(chan struct{})
+	oldController := &testRiotBrowserLoginController{
+		testCaptchaBrowserController: newTestCaptchaBrowserController(),
+		run: func(ctx context.Context, _, _ string) (riotBrowserLoginResult, error) {
+			close(oldStarted)
+			<-ctx.Done()
+			close(oldCanceled)
+			return riotBrowserLoginResult{}, ctx.Err()
+		},
+	}
+	newRelease := make(chan struct{})
+	newController := &testRiotBrowserLoginController{
+		testCaptchaBrowserController: newTestCaptchaBrowserController(),
+		run: func(context.Context, string, string) (riotBrowserLoginResult, error) {
+			<-newRelease
+			return riotBrowserLoginResult{
+				ResponseBody: []byte(`{"type":"multifactor","multifactor":{"method":"email"}}`),
+				UserAgent:    "browser-user-agent",
+			}, nil
+		},
+	}
+	var launches atomic.Int32
+	s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) {
+		if launches.Add(1) == 1 {
+			return oldController, nil
+		}
+		return newController, nil
+	}
+
+	_, state, err := s.BeginPasswordLogin(context.Background(), "discord-1", "browser-user", "browser-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "discord-1"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-oldStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first official browser worker did not start")
+	}
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "discord-1"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-oldCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("reopen did not cancel the previous official browser worker")
+	}
+	close(newRelease)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, mfaState, _, err := s.WaitPasswordLogin(ctx, state)
+	if err != nil {
+		t.Fatalf("replacement browser result: %v", err)
+	}
+	if mfaState == "" {
+		t.Fatal("replacement browser did not publish MFA")
+	}
+	if oldController.closeCalls.Load() != 1 || newController.closeCalls.Load() != 1 {
+		t.Fatalf("close calls old=%d new=%d", oldController.closeCalls.Load(), newController.closeCalls.Load())
+	}
+}
+
+func TestReopenOfficialBrowserCancelsBlockedAdoptionBeforeTakingLaunchOwnership(t *testing.T) {
+	adoptRelease := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(adoptRelease) }) }
+	defer release()
+	pw := &blockingFirstAdoptBrowserAuth{
+		fakeBrowserPasswordAuth: &fakeBrowserPasswordAuth{
+			fakePasswordAuth: &fakePasswordAuth{mfa: &riot.MFAChallenge{Email: "b***@example.com", Method: "email"}},
+			authorizeURL:     "https://auth.riotgames.com/authorize",
+		},
+		adoptStarted: make(chan struct{}),
+		adoptRelease: adoptRelease,
+	}
+	s := newCaptchaServer(pw.fakeBrowserPasswordAuth.fakePasswordAuth)
+	s.passwordAuth = pw
+	t.Cleanup(func() { _ = s.Close() })
+	first := &testRiotBrowserLoginController{
+		testCaptchaBrowserController: newTestCaptchaBrowserController(),
+		result: riotBrowserLoginResult{
+			ResponseBody: []byte(`{"type":"multifactor","multifactor":{"method":"email"}}`),
+			UserAgent:    "browser-user-agent",
+		},
+	}
+	second := &testRiotBrowserLoginController{
+		testCaptchaBrowserController: newTestCaptchaBrowserController(),
+		result: riotBrowserLoginResult{
+			ResponseBody: []byte(`{"type":"multifactor","multifactor":{"method":"email"}}`),
+			UserAgent:    "browser-user-agent",
+		},
+	}
+	var launches atomic.Int32
+	s.launchCaptchaBrowser = func(string) (captchaBrowserController, error) {
+		if launches.Add(1) == 1 {
+			return first, nil
+		}
+		return second, nil
+	}
+
+	_, state, err := s.BeginPasswordLogin(context.Background(), "discord-1", "browser-user", "browser-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "discord-1"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-pw.adoptStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first official browser adoption did not start")
+	}
+
+	reopened := make(chan error, 1)
+	go func() { reopened <- s.LaunchPasswordCaptcha(context.Background(), state, "discord-1") }()
+	select {
+	case err := <-reopened:
+		if err != nil {
+			t.Fatalf("reopen blocked adoption: %v", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		release()
+		t.Fatal("reopen waited for the old worker's network adoption while holding launch ownership")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, mfaState, _, err := s.WaitPasswordLogin(ctx, state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mfaState == "" {
+		t.Fatal("replacement browser did not publish MFA")
+	}
+	if got := pw.adoptCalls.Load(); got != 2 {
+		t.Fatalf("adoption calls = %d, want 2", got)
 	}
 }
 

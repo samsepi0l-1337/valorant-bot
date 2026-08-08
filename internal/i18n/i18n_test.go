@@ -14,13 +14,13 @@ func TestCaptchaCopyDescribesButtonStartedChrome(t *testing.T) {
 	}{
 		{
 			lang:     KO,
-			prompt:   "아래 버튼을 누르면 봇이 실행 중인 이 Mac/PC에서 Chrome 캡차 창을 엽니다.\n그 창에서 **「로봇이 아닙니다」**만 체크하세요.",
+			prompt:   "아래 버튼을 누르면 봇이 실행 중인 Mac/Linux PC에서 Riot 공식 Chrome 캡차 창을 엽니다.\n그 창에 표시되는 **「로봇이 아닙니다」** 캡차를 완료하세요.",
 			button:   "캡차 창 열기",
 			launched: "봇 PC에서 Chrome 캡차 창을 열었습니다.",
 		},
 		{
 			lang:     EN,
-			prompt:   "Tap the button below to open a Chrome captcha window on the bot Mac/PC.\nCheck **I'm not a robot** in that window.",
+			prompt:   "Tap below to open Riot's official Chrome captcha window on the bot macOS/Linux machine.\nComplete the **I'm not a robot** challenge shown there.",
 			button:   "Open captcha window",
 			launched: "Opened the Chrome captcha window on the bot machine.",
 		},

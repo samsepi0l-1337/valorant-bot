@@ -26,8 +26,8 @@ RestrictSUIDSGID=true
 LockPersonality=true
 ReadWritePaths=/var/lib/valorant-bot
 
-# AUTH_PORT (default 8787) and password-captcha loopback TLS (8443) are
-# unprivileged ports. QR and password /auth never bind port 80.
+# AUTH_PORT (default 8787) is unprivileged. QR and password /auth never bind
+# port 80; the official browser password flow needs no inbound CAPTCHA port.
 # Do NOT enable CAP_NET_BIND_SERVICE.
 
 [Install]

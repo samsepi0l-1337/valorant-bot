@@ -54,6 +54,7 @@ func (e *captchaBrowserCloseError) Unwrap() error {
 
 type chromeBrowserController struct {
 	cmd              *exec.Cmd
+	devToolsPipe     *chromeDevToolsPipe
 	processOwner     *captchaProcessOwnership
 	ownerUsesSeams   bool
 	profileRoot      string
@@ -173,12 +174,22 @@ func startChromeLogged(cmd *exec.Cmd, profileRoot, profileDir string) (captchaBr
 func startChromeLoggedWithRemove(cmd *exec.Cmd, profileRoot, profileDir string, removeProfile func(string, string) error) (captchaBrowserController, error) {
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
+	var pipeSetup *chromeDevToolsPipeSetup
+	var err error
+	if chromeCommandUsesPrivateDevTools(cmd) {
+		pipeSetup, err = prepareChromeDevToolsPipe(cmd)
+		if err != nil {
+			return cleanupUnstartedChromeLaunch(profileRoot, profileDir, fmt.Errorf("prepare private Chrome DevTools: %w", err))
+		}
+	}
 	preparedOwner, err := prepareCaptchaProcess(cmd)
 	if err != nil {
+		pipeSetup.closeAll()
 		return cleanupUnstartedChromeLaunch(profileRoot, profileDir, err)
 	}
 	controller := &chromeBrowserController{
 		cmd:           cmd,
+		devToolsPipe:  nil,
 		processOwner:  preparedOwner,
 		profileRoot:   profileRoot,
 		profileDir:    profileDir,
@@ -186,11 +197,16 @@ func startChromeLoggedWithRemove(cmd *exec.Cmd, profileRoot, profileDir string, 
 		closeDevTools: closeChromeViaDevTools,
 		removeProfile: removeProfile,
 	}
+	if pipeSetup != nil {
+		controller.devToolsPipe = pipeSetup.host
+	}
 	if err := cmd.Start(); err != nil {
 		log.Printf("captcha chrome start failed: %v", err)
+		pipeSetup.closeAll()
 		close(controller.exited)
 		return cleanupFailedChromeLaunch(controller, fmt.Errorf("start chrome: %w", err))
 	}
+	pipeSetup.closeChildEnds()
 	controller.processOwner = completeCaptchaProcessOwnership(preparedOwner, cmd.Process, controller.exited)
 
 	go func() {
@@ -264,7 +280,11 @@ func (c *chromeBrowserController) close() error {
 	graceful := false
 	if profileErr == nil && ownedProcess && !processExited {
 		ctx, cancel := context.WithTimeout(context.Background(), devToolsCloseTimeout)
-		graceful = closeDevTools(ctx, c.profileDir) == nil
+		if c.devToolsPipe != nil {
+			graceful = c.closeViaPrivateDevTools(ctx) == nil
+		} else {
+			graceful = closeDevTools(ctx, c.profileDir) == nil
+		}
 		cancel()
 	}
 
@@ -276,6 +296,13 @@ func (c *chromeBrowserController) close() error {
 	}
 
 	processExited = !ownedProcess || processOwner.waitForExit(0)
+	// The host transport belongs to this controller generation, not to the
+	// process lifetime. Close it even when group termination fails so a blocked
+	// CDP worker can leave flow.wg; the retained controller/reaper still owns the
+	// live process and profile independently.
+	if c.devToolsPipe != nil {
+		_ = c.devToolsPipe.Close()
+	}
 	if ownedProcess && !processExited && terminateErr == nil {
 		terminateErr = fmt.Errorf("captcha Chrome process did not exit")
 	}
@@ -290,6 +317,34 @@ func (c *chromeBrowserController) close() error {
 	return &captchaBrowserCloseError{
 		ProcessExited: processExited,
 		Err:           closeErr,
+	}
+}
+
+func chromeCommandUsesPrivateDevTools(cmd *exec.Cmd) bool {
+	if cmd == nil {
+		return false
+	}
+	for _, arg := range cmd.Args {
+		if arg == "--remote-debugging-pipe" {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *chromeBrowserController) closeViaPrivateDevTools(ctx context.Context) error {
+	if c == nil || c.devToolsPipe == nil {
+		return errors.New("private Chrome DevTools pipe is unavailable")
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- c.devToolsPipe.WriteJSON(map[string]any{"id": 1, "method": "Browser.close"})
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -484,12 +539,19 @@ func removeCaptchaChromeProfile(profileRoot, profileDir string) error {
 }
 
 func chromeLaunchConfig(widgetURL string) (profileRoot, profileDir string, flags []string, err error) {
-	hostRules := fmt.Sprintf(
-		"MAP %s 127.0.0.1",
-		RiotCaptchaHost,
-	)
-	// Only map the current authenticator origin. Mapping auth.riotgames.com
-	// would mint a token for Riot's legacy OAuth host and get it rejected.
+	parsed, err := url.Parse(widgetURL)
+	if err != nil {
+		return "", "", nil, fmt.Errorf("captcha Chrome URL: %w", err)
+	}
+	isLocalWidget := strings.EqualFold(parsed.Scheme, "https") &&
+		strings.EqualFold(parsed.Hostname(), RiotCaptchaHost) && parsed.Path == "/captcha/widget" &&
+		strings.TrimSpace(parsed.Query().Get("state")) != ""
+	isOfficialLogin := strings.EqualFold(parsed.Scheme, "https") &&
+		strings.EqualFold(parsed.Host, "auth.riotgames.com") && parsed.Path == "/authorize" &&
+		strings.TrimSpace(parsed.Query().Get("nonce")) != ""
+	if !isLocalWidget && !isOfficialLogin {
+		return "", "", nil, errors.New("captcha Chrome URL must be an owned local widget or Riot official authorize page")
+	}
 	profileRoot, profileDir, err = chromeUserDataDir(widgetURL)
 	if err != nil {
 		return "", "", nil, err
@@ -500,14 +562,26 @@ func chromeLaunchConfig(widgetURL string) (profileRoot, profileDir string, flags
 		"--no-default-browser-check",
 		"--new-window",
 		"--incognito",
-		"--remote-debugging-address=127.0.0.1",
-		"--remote-debugging-port=0",
-		"--host-resolver-rules=" + hostRules,
-		"--ignore-certificate-errors",
-		"--allow-insecure-localhost",
-		"--disable-features=HttpsFirstBalancedModeAutoEnable",
-		widgetURL,
 	}
+	if isLocalWidget {
+		flags = append(flags,
+			"--remote-debugging-address=127.0.0.1",
+			"--remote-debugging-port=0",
+		)
+		// Only map the current authenticator origin for the legacy local-widget
+		// fallback. The official browser flow must use Riot's real DNS and TLS.
+		flags = append(flags,
+			"--host-resolver-rules=MAP "+RiotCaptchaHost+" 127.0.0.1",
+			"--ignore-certificate-errors",
+			"--allow-insecure-localhost",
+			"--disable-features=HttpsFirstBalancedModeAutoEnable",
+		)
+	} else {
+		// The official browser flow injects credentials and reads authenticated
+		// cookies, so its DevTools transport must never be exposed on TCP.
+		flags = append(flags, "--remote-debugging-pipe")
+	}
+	flags = append(flags, widgetURL)
 	return profileRoot, profileDir, flags, nil
 }
 
@@ -535,7 +609,10 @@ func chromeUserDataDir(widgetURL string) (root, dir string, err error) {
 	}
 	state := strings.TrimSpace(parsed.Query().Get("state"))
 	if state == "" {
-		return "", "", fmt.Errorf("captcha widget URL missing state")
+		state = strings.TrimSpace(parsed.Query().Get("nonce"))
+	}
+	if state == "" {
+		return "", "", fmt.Errorf("captcha Chrome URL missing state or nonce")
 	}
 
 	if chromeUserDataDirFn != nil {
@@ -843,6 +920,7 @@ func (s *Server) ensureCaptchaLaunched(state string) error {
 	pending, ok := s.passwordPending[state]
 	out := s.passwordOutcomes[state]
 	port := s.captchaTLSPort
+	browserAuth, officialBrowser := s.passwordAuth.(browserPasswordAuthClient)
 	if !ok || pending.flow == nil || pending.flow.sealed || out.done ||
 		pending.flow.ctx.Err() != nil || time.Now().After(pending.expiresAt) {
 		s.mu.Unlock()
@@ -864,7 +942,7 @@ func (s *Server) ensureCaptchaLaunched(state string) error {
 		flow.launchMu.Unlock()
 		return fmt.Errorf("captcha session expired; run /auth again")
 	}
-	if port <= 0 && !skipCaptchaTLSWait {
+	if !officialBrowser && port <= 0 && !skipCaptchaTLSWait {
 		s.mu.Unlock()
 		flow.launchMu.Unlock()
 		return fmt.Errorf("captcha TLS not started")
@@ -885,8 +963,16 @@ func (s *Server) ensureCaptchaLaunched(state string) error {
 	if launcher == nil {
 		launcher = launchSystemChrome
 	}
-	widgetURL := s.captchaWidgetURL(state)
-	controller, err := launcher(widgetURL)
+	launchURL := s.captchaWidgetURL(state)
+	if officialBrowser {
+		officialURL, urlErr := browserAuth.BrowserAuthorizeURL(state)
+		if urlErr != nil {
+			flow.launchMu.Unlock()
+			return fmt.Errorf("build Riot browser login URL: %w", urlErr)
+		}
+		launchURL = officialURL
+	}
+	controller, err := launcher(launchURL)
 	if err != nil {
 		if controller != nil {
 			// A failed process may still own a profile whose cleanup failed. Keep
@@ -900,6 +986,21 @@ func (s *Server) ensureCaptchaLaunched(state string) error {
 	if controller == nil {
 		flow.launchMu.Unlock()
 		return fmt.Errorf("captcha Chrome launcher returned no controller")
+	}
+	var riotController riotBrowserLoginController
+	if officialBrowser {
+		riotController, ok = controller.(riotBrowserLoginController)
+		if !ok {
+			flow.browser = controller
+			closedController, closeErr := closeCaptchaBrowserLocked(flow)
+			s.recordCaptchaBrowserCloseResultLocked(flow, closedController, closeErr, false)
+			flow.launchMu.Unlock()
+			controllerErr := errors.New("captcha Chrome controller cannot drive Riot browser login")
+			if closeErr != nil {
+				return errors.Join(controllerErr, closeErr)
+			}
+			return controllerErr
+		}
 	}
 	s.mu.Lock()
 	current, stillPending = s.passwordPending[state]
@@ -919,14 +1020,29 @@ func (s *Server) ensureCaptchaLaunched(state string) error {
 		return expiredErr
 	}
 	flow.browser = controller
+	var browserCtx context.Context
+	var browserGeneration uint64
+	if officialBrowser {
+		flow.browserGeneration++
+		browserGeneration = flow.browserGeneration
+		browserCtx, flow.browserCancel = context.WithCancel(flow.ctx)
+		flow.wg.Add(1)
+	}
 	flow.launchMu.Unlock()
 	log.Printf("captcha Chrome launched")
+	if officialBrowser {
+		go s.runRiotBrowserLogin(browserCtx, state, current, browserGeneration, browserAuth, riotController)
+	}
 	return nil
 }
 
 func closeCaptchaBrowserLocked(flow *passwordFlow) (captchaBrowserController, error) {
 	if flow == nil {
 		return nil, nil
+	}
+	if flow.browserCancel != nil {
+		flow.browserCancel()
+		flow.browserCancel = nil
 	}
 	controller := flow.browser
 	if controller == nil {

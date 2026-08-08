@@ -7,8 +7,9 @@ Docker에서 실행할 수 있습니다.
 `/auth`는 **Riot Mobile QR 스캔** 또는 **아이디/비밀번호 로그인**을 제공합니다.
 별도 프로그램 설치, URL 붙여넣기, 사용자 측 localhost/포트 80은 필요 없습니다.
 비밀번호 로그인은 Discord에서 시작하지만, 캡차 창은 **봇이 실행 중인 호스트**의
-GUI Chrome에서 열립니다. Riot이 요구할 때만 Discord 모달로 MFA 코드를 받습니다.
-디스플레이가 없는 Raspberry Pi 또는 서버는 QR 방식을 사용하세요.
+GUI Chrome에서 Riot 공식 로그인 페이지로 열립니다. Riot이 요구할 때만 Discord
+모달로 MFA 코드를 받습니다. 디스플레이가 없는 Raspberry Pi·서버와 Windows 호스트는
+QR 방식을 사용하세요.
 
 ## 빠른 시작 (원샷 스크립트)
 
@@ -137,15 +138,16 @@ Discord에서 `/auth`를 실행한 뒤 원하는 방식을 선택합니다.
 - **아이디/비밀번호**: 다음 순서로 진행합니다.
   1. Discord 모달에 계정 정보를 입력합니다.
   2. 그 요청의 소유자가 Discord의 **캡차 창 열기/다시 열기** 버튼을 누릅니다.
-  3. 봇 호스트에서 GUI Chrome이 열리면 「로봇이 아닙니다」를 완료합니다. 이 창은
-     `authenticate.riotgames.com`을 호스트의 loopback TLS로 연결해 캡차 토큰이
-     Riot 인증 호스트에서 생성되도록 합니다.
+  3. 봇 호스트에서 Riot 공식 GUI Chrome 창이 열리면 「로봇이 아닙니다」를
+     완료합니다. Chrome은 Riot의 실제 DNS·TLS를 사용하고, 봇은 외부에 노출되지 않는
+     전용 DevTools pipe로 이 한 번의 로그인 창만 제어합니다.
   4. 캡차 결과가 처리되면 봇이 Chrome 창을 닫습니다. Riot이 MFA를 요구한 경우에만
      Discord의 MFA 버튼을 누르고 모달에 이메일 또는 인증 앱 코드를 입력합니다.
 
 Discord 사용자는 Chrome, 인증 도우미, localhost 주소 또는 포트 설정을 설치·실행할
-필요가 없습니다. 반대로 비밀번호 방식에는 **봇 호스트의 화면 세션과 GUI
-Chrome/Chromium**이 필요합니다. 설치 스크립트가 만드는 기본 systemd 서비스는
+필요가 없습니다. 반대로 비밀번호 방식에는 **macOS 또는 Linux 봇 호스트의 화면
+세션과 GUI Chrome/Chromium**이 필요합니다. Windows에서는 Riot Mobile QR을
+사용합니다. 설치 스크립트가 만드는 기본 systemd 서비스는
 비로그인 `valorant` 사용자로 실행되므로, 호스트에 화면이 있어도 그 서비스에서는 GUI
 Chrome을 열 수 없습니다. 기본 systemd·headless Raspberry Pi·VPS·Docker 배포에서는
 Riot Mobile QR을 사용하세요. GUI 비밀번호 로그인은 서비스를 중지한 뒤 실제 데스크톱
@@ -159,8 +161,8 @@ Riot Mobile에서 승인만 합니다. 토큰 응답 안의 `http://localhost/re
 Client에 등록된 결과 URI를 파싱하기 위한 값일 뿐, 사용자 또는 봇에 localhost 브라우저
 접속을 요구하지 않습니다. QR에는 Riot/Discord로 나가는 연결만 있으면 됩니다.
 
-이 흐름은 자동화 테스트로 상태 전이와 정리를 검증합니다. 실제 Riot 계정으로의
-인증 성공은 운영자가 직접 로그인하지 않는 한 보장하거나 주장하지 않습니다.
+이 흐름은 자동화 테스트로 상태 전이와 정리를 검증합니다. 실제 Riot 계정으로의 인증
+성공은 운영자가 직접 로그인하지 않는 한 보장하거나 주장하지 않습니다.
 
 Riot의 공식 제3자 인증인 [RSO](https://developer.riotgames.com/docs/valorant)는 승인된
 Production 애플리케이션과 RSO Client가 필요합니다. 공개 VALORANT API에는 개인 일일

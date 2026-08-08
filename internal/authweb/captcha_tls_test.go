@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -171,6 +172,37 @@ func TestCaptchaWidgetUsesAuthenticateOrigin(t *testing.T) {
 	}
 }
 
+func TestOfficialRiotChromeUsesNetworkWithoutLocalHostMapping(t *testing.T) {
+	rawURL := "https://auth.riotgames.com/authorize?client_id=riot-client&nonce=official-state"
+	args, err := chromeFlags(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(args, "\n")
+	if strings.Contains(joined, "host-resolver-rules") ||
+		strings.Contains(joined, "ignore-certificate-errors") ||
+		strings.Contains(joined, "allow-insecure-localhost") {
+		t.Fatalf("official Riot browser must use normal DNS/TLS: %v", args)
+	}
+	if !strings.Contains(joined, "--remote-debugging-pipe") ||
+		strings.Contains(joined, "--remote-debugging-address") ||
+		strings.Contains(joined, "--remote-debugging-port") ||
+		!strings.Contains(joined, rawURL) {
+		t.Fatalf("official Riot browser flags = %v", args)
+	}
+	_, firstProfile, _, err := chromeLaunchConfig(rawURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secondProfile, _, err := chromeLaunchConfig(strings.Replace(rawURL, "official-state", "other-state", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstProfile == secondProfile {
+		t.Fatalf("official Riot browser profiles share %q", firstProfile)
+	}
+}
+
 func TestCaptchaChromeProfilesAreIsolatedPerState(t *testing.T) {
 	first := captchaChromeProfileDir("/Users/tester", "state-a")
 	second := captchaChromeProfileDir("/Users/tester", "state-b")
@@ -232,6 +264,40 @@ func TestStartChromeLoggedDoesNotWaitForBrowserExit(t *testing.T) {
 	}
 	if _, err := os.Stat(profileDir); !os.IsNotExist(err) {
 		t.Fatalf("fallback close retained state profile: %v", err)
+	}
+}
+
+func TestStartChromeLoggedWiresOfficialDevToolsThroughPrivatePipe(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Go ExtraFiles does not support the Chrome DevTools pipe on Windows")
+	}
+	root := t.TempDir()
+	profileDir := filepath.Join(root, strings.Repeat("f", 32))
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=TestChromeLaunchHelperProcess", "--", "--remote-debugging-pipe")
+	cmd.Env = append(os.Environ(), "VALORANT_CHROME_LAUNCH_HELPER=pipe")
+	owned, err := startChromeLogged(cmd, root, profileDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller := owned.(*chromeBrowserController)
+	if controller.devToolsPipe == nil {
+		t.Fatal("official Chrome controller has no private DevTools pipe")
+	}
+	client := &chromeDevToolsClient{conn: controller.devToolsPipe}
+	var version struct {
+		Product string `json:"product"`
+	}
+	if err := client.call("Browser.getVersion", map[string]any{}, &version); err != nil {
+		t.Fatal(err)
+	}
+	if version.Product != "private-pipe-test" {
+		t.Fatalf("private pipe product = %q", version.Product)
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -588,6 +654,27 @@ func TestChromeLaunchHelperProcess(t *testing.T) {
 		os.Exit(23)
 	case "1":
 		time.Sleep(2 * time.Second)
+	case "pipe":
+		pipe := newChromeDevToolsPipe(os.NewFile(3, "devtools-command"), os.NewFile(4, "devtools-response"))
+		defer pipe.Close()
+		for {
+			var command struct {
+				ID     int64  `json:"id"`
+				Method string `json:"method"`
+			}
+			if err := pipe.ReadJSON(&command); err != nil {
+				os.Exit(24)
+			}
+			if command.Method == "Browser.close" {
+				return
+			}
+			if err := pipe.WriteJSON(map[string]any{
+				"id":     command.ID,
+				"result": map[string]any{"product": "private-pipe-test"},
+			}); err != nil {
+				os.Exit(25)
+			}
+		}
 	default:
 		return
 	}

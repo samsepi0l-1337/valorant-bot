@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"path/filepath"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -149,9 +148,6 @@ func (b *Bot) Run(ctx context.Context) error {
 		},
 	})
 	defer authServer.Close()
-	if err := authServer.StartCaptchaTLS(0, filepath.Dir(b.cfg.DatabasePath)); err != nil {
-		log.Printf("captcha tls: %v (password captcha unavailable until TLS is up)", err)
-	}
 
 	addr := fmt.Sprintf("0.0.0.0:%d", b.cfg.AuthPort)
 	root := http.NewServeMux()

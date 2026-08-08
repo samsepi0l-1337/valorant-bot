@@ -35,10 +35,9 @@ const captchaTLSIdleTimeout = 30 * time.Second
 // skipCaptchaTLSWait is set by unit tests that do not start a TLS listener.
 var skipCaptchaTLSWait bool
 
-// StartCaptchaTLS serves the captcha widget over HTTPS on 127.0.0.1 so a local
-// Chrome instance can open https://authenticate.riotgames.com/captcha/widget
-// with --host-resolver-rules mapping that name to loopback.
-// When running as root (sudo), prefers port 443 so the origin matches Riot/CapMonster.
+// StartCaptchaTLS supports the legacy local-widget path used by isolated tests
+// and custom PasswordAuthClient implementations. Production uses Riot's
+// official browser page with real DNS/TLS and does not call this listener.
 func (s *Server) StartCaptchaTLS(port int, dataDir string) error {
 	if dataDir == "" {
 		dataDir = "./data"

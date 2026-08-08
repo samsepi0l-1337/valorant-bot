@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -69,15 +70,120 @@ func captchaBrowserSession(ch riot.CaptchaChallenge) riot.CaptchaBrowserSession 
 	}
 }
 
+func mountCaptchaWebEntry(mux *http.ServeMux) {
+	mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/login-page", http.StatusFound)
+	})
+	mux.HandleFunc("/login-page", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "login")
+	})
+}
+
+func TestPasswordBrowserAuthorizeURLAndAdoptMFA(t *testing.T) {
+	var mfaCalls atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Fatalf("method = %s, want PUT", r.Method)
+		}
+		if got := r.UserAgent(); got != captchaBrowserUserAgent {
+			t.Fatalf("User-Agent = %q, want %q", got, captchaBrowserUserAgent)
+		}
+		if got, want := r.Header.Get("Origin"), "http://"+r.Host; got != want {
+			t.Fatalf("Origin = %q, want %q", got, want)
+		}
+		if got := r.Header.Get("Cache-Control"); got != "no-cache" {
+			t.Fatalf("Cache-Control = %q, want no-cache", got)
+		}
+		if cookie, err := r.Cookie("authenticator.sid"); err != nil || cookie.Value != "browser-session" {
+			t.Fatalf("authenticator.sid = %v, %v", cookie, err)
+		}
+		if _, err := r.Cookie("tracking"); err == nil {
+			t.Fatal("non-allowlisted browser cookie reached MFA request")
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		multifactor, _ := body["multifactor"].(map[string]any)
+		if body["type"] != "multifactor" || multifactor["otp"] != "123456" {
+			t.Fatalf("MFA body = %#v", body)
+		}
+		mfaCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"type":    "success",
+			"success": map[string]any{"login_token": "browser-login-token"},
+		})
+	})
+	mux.HandleFunc("/api/v1/login-token", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/api/v1/authorization", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"response": map[string]any{
+				"parameters": map[string]any{
+					"uri": "http://localhost/redirect#access_token=browser-at&id_token=browser-id",
+				},
+			},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	c := &riot.PasswordClient{
+		HTTPClient:          srv.Client(),
+		AuthBaseURL:         srv.URL,
+		AuthenticateBaseURL: srv.URL,
+	}
+	authorizeURL, err := c.BrowserAuthorizeURL("discord-state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := url.Parse(authorizeURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Path != "/authorize" || parsed.Query().Get("nonce") != "discord-state" ||
+		parsed.Query().Get("client_id") != "riot-client" ||
+		parsed.Query().Get("redirect_uri") != "http://localhost/redirect" ||
+		parsed.Query().Get("response_type") != "token id_token" ||
+		parsed.Query().Get("scope") != "openid link ban lol_region account" {
+		t.Fatalf("authorize URL = %s", authorizeURL)
+	}
+
+	_, challenge, err := c.AdoptBrowserLogin(context.Background(), []byte(`{
+		"type":"multifactor",
+		"multifactor":{"email":"b***@example.com","method":"email","methods":["riotmobile","thirdparty","email"]}
+	}`), []*http.Cookie{
+		{Name: "authenticator.sid", Value: "browser-session", Path: "/", Secure: true, HttpOnly: true},
+		{Name: "tracking", Value: "must-not-forward", Path: "/", Secure: true},
+	}, captchaBrowserUserAgent)
+	if err != nil || challenge == nil {
+		t.Fatalf("adopt browser MFA: challenge=%#v err=%v", challenge, err)
+	}
+	if challenge.Email != "b***@example.com" || challenge.Method != "email" || len(challenge.Methods) != 3 {
+		t.Fatalf("challenge = %#v", challenge)
+	}
+
+	tokens, err := c.SubmitMFA(context.Background(), challenge, "123456")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokens.AccessToken != "browser-at" || tokens.IDToken != "browser-id" || mfaCalls.Load() != 1 {
+		t.Fatalf("tokens=%+v mfaCalls=%d", tokens, mfaCalls.Load())
+	}
+}
+
 func TestPasswordBeginAndCompleteCaptcha_UsesBrowserSession(t *testing.T) {
 	var puts atomic.Int32
 	mux := http.NewServeMux()
+	mountCaptchaWebEntry(mux)
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.UserAgent(); got != captchaBrowserUserAgent {
 			t.Fatalf("User-Agent = %q, want %q", got, captchaBrowserUserAgent)
 		}
 		switch r.Method {
-		case http.MethodPost:
+		case http.MethodGet:
 			http.SetCookie(w, &http.Cookie{Name: "authenticator.sid", Value: "s1", Path: "/", Secure: true, HttpOnly: true})
 			http.SetCookie(w, &http.Cookie{Name: "tdid", Value: "d1", Path: "/", Secure: true, HttpOnly: true})
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -138,62 +244,59 @@ func TestPasswordBeginAndCompleteCaptcha_UsesBrowserSession(t *testing.T) {
 	}
 }
 
-func TestPasswordBeginCaptchaSeedsRiotSessionFromDiscovery(t *testing.T) {
-	var discoveryCalls atomic.Int32
-	var loginSawDiscoveryCookie atomic.Bool
+func TestPasswordBeginCaptchaSeedsRiotSessionFromWebAuthorization(t *testing.T) {
+	var authorizeCalls atomic.Int32
+	var loginSawAuthorizationCookie atomic.Bool
 	var loginSawOutOfScopeCookie atomic.Bool
-	mux := http.NewServeMux()
-	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
-		discoveryCalls.Add(1)
-		http.SetCookie(w, &http.Cookie{
-			Name:     "__cf_bm",
-			Value:    "cloudflare-session",
-			Domain:   "riotgames.com",
-			Path:     "/",
-			Secure:   true,
-			HttpOnly: true,
-			SameSite: http.SameSiteNoneMode,
-		})
-		http.SetCookie(w, &http.Cookie{Name: "tracking", Value: "not-allowlisted", Domain: "riotgames.com", Path: "/", Secure: true})
-		http.SetCookie(w, &http.Cookie{Name: "tdid", Value: "host-only", Path: "/", Secure: true, HttpOnly: true})
-		http.SetCookie(w, &http.Cookie{Name: "authenticator.sid", Value: "wrong-path", Domain: "riotgames.com", Path: "/discovery-only", Secure: true, HttpOnly: true})
-		http.SetCookie(w, &http.Cookie{Name: "__cflb", Value: "not-secure", Domain: "riotgames.com", Path: "/", HttpOnly: true})
-		_ = json.NewEncoder(w).Encode(map[string]any{"issuer": "riot"})
-	})
-	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
-		if cookie, err := r.Cookie("__cf_bm"); err == nil && cookie.Value == "cloudflare-session" {
-			loginSawDiscoveryCookie.Store(true)
-		}
-		for _, name := range []string{"tracking", "tdid", "authenticator.sid", "__cflb"} {
-			if _, err := r.Cookie(name); err == nil {
-				loginSawOutOfScopeCookie.Store(true)
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case r.URL.Host == "valorant-api.com":
+			return jsonResponse(r, `{"data":{"riotClientVersion":"release-test","riotClientBuild":"test"}}`), nil
+		case r.URL.Host == "auth.riotgames.com" && r.URL.Path == "/authorize":
+			authorizeCalls.Add(1)
+			header := make(http.Header)
+			header.Set("Location", "https://authenticate.riotgames.com/login-page")
+			header.Add("Set-Cookie", "__cf_bm=cloudflare-session; Domain=riotgames.com; Path=/; Secure; HttpOnly; SameSite=None")
+			header.Add("Set-Cookie", "tracking=not-allowlisted; Domain=riotgames.com; Path=/; Secure")
+			header.Add("Set-Cookie", "tdid=host-only; Path=/; Secure; HttpOnly")
+			header.Add("Set-Cookie", "authenticator.sid=wrong-path; Domain=riotgames.com; Path=/authorize-only; Secure; HttpOnly")
+			header.Add("Set-Cookie", "__cflb=not-secure; Domain=riotgames.com; Path=/; HttpOnly")
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Status:     "302 Found",
+				Header:     header,
+				Body:       io.NopCloser(strings.NewReader("redirect")),
+				Request:    r,
+			}, nil
+		case r.URL.Host == "authenticate.riotgames.com" && r.URL.Path == "/login-page":
+			return jsonResponse(r, "login"), nil
+		case r.URL.Host == "authenticate.riotgames.com" && r.URL.Path == "/api/v1/login" && r.Method == http.MethodGet:
+			if cookie, err := r.Cookie("__cf_bm"); err == nil && cookie.Value == "cloudflare-session" {
+				loginSawAuthorizationCookie.Store(true)
 			}
+			for _, name := range []string{"tracking", "tdid", "authenticator.sid", "__cflb"} {
+				if _, err := r.Cookie(name); err == nil {
+					loginSawOutOfScopeCookie.Store(true)
+				}
+			}
+			return jsonResponse(r, `{"captcha":{"hcaptcha":{"key":"site-key","data":"rq-data"}}}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.String())
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"captcha": map[string]any{
-				"hcaptcha": map[string]string{"key": "site-key", "data": "rq-data"},
-			},
-		})
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
+	})}
 
-	c := &riot.PasswordClient{
-		HTTPClient:          srv.Client(),
-		AuthBaseURL:         srv.URL,
-		AuthenticateBaseURL: srv.URL,
-	}
+	c := &riot.PasswordClient{HTTPClient: client}
 	challenge, err := c.BeginCaptcha(context.Background(), "user", "secret", riot.CaptchaBrowserSession{
 		UserAgent: captchaBrowserUserAgent,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := discoveryCalls.Load(); got != 1 {
-		t.Fatalf("discovery calls = %d, want 1 before captcha login", got)
+	if got := authorizeCalls.Load(); got != 1 {
+		t.Fatalf("authorization calls = %d, want 1 before captcha login", got)
 	}
-	if !loginSawDiscoveryCookie.Load() {
-		t.Fatal("captcha login did not receive the Riot discovery session cookie")
+	if !loginSawAuthorizationCookie.Load() {
+		t.Fatal("captcha login did not receive the Riot web authorization session cookie")
 	}
 	if loginSawOutOfScopeCookie.Load() {
 		t.Fatal("captcha login received an out-of-scope discovery cookie")
@@ -204,21 +307,22 @@ func TestPasswordBeginCaptchaSeedsRiotSessionFromDiscovery(t *testing.T) {
 			browserCookie = cookie
 		}
 		if cookie != nil && cookie.Value != "" && cookie.Name != "__cf_bm" {
-			t.Fatalf("browser received out-of-scope discovery cookie: %#v", cookie)
+			t.Fatalf("browser received out-of-scope authorization cookie: %#v", cookie)
 		}
 	}
 	if browserCookie == nil {
-		t.Fatal("browser did not receive the discovery __cf_bm cookie")
+		t.Fatal("browser did not receive the authorization __cf_bm cookie")
 	}
 	if browserCookie.Domain != "riotgames.com" || browserCookie.Path != "/" ||
 		!browserCookie.Secure || !browserCookie.HttpOnly || browserCookie.SameSite != http.SameSiteNoneMode {
-		t.Fatalf("browser discovery cookie attributes changed: %#v", browserCookie)
+		t.Fatalf("browser authorization cookie attributes changed: %#v", browserCookie)
 	}
 }
 
 func TestPasswordCompleteCaptchaRejectsDifferentBrowserSession(t *testing.T) {
 	var puts atomic.Int32
 	mux := http.NewServeMux()
+	mountCaptchaWebEntry(mux)
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
 			puts.Add(1)
@@ -268,6 +372,7 @@ func TestPasswordCompleteCaptchaRejectsDifferentBrowserSession(t *testing.T) {
 
 func TestPasswordBeginCaptchaClearsStaleBrowserCookies(t *testing.T) {
 	mux := http.NewServeMux()
+	mountCaptchaWebEntry(mux)
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		if _, err := r.Cookie("tdid"); err == nil {
 			t.Fatal("stale browser cookie must not be imported into a replacement Riot session")
@@ -318,6 +423,7 @@ func TestPasswordBeginCaptchaRefreshesMetadataOnceConcurrently(t *testing.T) {
 	})}
 	c := &riot.PasswordClient{
 		HTTPClient:          client,
+		AuthBaseURL:         "https://authenticate.test",
 		AuthenticateBaseURL: "https://authenticate.test",
 	}
 
@@ -349,6 +455,7 @@ func TestPasswordBeginCaptchaMetadataFailureUsesFallbackOnce(t *testing.T) {
 	})}
 	c := &riot.PasswordClient{
 		HTTPClient:          client,
+		AuthBaseURL:         "https://authenticate.test",
 		AuthenticateBaseURL: "https://authenticate.test",
 	}
 
@@ -371,18 +478,40 @@ func TestPasswordBeginCaptchaMetadataFailureUsesFallbackOnce(t *testing.T) {
 
 func TestPasswordBeginAndCompleteCaptcha_Success(t *testing.T) {
 	var beginBaggage string
+	var webSessionOrder atomic.Int32
 	mux := http.NewServeMux()
+	mux.HandleFunc("/authorize", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Fatalf("web authorization method = %s, want GET", r.Method)
+		}
+		if r.URL.Query().Get("client_id") != "riot-client" || r.URL.Query().Get("redirect_uri") != "http://localhost/redirect" {
+			t.Fatalf("web authorization query = %q", r.URL.RawQuery)
+		}
+		if got := webSessionOrder.Add(1); got != 1 {
+			t.Fatalf("web authorization order = %d, want 1", got)
+		}
+		http.Redirect(w, r, "/login-page", http.StatusFound)
+	})
+	mux.HandleFunc("/login-page", func(w http.ResponseWriter, _ *http.Request) {
+		if got := webSessionOrder.Add(1); got != 2 {
+			t.Fatalf("login page order = %d, want 2", got)
+		}
+		http.SetCookie(w, &http.Cookie{Name: "authenticator.sid", Value: "s1", Path: "/", Secure: true, HttpOnly: true})
+		_, _ = io.WriteString(w, "login")
+	})
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.UserAgent(); got != captchaBrowserUserAgent {
 			t.Fatalf("authenticate User-Agent = %q, want %q", got, captchaBrowserUserAgent)
 		}
 		switch r.Method {
-		case http.MethodPost:
-			beginBaggage = r.Header.Get("baggage")
-			if !strings.HasPrefix(beginBaggage, "sdksid=") || strings.TrimPrefix(beginBaggage, "sdksid=") == "" {
-				t.Fatalf("captcha begin baggage = %q, want a non-empty sdksid", beginBaggage)
+		case http.MethodGet:
+			if got := webSessionOrder.Add(1); got != 3 {
+				t.Fatalf("captcha challenge order = %d, want 3", got)
 			}
-			http.SetCookie(w, &http.Cookie{Name: "authenticator.sid", Value: "s1"})
+			beginBaggage = r.Header.Get("baggage")
+			if beginBaggage != "" {
+				t.Fatalf("web captcha begin baggage = %q, want none", beginBaggage)
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"type": "auth",
 				"captcha": map[string]any{
@@ -423,6 +552,8 @@ func TestPasswordBeginAndCompleteCaptcha_Success(t *testing.T) {
 					"login_token": "lt-1",
 				},
 			})
+		default:
+			t.Fatalf("captcha login method = %s, want web GET then PUT", r.Method)
 		}
 	})
 	mux.HandleFunc("/api/v1/login-token", func(w http.ResponseWriter, r *http.Request) {
@@ -468,6 +599,7 @@ func TestPasswordBeginAndCompleteCaptcha_Success(t *testing.T) {
 
 func TestPasswordCancelCaptchaDeletesSession(t *testing.T) {
 	mux := http.NewServeMux()
+	mountCaptchaWebEntry(mux)
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"captcha": map[string]any{
@@ -493,15 +625,16 @@ func TestPasswordCancelCaptchaDeletesSession(t *testing.T) {
 func TestPasswordCompleteCaptcha_MFA(t *testing.T) {
 	var sessionBaggage string
 	mux := http.NewServeMux()
+	mountCaptchaWebEntry(mux)
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.UserAgent(); got != captchaBrowserUserAgent {
 			t.Fatalf("authenticate User-Agent = %q, want %q", got, captchaBrowserUserAgent)
 		}
 		switch r.Method {
-		case http.MethodPost:
+		case http.MethodGet:
 			sessionBaggage = r.Header.Get("baggage")
-			if !strings.HasPrefix(sessionBaggage, "sdksid=") || strings.TrimPrefix(sessionBaggage, "sdksid=") == "" {
-				t.Fatalf("captcha begin baggage = %q, want a non-empty sdksid", sessionBaggage)
+			if sessionBaggage != "" {
+				t.Fatalf("web captcha begin baggage = %q, want none", sessionBaggage)
 			}
 			http.SetCookie(w, &http.Cookie{Name: "authenticator.sid", Value: "initial-session", Path: "/", Secure: true, HttpOnly: true})
 			http.SetCookie(w, &http.Cookie{Name: "tdid", Value: "initial-device", Domain: "riotgames.com", Path: "/", Secure: true, HttpOnly: true})
@@ -586,9 +719,10 @@ func TestPasswordCompleteCaptchaRejectsAmbiguousNonOKContinuationBodies(t *testi
 		t.Run(tt.name, func(t *testing.T) {
 			var tokenExchanges atomic.Int32
 			mux := http.NewServeMux()
+			mountCaptchaWebEntry(mux)
 			mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 				switch r.Method {
-				case http.MethodPost:
+				case http.MethodGet:
 					_, _ = io.WriteString(w, `{"captcha":{"hcaptcha":{"key":"k","data":"d"}}}`)
 				case http.MethodPut:
 					w.WriteHeader(http.StatusBadGateway)
@@ -621,9 +755,10 @@ func TestPasswordCompleteCaptchaRejectsAmbiguousNonOKContinuationBodies(t *testi
 func TestPasswordSubmitMFADoesNotRetryAfterLoginTokenExchangeFailure(t *testing.T) {
 	var mfaPUTs atomic.Int32
 	mux := http.NewServeMux()
+	mountCaptchaWebEntry(mux)
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
-		case http.MethodPost:
+		case http.MethodGet:
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"captcha": map[string]any{
 					"hcaptcha": map[string]string{"key": "k", "data": "d"},
@@ -678,14 +813,14 @@ func TestPasswordSubmitMFADoesNotRetryAfterLoginTokenExchangeFailure(t *testing.
 func TestPasswordSubmitMFADoesNotRetryAfterTransportFailure(t *testing.T) {
 	var mfaPUTs atomic.Int32
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/.well-known/openid-configuration" {
-			return jsonResponse(r, `{}`), nil
+		if r.URL.Path == "/authorize" {
+			return jsonResponse(r, `login`), nil
 		}
 		if r.URL.Path != "/api/v1/login" {
 			return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 		switch r.Method {
-		case http.MethodPost:
+		case http.MethodGet:
 			return jsonResponse(r, `{"captcha":{"hcaptcha":{"key":"k","data":"d"}}}`), nil
 		case http.MethodPut:
 			var body map[string]any
@@ -731,9 +866,10 @@ func TestPasswordSubmitMFARejectsAmbiguousNonOKBodiesBeforeParsing(t *testing.T)
 			var mfaPUTs atomic.Int32
 			var tokenExchanges atomic.Int32
 			mux := http.NewServeMux()
+			mountCaptchaWebEntry(mux)
 			mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 				switch r.Method {
-				case http.MethodPost:
+				case http.MethodGet:
 					_ = json.NewEncoder(w).Encode(map[string]any{
 						"captcha": map[string]any{
 							"hcaptcha": map[string]string{"key": "k", "data": "d"},
@@ -800,14 +936,14 @@ func TestPasswordSubmitMFADoesNotFallbackAfterSchemaBodyReadError(t *testing.T) 
 	var loginPUTs atomic.Int32
 	sentinel := errors.New("truncated response")
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path == "/.well-known/openid-configuration" {
-			return jsonResponse(r, `{}`), nil
+		if r.URL.Path == "/authorize" {
+			return jsonResponse(r, `login`), nil
 		}
 		if r.URL.Path != "/api/v1/login" {
 			return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 		switch r.Method {
-		case http.MethodPost:
+		case http.MethodGet:
 			return jsonResponse(r, `{"captcha":{"hcaptcha":{"key":"k","data":"d"}}}`), nil
 		case http.MethodPut:
 			put := loginPUTs.Add(1)
@@ -859,9 +995,10 @@ func TestPasswordSubmitMFADoesNotFollowRedirectOrReplayOTP(t *testing.T) {
 	var loginPUTs atomic.Int32
 	var tokenExchanges atomic.Int32
 	mux := http.NewServeMux()
+	mountCaptchaWebEntry(mux)
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
-		case http.MethodPost:
+		case http.MethodGet:
 			_, _ = io.WriteString(w, `{"captcha":{"hcaptcha":{"key":"k","data":"d"}}}`)
 		case http.MethodPut:
 			put := loginPUTs.Add(1)
@@ -908,9 +1045,10 @@ func TestPasswordSubmitMFAFallsBackAfterExplicitSchemaRejection(t *testing.T) {
 	var canonicalPUTs atomic.Int32
 	var alternatePUTs atomic.Int32
 	mux := http.NewServeMux()
+	mountCaptchaWebEntry(mux)
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
-		case http.MethodPost:
+		case http.MethodGet:
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"captcha": map[string]any{
 					"hcaptcha": map[string]string{"key": "k", "data": "d"},
@@ -987,9 +1125,10 @@ func TestPasswordSubmitMFAFallsBackAfterExplicitSchemaRejection(t *testing.T) {
 
 func TestPasswordCompleteCaptcha_AuthFailure(t *testing.T) {
 	mux := http.NewServeMux()
+	mountCaptchaWebEntry(mux)
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
-		case http.MethodPost:
+		case http.MethodGet:
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"captcha": map[string]any{
 					"hcaptcha": map[string]string{"key": "k", "data": "d"},
@@ -1024,9 +1163,10 @@ func TestPasswordCompleteCaptcha_AuthFailureWithCaptchaIsRetry(t *testing.T) {
 	// Riot often returns auth_failure AND a new captcha together for bad tokens.
 	// Treat that as captcha retry (not a hard password error).
 	mux := http.NewServeMux()
+	mountCaptchaWebEntry(mux)
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
-		case http.MethodPost:
+		case http.MethodGet:
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"captcha": map[string]any{
 					"hcaptcha": map[string]string{"key": "k", "data": "d"},
@@ -1068,12 +1208,13 @@ func TestPasswordCompleteCaptcha_RetryKeepsSession(t *testing.T) {
 	puts := 0
 	var sessionBaggage string
 	mux := http.NewServeMux()
+	mountCaptchaWebEntry(mux)
 	mux.HandleFunc("/api/v1/login", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
-		case http.MethodPost:
+		case http.MethodGet:
 			sessionBaggage = r.Header.Get("baggage")
-			if !strings.HasPrefix(sessionBaggage, "sdksid=") || strings.TrimPrefix(sessionBaggage, "sdksid=") == "" {
-				t.Fatalf("captcha begin baggage = %q, want a non-empty sdksid", sessionBaggage)
+			if sessionBaggage != "" {
+				t.Fatalf("web captcha begin baggage = %q, want none", sessionBaggage)
 			}
 			http.SetCookie(w, &http.Cookie{Name: "authenticator.sid", Value: "initial-session", Path: "/", Secure: true, HttpOnly: true})
 			_ = json.NewEncoder(w).Encode(map[string]any{

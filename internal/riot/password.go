@@ -9,6 +9,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -136,6 +138,215 @@ func NewPasswordClient(httpClient *http.Client) *PasswordClient {
 	}
 }
 
+type captchaWebSetCookie struct {
+	sourceHost string
+	cookie     *http.Cookie
+}
+
+// BrowserAuthorizeURL returns Riot's official browser login entry point. The
+// nonce is bound to the Discord password state so a fresh Chrome profile can
+// be identified without exposing credentials in the URL.
+func (c *PasswordClient) BrowserAuthorizeURL(nonce string) (string, error) {
+	nonce = strings.TrimSpace(nonce)
+	if nonce == "" {
+		return "", errors.New("missing browser login nonce")
+	}
+	authBase, err := url.Parse(c.authBase())
+	if err != nil {
+		return "", fmt.Errorf("parse auth base: %w", err)
+	}
+	authBase.Path = strings.TrimRight(authBase.Path, "/") + "/authorize"
+	query := authBase.Query()
+	query.Set("client_id", "riot-client")
+	query.Set("nonce", nonce)
+	query.Set("redirect_uri", qrRedirectURI)
+	query.Set("response_type", "token id_token")
+	query.Set("scope", qrScope)
+	authBase.RawQuery = query.Encode()
+	return authBase.String(), nil
+}
+
+// AdoptBrowserLogin converts an authenticate.riotgames.com response produced
+// by the owned Chrome session into the existing token/MFA continuation. Only
+// cookies that the browser would send back to the login endpoint are retained.
+func (c *PasswordClient) AdoptBrowserLogin(ctx context.Context, raw []byte, browserCookies []*http.Cookie, userAgent string) (PasswordTokens, *MFAChallenge, error) {
+	if len(raw) == 0 || len(raw) > maxPasswordResponseBody {
+		return PasswordTokens{}, nil, errors.New("invalid browser login response")
+	}
+	userAgent = strings.TrimSpace(userAgent)
+	if userAgent == "" {
+		return PasswordTokens{}, nil, fmt.Errorf("%w: missing browser user-agent", ErrCaptchaSession)
+	}
+	target, err := url.Parse(c.authenticateBase() + "/api/v1/login")
+	if err != nil {
+		return PasswordTokens{}, nil, fmt.Errorf("parse authenticate base: %w", err)
+	}
+	cookies := make(map[string]string)
+	for _, cookie := range browserCookies {
+		if cookie == nil || captchaCookieDeletes(cookie) {
+			continue
+		}
+		if _, allowed := captchaBrowserCookieAllowlist[cookie.Name]; !allowed {
+			continue
+		}
+		if strings.EqualFold(target.Scheme, "https") && !cookie.Secure {
+			continue
+		}
+		domain := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(cookie.Domain)), ".")
+		host := strings.ToLower(target.Hostname())
+		if domain != "" && domain != host && !strings.HasSuffix(host, "."+domain) {
+			continue
+		}
+		if !captchaCookiePathMatches(target.Path, cookie.Path) {
+			continue
+		}
+		cookies[cookie.Name] = cookie.Value
+	}
+	return c.parseAuthenticateLogin(ctx, raw, cookies, true, "", userAgent)
+}
+
+// beginCaptchaWebSession follows Riot's browser authorization entry point so
+// the CAPTCHA rqdata belongs to the same web session as the later credential
+// PUT. A cookie jar is used only for this credential-free redirect chain; the
+// resulting authenticate.riotgames.com cookies are then copied into the
+// short-lived in-memory CAPTCHA session.
+func (c *PasswordClient) beginCaptchaWebSession(ctx context.Context, userAgent string) (map[string]string, []*http.Cookie, error) {
+	authBase, err := url.Parse(c.authBase())
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse auth base: %w", err)
+	}
+	authenticateBase, err := url.Parse(c.authenticateBase())
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse authenticate base: %w", err)
+	}
+	authURLString, err := c.BrowserAuthorizeURL(randomHex(16))
+	if err != nil {
+		return nil, nil, err
+	}
+	authURL, err := url.Parse(authURLString)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse browser authorize URL: %w", err)
+	}
+
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create captcha cookie jar: %w", err)
+	}
+	baseClient := c.HTTPClient
+	if baseClient == nil {
+		baseClient = http.DefaultClient
+	}
+	webClient := *baseClient
+	webClient.Jar = jar
+	allowed := map[string]string{
+		strings.ToLower(authBase.Host):         strings.ToLower(authBase.Scheme),
+		strings.ToLower(authenticateBase.Host): strings.ToLower(authenticateBase.Scheme),
+	}
+	observed := make([]captchaWebSetCookie, 0, 8)
+	capture := func(resp *http.Response) {
+		if resp == nil || resp.Request == nil || resp.Request.URL == nil {
+			return
+		}
+		for _, cookie := range resp.Cookies() {
+			if cookie == nil {
+				continue
+			}
+			clone := *cookie
+			observed = append(observed, captchaWebSetCookie{sourceHost: strings.ToLower(resp.Request.URL.Hostname()), cookie: &clone})
+		}
+	}
+	webClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		capture(req.Response)
+		if len(via) >= 10 {
+			return errors.New("too many Riot web authorization redirects")
+		}
+		scheme, ok := allowed[strings.ToLower(req.URL.Host)]
+		if !ok || !strings.EqualFold(req.URL.Scheme, scheme) {
+			return fmt.Errorf("Riot web authorization redirected to untrusted origin %s", req.URL.Redacted())
+		}
+		return nil
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, authURL.String(), nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := webClient.Do(req)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Riot web authorization: %w", err)
+	}
+	capture(resp)
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxPasswordResponseBody))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("Riot web authorization: %s", resp.Status)
+	}
+	if resp.Request == nil || resp.Request.URL == nil || !strings.EqualFold(resp.Request.URL.Host, authenticateBase.Host) {
+		return nil, nil, errors.New("Riot web authorization did not reach authenticate.riotgames.com")
+	}
+
+	loginURL := *authenticateBase
+	loginURL.Path = strings.TrimRight(loginURL.Path, "/") + "/api/v1/login"
+	jarCookies := make(map[string]string)
+	for _, cookie := range jar.Cookies(&loginURL) {
+		if cookie == nil {
+			continue
+		}
+		if _, allowed := captchaBrowserCookieAllowlist[cookie.Name]; allowed {
+			jarCookies[cookie.Name] = cookie.Value
+		}
+	}
+	browserCookies := captchaWebBrowserCookies(observed, authenticateBase.Hostname(), loginURL.Path, jarCookies, strings.EqualFold(authenticateBase.Scheme, "https"))
+	cookies := make(map[string]string, len(browserCookies))
+	for _, cookie := range browserCookies {
+		cookies[cookie.Name] = cookie.Value
+	}
+	return cookies, browserCookies, nil
+}
+
+func captchaWebBrowserCookies(observed []captchaWebSetCookie, targetHost, requestPath string, canonical map[string]string, requireSecure bool) []*http.Cookie {
+	active := make(map[string]*http.Cookie)
+	targetHost = strings.ToLower(targetHost)
+	for _, item := range observed {
+		cookie := item.cookie
+		if cookie == nil || (requireSecure && !cookie.Secure) {
+			continue
+		}
+		if _, allowed := captchaBrowserCookieAllowlist[cookie.Name]; !allowed {
+			continue
+		}
+		domain := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(cookie.Domain)), ".")
+		if domain == "" {
+			if item.sourceHost != targetHost {
+				continue
+			}
+		} else if targetHost != domain && !strings.HasSuffix(targetHost, "."+domain) {
+			continue
+		}
+		if !captchaCookiePathMatches(requestPath, cookie.Path) {
+			continue
+		}
+		if captchaCookieDeletes(cookie) {
+			delete(active, cookie.Name)
+			continue
+		}
+		clone := *cookie
+		active[cookie.Name] = &clone
+	}
+	for name, cookie := range active {
+		value, ok := canonical[name]
+		if !ok {
+			delete(active, name)
+			continue
+		}
+		cookie.Value = value
+	}
+	return captchaBrowserCookieSlice(active)
+}
+
 // BeginCaptcha starts the Riot authenticate login and returns hCaptcha widget data.
 // Credentials are held only in memory until login completes or the session expires.
 func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password string, browser CaptchaBrowserSession) (CaptchaChallenge, error) {
@@ -149,35 +360,11 @@ func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password st
 	}
 	c.refreshClientMeta(ctx)
 
-	cookies := map[string]string{}
-	sdkSID := randomHex(16)
-	// Match the Riot Client login bootstrap used by the working QR flow. The
-	// discovery response seeds Cloudflare's .riotgames.com session cookie,
-	// which must be present for both the captcha challenge and its submission.
-	discoveryState := map[string]string{}
-	discovery, err := c.doJSON(ctx, http.MethodGet, c.authBase()+"/.well-known/openid-configuration", nil, discoveryState, sdkSID, userAgent)
+	cookies, webCookies, err := c.beginCaptchaWebSession(ctx, userAgent)
 	if err != nil {
-		return CaptchaChallenge{}, fmt.Errorf("captcha discovery: %w", err)
+		return CaptchaChallenge{}, fmt.Errorf("captcha web session: %w", err)
 	}
-	discoveryCookies := captchaDiscoveryCookies(discovery.Cookies())
-	discovery.Body.Close()
-	for _, cookie := range discoveryCookies {
-		cookies[cookie.Name] = cookie.Value
-	}
-
-	body := map[string]any{
-		"clientId":   "riot-client",
-		"language":   "",
-		"platform":   "windows",
-		"remember":   false,
-		"type":       "auth",
-		"sdkVersion": c.sdkVersion(),
-		"riot_identity": map[string]any{
-			"language": "ko_KR",
-			"state":    "auth",
-		},
-	}
-	resp, err := c.doJSON(ctx, http.MethodPost, c.authenticateBase()+"/api/v1/login", body, cookies, sdkSID, userAgent)
+	resp, err := c.doAuthenticateWebJSON(ctx, http.MethodGet, c.authenticateBase()+"/api/v1/login", nil, cookies, userAgent)
 	if err != nil {
 		return CaptchaChallenge{}, fmt.Errorf("captcha begin: %w", err)
 	}
@@ -201,9 +388,10 @@ func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password st
 		return CaptchaChallenge{}, errors.New("captcha begin: missing hcaptcha challenge")
 	}
 	setCookies := resp.Cookies()
-	browserCookies := mergeCaptchaBrowserCookies(nil, discoveryCookies)
+	browserCookies := mergeCaptchaBrowserCookies(nil, webCookies)
 	browserCookies = mergeCaptchaBrowserCookies(browserCookies, setCookies)
-	browserCookieSync := captchaBrowserCookieSync(browserCookies, setCookies, browser.Cookies, cookies, true)
+	browserChanges := append(append([]*http.Cookie(nil), webCookies...), setCookies...)
+	browserCookieSync := captchaBrowserCookieSync(browserCookies, browserChanges, browser.Cookies, cookies, true)
 
 	sessionID := randomHex(16)
 	c.mu.Lock()
@@ -216,7 +404,7 @@ func (c *PasswordClient) BeginCaptcha(ctx context.Context, username, password st
 		password:       password,
 		cookies:        cookies,
 		browserCookies: browserCookies,
-		sdkSID:         sdkSID,
+		sdkSID:         "",
 		userAgent:      userAgent,
 		siteKey:        siteKey,
 		rqData:         rqData,
@@ -280,7 +468,7 @@ func (c *PasswordClient) CompleteCaptcha(ctx context.Context, sessionID, captcha
 			"username": username,
 		},
 	}
-	resp, err := c.doJSON(ctx, http.MethodPut, c.authenticateBase()+"/api/v1/login", body, cookies, sdkSID, userAgent)
+	resp, err := c.doAuthenticateWebJSON(ctx, http.MethodPut, c.authenticateBase()+"/api/v1/login", body, cookies, userAgent)
 	if err != nil {
 		return PasswordTokens{}, nil, fmt.Errorf("captcha complete: %w", err)
 	}
@@ -434,7 +622,7 @@ func (c *PasswordClient) submitMFAPayload(ctx context.Context, challenge *MFACha
 }
 
 func (c *PasswordClient) putAuthenticate(ctx context.Context, cookies map[string]string, body map[string]any, sdkSID, userAgent string) (PasswordTokens, *MFAChallenge, error) {
-	resp, err := c.doJSON(ctx, http.MethodPut, c.authenticateBase()+"/api/v1/login", body, cookies, sdkSID, userAgent)
+	resp, err := c.doAuthenticateWebJSON(ctx, http.MethodPut, c.authenticateBase()+"/api/v1/login", body, cookies, userAgent)
 	if err != nil {
 		return PasswordTokens{}, nil, fmt.Errorf("authenticate put: %w", err)
 	}
@@ -663,6 +851,36 @@ func (c *PasswordClient) exchangeLoginToken(ctx context.Context, loginToken stri
 		IDToken:       tok.IDToken,
 		SessionCookie: tok.SessionCookie,
 	}, nil
+}
+
+func (c *PasswordClient) doAuthenticateWebJSON(ctx context.Context, method, rawURL string, body any, cookies map[string]string, userAgent string) (*http.Response, error) {
+	var reader io.Reader
+	if body != nil {
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		reader = bytes.NewReader(encoded)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, reader)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Origin", c.authenticateBase())
+	req.Header.Set("Referer", c.authenticateBase()+"/")
+	req.Header.Set("User-Agent", userAgent)
+	if h := cookieHeader(cookies); h != "" {
+		req.Header.Set("Cookie", h)
+	}
+	resp, err := riotNoRedirectClient(c.HTTPClient).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	mergeSetCookies(cookies, resp)
+	return resp, nil
 }
 
 func (c *PasswordClient) doJSON(ctx context.Context, method, rawURL string, body any, cookies map[string]string, sdkSID, userAgent string) (*http.Response, error) {

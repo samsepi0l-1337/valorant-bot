@@ -15,14 +15,17 @@ Password login is a bot-host GUI flow, not a public web flow:
 
 1. The Discord user submits the ID/password modal, then the same Discord user
    clicks the CAPTCHA open/re-open button.
-2. The bot opens GUI Chrome/Chromium on the **bot host**. It maps
-   `authenticate.riotgames.com` to loopback TLS so hCaptcha tokens originate
-   from Riot's authentication host.
+2. The bot opens Riot's official login page in GUI Chrome/Chromium on the
+   **bot host**. Chrome uses Riot's real DNS and TLS. The bot controls only this
+   owned login window through a private DevTools pipe that is never exposed on
+   a TCP port.
 3. After CAPTCHA completion, the bot closes that Chrome window. Only if Riot
    asks for MFA does Discord show an MFA button and modal for the code.
 
 The Discord user installs nothing and never opens a localhost URL. Password
-login needs no inbound port or public tunnel. `AUTH_BASE_URL`, reverse proxies,
+login needs no inbound port or public tunnel. Riot's registered
+`http://localhost/redirect` is parsed as a returned token URI; neither the user
+nor the bot opens a localhost callback server. `AUTH_BASE_URL`, reverse proxies,
 and Cloudflare Tunnel are for `/invite` and optional helper pages only; do not
 use a public/tunnel URL for CAPTCHA.
 
@@ -34,7 +37,9 @@ use a public/tunnel URL for CAPTCHA.
 
 ### Raspberry Pi and server authentication
 
-The default `systemd` deployment is deliberately a non-login `valorant` user
+The GUI password flow is supported on macOS and Linux. Windows, headless Pi,
+VPS, and Docker deployments should use Riot Mobile QR. The default `systemd`
+deployment is deliberately a non-login `valorant` user
 service. It has no desktop session or display configuration, so it cannot open
 GUI Chrome even on a GUI-equipped Pi/server. Use Riot Mobile QR with the
 default service; headless Pi, VPS, and Docker deployments support QR only.
