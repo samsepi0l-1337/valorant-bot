@@ -166,6 +166,36 @@ func TestLoad_RejectsInvalidRemoteCaptchaOrigin(t *testing.T) {
 	}
 }
 
+func TestLoad_CanonicalizesRemoteCaptchaOrigin(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "DNS case and default port", raw: "HTTPS://Relay.Example.COM:443/", want: "https://relay.example.com"},
+		{name: "DNS nondefault port", raw: "https://Relay.Example.COM:8443", want: "https://relay.example.com:8443"},
+		{name: "IPv4 default port", raw: "https://192.0.2.10:443", want: "https://192.0.2.10"},
+		{name: "IPv4 nondefault port", raw: "https://192.0.2.10:8443", want: "https://192.0.2.10:8443"},
+		{name: "IPv6 spelling and default port", raw: "https://[2001:0DB8:0:0:0:0:0:1]:443", want: "https://[2001:db8::1]"},
+		{name: "IPv6 nondefault port", raw: "https://[2001:0DB8::1]:8443", want: "https://[2001:db8::1]:8443"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearEnv(t)
+			setRequired(t)
+			t.Setenv("CAPTCHA_BROWSER_MODE", "remote")
+			t.Setenv("AUTH_BASE_URL", test.raw)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.AuthBaseURL != test.want {
+				t.Fatalf("AuthBaseURL = %q, want %q", cfg.AuthBaseURL, test.want)
+			}
+		})
+	}
+}
+
 func TestLoad_InvalidAuthPort(t *testing.T) {
 	clearEnv(t)
 	setRequired(t)

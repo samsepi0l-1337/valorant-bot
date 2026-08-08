@@ -26,6 +26,20 @@ type lockedRemoteCaptchaReader struct {
 	reader *bytes.Reader
 }
 
+var errObservedPartialEntropy = errors.New("observed partial entropy failure")
+
+type observingPartialErrorReader struct {
+	observed []byte
+}
+
+func (r *observingPartialErrorReader) Read(destination []byte) (int, error) {
+	for i := 0; i < 7; i++ {
+		destination[i] = 0xa5
+	}
+	r.observed = destination
+	return 7, errObservedPartialEntropy
+}
+
 func (r *lockedRemoteCaptchaReader) Read(destination []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -143,6 +157,25 @@ func TestBeginPasswordLoginRemoteIssuesFragmentBearerAndLocalReturnsNoURL(t *tes
 	}
 }
 
+func TestRemoteCaptchaSecretClearsPartialEntropyOnReadError(t *testing.T) {
+	reader := &observingPartialErrorReader{}
+	raw, digest, err := newRemoteCaptchaSecret(reader)
+	if !errors.Is(err, errObservedPartialEntropy) {
+		t.Fatalf("newRemoteCaptchaSecret error = %v", err)
+	}
+	if raw != "" || digest != ([sha256.Size]byte{}) {
+		t.Fatalf("failed secret generation returned raw=%q digest=%x", raw, digest)
+	}
+	if len(reader.observed) != remoteCaptchaSecretBytes {
+		t.Fatalf("observed entropy buffer length = %d", len(reader.observed))
+	}
+	for index, value := range reader.observed {
+		if value != 0 {
+			t.Fatalf("partial entropy buffer byte %d = %#x, want zero", index, value)
+		}
+	}
+}
+
 func TestRemoteCaptchaGrantRedeemsOnceAndBindsOneOpaqueViewer(t *testing.T) {
 	grantBytes := bytes.Repeat([]byte{0x41}, remoteCaptchaSecretBytes)
 	viewerBytes := bytes.Repeat([]byte{0x52}, remoteCaptchaSecretBytes)
@@ -200,19 +233,109 @@ func TestRemoteCaptchaGrantRejectsOwnerOrFlowReplacement(t *testing.T) {
 
 			s.mu.Lock()
 			pending := s.passwordPending[state]
+			originalFlow := pending.flow
+			var replacementFlow *passwordFlow
 			if replacement == "owner" {
 				pending.discordUserID = "different-owner"
 			} else {
 				replacementCtx, replacementCancel := context.WithCancel(context.Background())
 				t.Cleanup(replacementCancel)
-				pending.flow = &passwordFlow{ctx: replacementCtx, cancel: replacementCancel}
+				replacementFlow = &passwordFlow{ctx: replacementCtx, cancel: replacementCancel, remoteDone: make(chan struct{})}
+				pending.flow = replacementFlow
 			}
 			s.passwordPending[state] = pending
 			s.mu.Unlock()
 			if _, _, err := s.redeemRemoteCaptchaGrant(bearer); !errors.Is(err, errRemoteCaptchaUnavailable) {
 				t.Fatalf("%s replacement redemption error = %v", replacement, err)
 			}
+			s.mu.Lock()
+			_, retained := s.passwordPending[state]
+			s.mu.Unlock()
+			if retained {
+				t.Fatal("binding mismatch retained password/grant state")
+			}
+			assertRemoteCaptchaFlowReleased(t, originalFlow)
+			if replacementFlow != nil {
+				assertRemoteCaptchaFlowReleased(t, replacementFlow)
+			}
+			assertRemoteCaptchaLifecycleDrained(t, s)
 		})
+	}
+}
+
+func TestRemoteCaptchaViewerLookupScrubsOwnerOrFlowReplacement(t *testing.T) {
+	for _, replacement := range []string{"owner", "flow"} {
+		t.Run(replacement, func(t *testing.T) {
+			grantBytes := bytes.Repeat([]byte{0x63}, remoteCaptchaSecretBytes)
+			viewerBytes := bytes.Repeat([]byte{0x64}, remoteCaptchaSecretBytes)
+			s := newRemoteCaptchaStateServer(t, append(grantBytes, viewerBytes...), time.Minute)
+			remoteURL, state, err := s.BeginPasswordLogin(context.Background(), "discord-owner", "riot-user", "riot-password")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, rawSession, err := s.redeemRemoteCaptchaGrant(remoteBearerFromURL(t, remoteURL))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			s.mu.Lock()
+			pending := s.passwordPending[state]
+			originalFlow := pending.flow
+			var replacementFlow *passwordFlow
+			if replacement == "owner" {
+				pending.discordUserID = "different-owner"
+			} else {
+				replacementCtx, replacementCancel := context.WithCancel(context.Background())
+				t.Cleanup(replacementCancel)
+				replacementFlow = &passwordFlow{ctx: replacementCtx, cancel: replacementCancel, remoteDone: make(chan struct{})}
+				pending.flow = replacementFlow
+			}
+			s.passwordPending[state] = pending
+			s.mu.Unlock()
+
+			if _, err := s.lookupRemoteCaptchaViewer(rawSession); !errors.Is(err, errRemoteCaptchaUnavailable) {
+				t.Fatalf("%s replacement lookup error = %v", replacement, err)
+			}
+			s.mu.Lock()
+			_, retained := s.passwordPending[state]
+			s.mu.Unlock()
+			if retained {
+				t.Fatal("viewer binding mismatch retained password/viewer state")
+			}
+			assertRemoteCaptchaFlowReleased(t, originalFlow)
+			if replacementFlow != nil {
+				assertRemoteCaptchaFlowReleased(t, replacementFlow)
+			}
+			assertRemoteCaptchaLifecycleDrained(t, s)
+		})
+	}
+}
+
+func assertRemoteCaptchaFlowReleased(t *testing.T, flow *passwordFlow) {
+	t.Helper()
+	select {
+	case <-flow.remoteDone:
+	default:
+		t.Fatal("remoteDone was not released")
+	}
+	select {
+	case <-flow.ctx.Done():
+	default:
+		t.Fatal("password flow context was not canceled")
+	}
+}
+
+func assertRemoteCaptchaLifecycleDrained(t *testing.T, s *Server) {
+	t.Helper()
+	drained := make(chan struct{})
+	go func() {
+		s.lifecycleWG.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+	case <-time.After(time.Second):
+		t.Fatal("remote CAPTCHA lifecycle workers did not finish after mismatch cleanup")
 	}
 }
 

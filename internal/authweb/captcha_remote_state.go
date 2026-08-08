@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"log"
 	"time"
 )
 
@@ -40,6 +41,11 @@ type remoteCaptchaViewer struct {
 	discordUserID string
 	flow          *passwordFlow
 	expiresAt     time.Time
+}
+
+type remoteCaptchaBindingCleanup struct {
+	password   passwordStateCleanup
+	staleFlows []*passwordFlow
 }
 
 type remoteCaptchaHooks struct {
@@ -80,12 +86,12 @@ func (s *Server) remoteCaptchaHooks() remoteCaptchaHooks {
 
 func newRemoteCaptchaSecret(random io.Reader) (raw string, digest [sha256.Size]byte, err error) {
 	secret := make([]byte, remoteCaptchaSecretBytes)
+	defer clear(secret)
 	if _, err = io.ReadFull(random, secret); err != nil {
 		return "", digest, err
 	}
 	digest = sha256.Sum256(secret)
 	raw = base64.RawURLEncoding.EncodeToString(secret)
-	clear(secret)
 	return raw, digest, nil
 }
 
@@ -126,8 +132,8 @@ func (s *Server) redeemRemoteCaptchaGrant(rawGrant string) (remoteCaptchaViewer,
 	now := hooks.now()
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return remoteCaptchaViewer{}, "", errRemoteCaptchaUnavailable
 	}
 	for state, pending := range s.passwordPending {
@@ -139,6 +145,9 @@ func (s *Server) redeemRemoteCaptchaGrant(rawGrant string) (remoteCaptchaViewer,
 		if now.After(grant.expiresAt) || now.Equal(grant.expiresAt) || pending.flow == nil ||
 			pending.flow != grant.flow || pending.discordUserID != grant.ownerDiscordUserID ||
 			pending.flow.sealed || pending.flow.ctx.Err() != nil || outcome.done || pending.remoteViewer.active {
+			cleanup := s.claimRemoteCaptchaBindingCleanupLocked(state, pending, grant.flow, pending.remoteViewer.flow)
+			s.mu.Unlock()
+			s.finishRemoteCaptchaBindingCleanup(cleanup)
 			return remoteCaptchaViewer{}, "", errRemoteCaptchaUnavailable
 		}
 
@@ -151,13 +160,16 @@ func (s *Server) redeemRemoteCaptchaGrant(rawGrant string) (remoteCaptchaViewer,
 			active:             true,
 		}
 		s.passwordPending[state] = pending
-		return remoteCaptchaViewer{
+		viewer := remoteCaptchaViewer{
 			state:         state,
 			discordUserID: grant.ownerDiscordUserID,
 			flow:          grant.flow,
 			expiresAt:     grant.expiresAt,
-		}, rawSession, nil
+		}
+		s.mu.Unlock()
+		return viewer, rawSession, nil
 	}
+	s.mu.Unlock()
 	return remoteCaptchaViewer{}, "", errRemoteCaptchaUnavailable
 }
 
@@ -169,8 +181,8 @@ func (s *Server) lookupRemoteCaptchaViewer(rawSession string) (remoteCaptchaView
 	now := s.remoteCaptchaHooks().now()
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		return remoteCaptchaViewer{}, errRemoteCaptchaUnavailable
 	}
 	for state, pending := range s.passwordPending {
@@ -182,15 +194,21 @@ func (s *Server) lookupRemoteCaptchaViewer(rawSession string) (remoteCaptchaView
 		if !now.Before(viewer.expiresAt) || pending.flow == nil || pending.flow != viewer.flow ||
 			pending.discordUserID != viewer.ownerDiscordUserID || pending.flow.sealed ||
 			pending.flow.ctx.Err() != nil || outcome.done {
+			cleanup := s.claimRemoteCaptchaBindingCleanupLocked(state, pending, pending.remoteGrant.flow, viewer.flow)
+			s.mu.Unlock()
+			s.finishRemoteCaptchaBindingCleanup(cleanup)
 			return remoteCaptchaViewer{}, errRemoteCaptchaUnavailable
 		}
-		return remoteCaptchaViewer{
+		authenticated := remoteCaptchaViewer{
 			state:         state,
 			discordUserID: viewer.ownerDiscordUserID,
 			flow:          viewer.flow,
 			expiresAt:     viewer.expiresAt,
-		}, nil
+		}
+		s.mu.Unlock()
+		return authenticated, nil
 	}
+	s.mu.Unlock()
 	return remoteCaptchaViewer{}, errRemoteCaptchaUnavailable
 }
 
@@ -214,7 +232,9 @@ func (s *Server) cancelRemoteCaptchaViewer(rawSession string) error {
 		if !now.Before(viewer.expiresAt) || pending.flow == nil || pending.flow != viewer.flow ||
 			pending.discordUserID != viewer.ownerDiscordUserID || pending.flow.sealed ||
 			pending.flow.ctx.Err() != nil || outcome.done {
+			cleanup := s.claimRemoteCaptchaBindingCleanupLocked(state, pending, pending.remoteGrant.flow, viewer.flow)
 			s.mu.Unlock()
+			s.finishRemoteCaptchaBindingCleanup(cleanup)
 			return errRemoteCaptchaUnavailable
 		}
 		cleanup := s.claimPasswordStateCleanupLocked(state)
@@ -229,14 +249,54 @@ func (s *Server) cancelRemoteCaptchaViewer(rawSession string) error {
 	return errRemoteCaptchaUnavailable
 }
 
+// claimRemoteCaptchaBindingCleanupLocked invalidates every credential and
+// remote lifecycle involved in a binding mismatch before releasing Server.mu.
+// Slow browser/flow cleanup is returned to the caller.
+func (s *Server) claimRemoteCaptchaBindingCleanupLocked(state string, pending passwordPending, bindingFlows ...*passwordFlow) remoteCaptchaBindingCleanup {
+	stale := make(map[*passwordFlow]struct{})
+	for _, flow := range bindingFlows {
+		if flow == nil {
+			continue
+		}
+		releaseRemoteCaptchaFlow(flow)
+		if flow != pending.flow {
+			stale[flow] = struct{}{}
+		}
+	}
+	scrubPasswordCredentials(&pending)
+	clearRemoteCaptchaState(&pending)
+	s.passwordPending[state] = pending
+	cleanup := s.claimPasswordStateCleanupLocked(state)
+	staleFlows := make([]*passwordFlow, 0, len(stale))
+	for flow := range stale {
+		staleFlows = append(staleFlows, flow)
+	}
+	return remoteCaptchaBindingCleanup{password: cleanup, staleFlows: staleFlows}
+}
+
+func (s *Server) finishRemoteCaptchaBindingCleanup(cleanup remoteCaptchaBindingCleanup) {
+	s.finishPasswordStateCleanup(cleanup.password)
+	for _, flow := range cleanup.staleFlows {
+		flow.cancel()
+		if closeErr := s.closeOwnedCaptchaBrowser(flow); closeErr != nil {
+			log.Printf("stale CAPTCHA browser cleanup remains incomplete: %v", closeErr)
+		}
+		flow.wg.Wait()
+	}
+}
+
 func clearRemoteCaptchaState(pending *passwordPending) {
 	if pending == nil {
 		return
 	}
 	pending.remoteGrant = remoteCaptchaGrant{}
 	pending.remoteViewer = remoteCaptchaViewerSessionState{}
-	if pending.flow != nil && pending.flow.remoteDone != nil {
-		pending.flow.remoteDoneOnce.Do(func() { close(pending.flow.remoteDone) })
+	releaseRemoteCaptchaFlow(pending.flow)
+}
+
+func releaseRemoteCaptchaFlow(flow *passwordFlow) {
+	if flow != nil && flow.remoteDone != nil {
+		flow.remoteDoneOnce.Do(func() { close(flow.remoteDone) })
 	}
 }
 

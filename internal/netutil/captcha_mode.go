@@ -29,13 +29,41 @@ func NormalizeCaptchaBrowserMode(rawMode, authBaseURL string) (CaptchaBrowserMod
 	case CaptchaBrowserLocal, CaptchaBrowserDisabled:
 		return mode, nil
 	case CaptchaBrowserRemote:
-		if err := validateRemoteCaptchaOrigin(authBaseURL); err != nil {
+		if _, err := CanonicalRemoteCaptchaOrigin(authBaseURL); err != nil {
 			return "", err
 		}
 		return mode, nil
 	default:
 		return "", fmt.Errorf("unsupported CAPTCHA_BROWSER_MODE %q (want local, remote, or disabled)", rawMode)
 	}
+}
+
+// CanonicalRemoteCaptchaOrigin validates and serializes an HTTPS origin the
+// same way a browser supplies Host and Origin: lowercase DNS/scheme, canonical
+// IP spelling, no root slash, and no explicit default HTTPS port.
+func CanonicalRemoteCaptchaOrigin(authBaseURL string) (string, error) {
+	if err := validateRemoteCaptchaOrigin(authBaseURL); err != nil {
+		return "", err
+	}
+	origin, err := url.Parse(authBaseURL)
+	if err != nil {
+		return "", fmt.Errorf("parse remote CAPTCHA origin: %w", err)
+	}
+	hostname := origin.Hostname()
+	canonicalHost := strings.ToLower(hostname)
+	if address, parseErr := netip.ParseAddr(hostname); parseErr == nil {
+		canonicalHost = address.String()
+		if address.Is6() {
+			canonicalHost = "[" + canonicalHost + "]"
+		}
+	}
+	if port := origin.Port(); port != "" {
+		portNumber, _ := strconv.Atoi(port) // validated above
+		if portNumber != 443 {
+			canonicalHost += ":" + strconv.Itoa(portNumber)
+		}
+	}
+	return "https://" + canonicalHost, nil
 }
 
 func validateRemoteCaptchaOrigin(authBaseURL string) error {
@@ -68,7 +96,7 @@ func validateRemoteCaptchaHost(host string) error {
 			return fmt.Errorf("malformed bracketed IPv6 host")
 		}
 		address, err := netip.ParseAddr(host[1:close])
-		if err != nil || !address.Is6() {
+		if err != nil || !address.Is6() || address.Zone() != "" {
 			return fmt.Errorf("malformed bracketed IPv6 host")
 		}
 		rest := host[close+1:]
@@ -100,10 +128,46 @@ func validateRemoteCaptchaHost(host string) error {
 	if address, err := netip.ParseAddr(hostname); err == nil && address.Is4() {
 		return nil
 	}
+	if looksLikeNoncanonicalIPv4(hostname) {
+		return fmt.Errorf("noncanonical IPv4 host")
+	}
 	if !validRemoteCaptchaDNSName(hostname) {
 		return fmt.Errorf("malformed DNS host")
 	}
 	return nil
+}
+
+func looksLikeNoncanonicalIPv4(hostname string) bool {
+	hostname = strings.TrimSuffix(hostname, ".")
+	parts := strings.Split(hostname, ".")
+	if len(parts) == 0 || len(parts) > 4 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		digits := part
+		base := byte(10)
+		if strings.HasPrefix(part, "0x") || strings.HasPrefix(part, "0X") {
+			digits = part[2:]
+			base = 16
+		}
+		if digits == "" {
+			return false
+		}
+		for index := 0; index < len(digits); index++ {
+			char := digits[index]
+			if char >= '0' && char <= '9' {
+				continue
+			}
+			if base == 16 && ((char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+				continue
+			}
+			return false
+		}
+	}
+	return true
 }
 
 func validateRemoteCaptchaPort(rawPort string) error {

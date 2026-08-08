@@ -58,6 +58,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.CaptchaBrowserMode = string(mode)
+	if mode == netutil.CaptchaBrowserRemote {
+		cfg.AuthBaseURL, err = netutil.CanonicalRemoteCaptchaOrigin(cfg.AuthBaseURL)
+		if err != nil {
+			return Config{}, err
+		}
+	}
 
 	if portStr := os.Getenv("AUTH_PORT"); portStr != "" {
 		port, err := strconv.Atoi(portStr)

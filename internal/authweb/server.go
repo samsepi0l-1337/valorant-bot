@@ -144,19 +144,21 @@ func (m *serverMutex) Lock() {
 
 // Server serves login redirect + Riot callback catcher.
 type Server struct {
-	authBaseURL        string
-	captchaBrowserMode netutil.CaptchaBrowserMode
-	captchaDisplay     string
-	pendingTTL         time.Duration
-	store              Store
-	riot               RiotClient
-	qrAuth             QRAuthClient
-	passwordAuth       PasswordAuthClient
-	qrPollInterval     time.Duration
-	boxer              Boxer
-	onLinked           LinkedNotifier
-	mux                *http.ServeMux
-	captchaMux         *http.ServeMux
+	authBaseURL         string
+	remoteCaptchaOrigin string
+	remoteCaptchaHost   string
+	captchaBrowserMode  netutil.CaptchaBrowserMode
+	captchaDisplay      string
+	pendingTTL          time.Duration
+	store               Store
+	riot                RiotClient
+	qrAuth              QRAuthClient
+	passwordAuth        PasswordAuthClient
+	qrPollInterval      time.Duration
+	boxer               Boxer
+	onLinked            LinkedNotifier
+	mux                 *http.ServeMux
+	captchaMux          *http.ServeMux
 
 	mu                         serverMutex
 	closed                     bool
@@ -219,8 +221,21 @@ func New(d Deps) *Server {
 		poll = defaultQRPollInterval
 	}
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
+	authBaseURL := strings.TrimRight(d.AuthBaseURL, "/")
+	var remoteCaptchaOrigin, remoteCaptchaHost string
+	if mode == netutil.CaptchaBrowserRemote {
+		if canonicalOrigin, err := netutil.CanonicalRemoteCaptchaOrigin(d.AuthBaseURL); err == nil {
+			authBaseURL = canonicalOrigin
+			remoteCaptchaOrigin = canonicalOrigin
+			if parsed, parseErr := url.Parse(canonicalOrigin); parseErr == nil {
+				remoteCaptchaHost = parsed.Host
+			}
+		}
+	}
 	s := &Server{
-		authBaseURL:                strings.TrimRight(d.AuthBaseURL, "/"),
+		authBaseURL:                authBaseURL,
+		remoteCaptchaOrigin:        remoteCaptchaOrigin,
+		remoteCaptchaHost:          remoteCaptchaHost,
 		captchaBrowserMode:         mode,
 		captchaDisplay:             display,
 		pendingTTL:                 ttl,

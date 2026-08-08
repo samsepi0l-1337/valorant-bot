@@ -8,7 +8,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -27,12 +26,10 @@ func (s *Server) registerRemoteCaptchaHTTPRoutes() {
 }
 
 func (s *Server) remoteCaptchaPublicOrigin() (origin, host string, ok bool) {
-	parsed, err := url.Parse(s.authBaseURL)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil ||
-		parsed.RawQuery != "" || parsed.Fragment != "" {
+	if s.remoteCaptchaOrigin == "" || s.remoteCaptchaHost == "" {
 		return "", "", false
 	}
-	return parsed.Scheme + "://" + parsed.Host, parsed.Host, true
+	return s.remoteCaptchaOrigin, s.remoteCaptchaHost, true
 }
 
 func (s *Server) allowRemoteCaptchaRequest(r *http.Request, requireOrigin bool) bool {
@@ -165,6 +162,14 @@ func decodeRemoteCaptchaJSON(w http.ResponseWriter, r *http.Request, destination
 		}
 		return http.StatusBadRequest
 	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return http.StatusBadRequest
+	}
+	duplicate, err := remoteCaptchaJSONHasDuplicateRootKey(trimmed)
+	if err != nil || duplicate {
+		return http.StatusBadRequest
+	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
@@ -174,6 +179,44 @@ func decodeRemoteCaptchaJSON(w http.ResponseWriter, r *http.Request, destination
 		return http.StatusBadRequest
 	}
 	return 0
+}
+
+func remoteCaptchaJSONHasDuplicateRootKey(body []byte) (bool, error) {
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	token, err := decoder.Token()
+	if err != nil {
+		return false, err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok || delimiter != '{' {
+		return false, errors.New("remote captcha JSON must be an object")
+	}
+	seen := make(map[string]struct{})
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return false, err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return false, errors.New("remote captcha JSON key must be a string")
+		}
+		if _, exists := seen[key]; exists {
+			return true, nil
+		}
+		seen[key] = struct{}{}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return false, err
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return false, err
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return false, errors.New("remote captcha JSON contains trailing data")
+	}
+	return false, nil
 }
 
 func writeRemoteCaptchaError(w http.ResponseWriter, status int) {
@@ -204,11 +247,11 @@ canvas.addEventListener("pointerdown",event=>pointer("down",event));
 canvas.addEventListener("pointerup",event=>pointer("up",event));
 canvas.addEventListener("wheel",event=>{event.preventDefault();send({type:"wheel",deltaY:event.deltaY,...point(event)});},{passive:false});
 cancel.addEventListener("click",async()=>{cancel.disabled=true;await fetch("/api/auth/captcha/remote/cancel",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).catch(()=>{});if(socket)socket.close();setStatus("Cancelled");});
-const start=async()=>{if(!grant){setStatus("This CAPTCHA link is invalid or expired.");return;}const response=await fetch("/api/auth/captcha/remote/redeem",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:grant})}).catch(()=>null);grant="";if(!response||!response.ok){setStatus("This CAPTCHA link is invalid or expired.");return;}setStatus("Connecting…");const protocol=location.protocol==="https:"?"wss:":"ws:";socket=new WebSocket(protocol+"//"+location.host+"/api/auth/captcha/remote/ws");socket.binaryType="blob";socket.addEventListener("open",()=>{setStatus("Connected");send({type:"viewport",width:canvas.clientWidth,height:canvas.clientHeight});});socket.addEventListener("message",async event=>{if(typeof event.data==="string"){const message=JSON.parse(event.data);if(message.status)setStatus(message.status);return;}const bitmap=await createImageBitmap(event.data);canvas.width=bitmap.width;canvas.height=bitmap.height;context.drawImage(bitmap,0,0);bitmap.close();});socket.addEventListener("close",()=>setStatus("Disconnected"));socket.addEventListener("error",()=>setStatus("Connection failed"));};
+const start=async()=>{if(!grant){setStatus("This CAPTCHA link is invalid or expired.");return;}const response=await fetch("/api/auth/captcha/remote/redeem",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:grant})}).catch(()=>null);grant="";if(!response||!response.ok){setStatus("This CAPTCHA link is invalid or expired.");return;}cancel.disabled=false;setStatus("Connecting…");const protocol=location.protocol==="https:"?"wss:":"ws:";socket=new WebSocket(protocol+"//"+location.host+"/api/auth/captcha/remote/ws");socket.binaryType="blob";socket.addEventListener("open",()=>{setStatus("Connected");send({type:"viewport",width:canvas.clientWidth,height:canvas.clientHeight});});socket.addEventListener("message",async event=>{if(typeof event.data==="string"){const message=JSON.parse(event.data);if(message.status)setStatus(message.status);return;}const bitmap=await createImageBitmap(event.data);canvas.width=bitmap.width;canvas.height=bitmap.height;context.drawImage(bitmap,0,0);bitmap.close();});socket.addEventListener("close",()=>setStatus("Disconnected"));socket.addEventListener("error",()=>setStatus("Connection failed"));};
 start();
 })();
 `
 
 const remoteCaptchaViewerHTML = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Remote CAPTCHA</title><style>` + remoteCaptchaViewerStyle + `</style></head>
-<body><main><header><p id="status" role="status" aria-live="polite">Preparing secure viewer…</p><button id="cancel" type="button">Cancel</button></header><canvas id="viewer" width="1280" height="900" aria-label="Remote Riot CAPTCHA viewer"></canvas></main><script>` + remoteCaptchaViewerScript + `</script></body></html>`
+<body><main><header><p id="status" role="status" aria-live="polite">Preparing secure viewer…</p><button id="cancel" type="button" disabled>Cancel</button></header><canvas id="viewer" width="1280" height="900" aria-label="Remote Riot CAPTCHA viewer"></canvas></main><script>` + remoteCaptchaViewerScript + `</script></body></html>`

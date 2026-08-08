@@ -43,6 +43,10 @@ func TestNormalizeCaptchaBrowserMode(t *testing.T) {
 		{name: "remote overflowing port", rawMode: "remote", authBaseURL: "https://relay.example.com:65536", wantErr: true},
 		{name: "remote malformed bracket host", rawMode: "remote", authBaseURL: "https://[::1", wantErr: true},
 		{name: "remote malformed IPv6", rawMode: "remote", authBaseURL: "https://[2001:db8:::1]", wantErr: true},
+		{name: "remote zero-padded IPv4", rawMode: "remote", authBaseURL: "https://192.168.001.1", wantErr: true},
+		{name: "remote abbreviated IPv4", rawMode: "remote", authBaseURL: "https://127.1", wantErr: true},
+		{name: "remote hexadecimal IPv4", rawMode: "remote", authBaseURL: "https://0x7f.0x0.0x0.0x1", wantErr: true},
+		{name: "remote IPv6 zone", rawMode: "remote", authBaseURL: "https://[fe80::1%25eth0]", wantErr: true},
 	}
 
 	for _, tt := range tests {
@@ -59,6 +63,35 @@ func TestNormalizeCaptchaBrowserMode(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Fatalf("NormalizeCaptchaBrowserMode(%q, %q) = %q, want %q", tt.rawMode, tt.authBaseURL, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalRemoteCaptchaOrigin(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "DNS and scheme case with default port", raw: "HTTPS://Relay.Example.COM:443/", want: "https://relay.example.com"},
+		{name: "DNS zero-padded default port", raw: "https://relay.example.com:0443", want: "https://relay.example.com"},
+		{name: "DNS nondefault port", raw: "https://Relay.Example.COM:8443", want: "https://relay.example.com:8443"},
+		{name: "DNS zero-padded nondefault port", raw: "https://Relay.Example.COM:08443", want: "https://relay.example.com:8443"},
+		{name: "IPv4 default port", raw: "https://192.0.2.10:443", want: "https://192.0.2.10"},
+		{name: "IPv4 nondefault port", raw: "https://192.0.2.10:8443", want: "https://192.0.2.10:8443"},
+		{name: "IPv6 spelling and default port", raw: "https://[2001:0DB8:0:0:0:0:0:1]:443", want: "https://[2001:db8::1]"},
+		{name: "IPv6 nondefault port", raw: "https://[2001:0DB8::1]:8443", want: "https://[2001:db8::1]:8443"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := netutil.CanonicalRemoteCaptchaOrigin(test.raw)
+			if err != nil {
+				t.Fatalf("CanonicalRemoteCaptchaOrigin(%q): %v", test.raw, err)
+			}
+			if got != test.want {
+				t.Fatalf("CanonicalRemoteCaptchaOrigin(%q) = %q, want %q", test.raw, got, test.want)
 			}
 		})
 	}
