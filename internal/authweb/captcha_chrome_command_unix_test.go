@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strconv"
@@ -200,6 +201,100 @@ func TestChromeCommandNonRootLaunchRemainsDirect(t *testing.T) {
 	assertEnvironmentKeysAbsent(t, cmd.Env, []string{"DISCORD_TOKEN=x", "UNKNOWN_SECURITY_FOLLOWUP=x"})
 }
 
+// Mutations caught: bypassing the common command boundary with a raw
+// exec.Command leaves Cmd.Env nil, while using the Unix case-sensitive list on
+// Windows loses ordinary mixed-case fields such as Path and UserProfile.
+func TestChromeCommandWindowsModeUsesCommonEnvironmentBoundary(t *testing.T) {
+	safeEnvironment := []string{
+		`Path=C:\security\bin;C:\Windows\System32`,
+		`UserProfile=C:\Users\security-test`,
+		"username=security-test",
+		`AppData=C:\Users\security-test\AppData\Roaming`,
+		`LOCALAPPDATA=C:\Users\security-test\AppData\Local`,
+		"HomeDrive=C:",
+		`HOMEPATH=\Users\security-test`,
+		`SystemRoot=C:\Windows`,
+		`windir=C:\Windows`,
+		`TEMP=C:\Users\security-test\AppData\Local\Temp`,
+		"Lang=ko_KR.UTF-8",
+	}
+	for _, entry := range safeEnvironment {
+		key, value, _ := strings.Cut(entry, "=")
+		t.Setenv(key, value)
+	}
+	for _, entry := range []string{
+		"Discord_Token=final-hardening-discord-sentinel",
+		"Bot_Secret=final-hardening-bot-sentinel",
+		"Aws_Secret_Access_Key=final-hardening-cloud-sentinel",
+		"Unknown_Final_Hardening=final-hardening-unknown-sentinel",
+	} {
+		key, value, _ := strings.Cut(entry, "=")
+		t.Setenv(key, value)
+	}
+	installCaptchaChromeCommandRuntime(t, captchaChromeCommandRuntime{
+		goos:         "windows",
+		effectiveUID: func() int { return 1000 },
+		desktopUser:  func() string { return "security-test" },
+	})
+
+	cmd, err := chromeCommand(`C:\Program Files\Google\Chrome\Application\chrome.exe`, []string{"--incognito"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd.Path != `C:\Program Files\Google\Chrome\Application\chrome.exe` || len(cmd.Args) != 2 || cmd.Args[1] != "--incognito" {
+		t.Fatalf("Windows-mode direct Chrome launch was wrapped: path=%q args=%v", cmd.Path, cmd.Args)
+	}
+	if cmd.Env == nil {
+		t.Fatal("common Chrome command boundary left Windows-mode Cmd.Env nil")
+	}
+	assertEnvironmentEntries(t, cmd.Env, safeEnvironment)
+	assertEnvironmentKeysAbsentFold(t, cmd.Env, []string{
+		"DISCORD_TOKEN",
+		"BOT_SECRET",
+		"AWS_SECRET_ACCESS_KEY",
+		"UNKNOWN_FINAL_HARDENING",
+	})
+}
+
+// Mutation caught: case-sensitive Windows filtering drops ordinary Path and
+// mixed-case identity fields; copying the input retains the dirty tail.
+func TestWindowsDesktopEnvironmentAllowlistIsCaseInsensitive(t *testing.T) {
+	wanted := []string{
+		`Path=C:\security\new-bin`,
+		`UserProfile=C:\Users\security-test`,
+		"username=security-test",
+		`AppData=C:\Users\security-test\AppData\Roaming`,
+		`localappdata=C:\Users\security-test\AppData\Local`,
+		"HomeDrive=C:",
+		`homepath=\Users\security-test`,
+		`SystemRoot=C:\Windows`,
+		`windir=C:\Windows`,
+		`Temp=C:\Users\security-test\AppData\Local\Temp`,
+		"lang=ko_KR.UTF-8",
+	}
+	injected := []string{`PATH=C:\security\old-bin`}
+	injected = append(injected, wanted...)
+	injected = append(injected,
+		"DISPLAY=:99",
+		"Discord_Token=final-hardening-discord-sentinel",
+		"Bot_Secret=final-hardening-bot-sentinel",
+		"Aws_Secret_Access_Key=final-hardening-cloud-sentinel",
+		"Unknown_Final_Hardening=final-hardening-unknown-sentinel",
+	)
+
+	filtered := allowlistedCaptchaDesktopEnvironment("windows", injected)
+	if filtered == nil {
+		t.Fatal("Windows allowlist returned nil environment")
+	}
+	assertEnvironmentEntries(t, filtered, wanted)
+	if len(filtered) != len(wanted) {
+		t.Fatalf("Windows allowlist retained %d entries, want exactly %d", len(filtered), len(wanted))
+	}
+	if environmentContains(filtered, `PATH=C:\security\old-bin`) {
+		t.Fatal("Windows allowlist retained the superseded PATH spelling/value")
+	}
+}
+
 // Mutation caught: deleting either final PGID verification lets the helper
 // exec Chrome after a wrapper/session boundary placed it outside ownership.
 func TestCaptchaChromeExecHelperFailsClosedOnFinalGroupMismatch(t *testing.T) {
@@ -276,6 +371,72 @@ func TestCaptchaChromeOwnedExecTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(30 * time.Second)
+}
+
+// Mutation caught: replacing the helper's final explicit allowlist with
+// marker-only deletion lets a valid direct helper invocation forward dirty
+// environment values to its final exec target.
+func TestCaptchaChromeExecHelperFiltersDirtyEnvironmentAtFinalExec(t *testing.T) {
+	identity := currentCaptchaDesktopIdentity(t)
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	profileDir := filepath.Join(root, strings.Repeat("7", 32))
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	pgidFile := filepath.Join(root, "dirty-helper-final-pgid")
+	environmentFile := filepath.Join(root, "dirty-helper-final-environment.json")
+	safeEnvironment := setCaptchaEnvironment(captchaDesktopEnvironmentSafeTestValues, "TMPDIR", root)
+	dirtyEnvironment := append([]string(nil), safeEnvironment...)
+	dirtyEnvironment = append(dirtyEnvironment, captchaDesktopEnvironmentSecretTestValues...)
+	dirtyEnvironment = setCaptchaEnvironment(dirtyEnvironment, captchaChromeExecEnvironment, "1")
+
+	helperArgs := []string{
+		captchaChromeExecArgument,
+		strconv.Itoa(identity.uid),
+		strconv.Itoa(identity.gid),
+		joinCaptchaGroupIDs(normalizedCaptchaDesktopGroups(identity.gid, identity.groups)),
+		executable,
+		"-test.run=^TestCaptchaChromeOwnedExecTarget$",
+		"--",
+		pgidFile,
+		environmentFile,
+	}
+	cmd := exec.Command(executable, helperArgs...)
+	cmd.Env = dirtyEnvironment
+	controllerValue, err := startChromeLogged(cmd, root, profileDir)
+	if err != nil {
+		t.Fatalf("start dirty helper final-exec target: %v", err)
+	}
+	controller := controllerValue.(*chromeBrowserController)
+	controller.closeDevTools = func(context.Context, string) error {
+		return errors.New("close dirty helper target through guardian group")
+	}
+	t.Cleanup(func() { _ = controller.Close() })
+
+	observation := readCaptchaChromeTargetObservation(t, environmentFile)
+	for _, entry := range safeEnvironment {
+		key, want, _ := strings.Cut(entry, "=")
+		if got := observation.Environment[key]; got != want {
+			t.Fatalf("safe dirty-helper final environment key %q was not preserved", key)
+		}
+	}
+	for _, key := range environmentKeys(captchaDesktopEnvironmentSecretTestValues) {
+		if observation.Environment[key] != "" {
+			t.Fatalf("forbidden dirty-helper final environment key %q was preserved", key)
+		}
+	}
+	for _, key := range []string{captchaChromeExecEnvironment, captchaChromeExecPGIDEnvironment} {
+		if observation.Environment[key] != "" {
+			t.Fatalf("internal helper environment key %q reached dirty final target", key)
+		}
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatalf("close dirty helper final-exec target: %v", err)
+	}
 }
 
 // Mutation caught: omitting guardian PGID injection or bypassing the helper
@@ -435,6 +596,21 @@ func assertEnvironmentKeysAbsent(t *testing.T, environment, forbidden []string) 
 	}
 }
 
+func assertEnvironmentKeysAbsentFold(t *testing.T, environment, forbidden []string) {
+	t.Helper()
+	for _, entry := range environment {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		for _, forbiddenKey := range forbidden {
+			if strings.EqualFold(key, forbiddenKey) {
+				t.Fatalf("forbidden case-insensitive environment key %q was preserved", forbiddenKey)
+			}
+		}
+	}
+}
+
 func environmentKeys(groups ...[]string) []string {
 	var keys []string
 	for _, group := range groups {
@@ -453,4 +629,29 @@ func argumentsAfterSeparator(arguments []string) []string {
 		}
 	}
 	return nil
+}
+
+func readCaptchaChromeTargetObservation(t *testing.T, path string) captchaChromeExecTargetObservation {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var encoded []byte
+	var err error
+	for time.Now().Before(deadline) {
+		encoded, err = os.ReadFile(path)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("read final target environment observation: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("final target did not publish its environment observation: %v", err)
+	}
+	var observation captchaChromeExecTargetObservation
+	if err := json.Unmarshal(encoded, &observation); err != nil {
+		t.Fatalf("decode final target environment observation: %v", err)
+	}
+	return observation
 }

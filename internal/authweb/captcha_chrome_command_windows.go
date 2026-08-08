@@ -2,8 +2,15 @@
 
 package authweb
 
-import "os/exec"
+import (
+	"os"
+	"os/exec"
+)
 
-func chromeCommand(bin string, args []string) (*exec.Cmd, error) {
-	return allowlistedCaptchaChromeCommand(bin, args), nil
+func platformCaptchaChromeCommand(bin string, args []string) (captchaChromePlatformCommand, error) {
+	return captchaChromePlatformCommand{
+		cmd:         exec.Command(bin, args...),
+		goos:        "windows",
+		environment: os.Environ(),
+	}, nil
 }

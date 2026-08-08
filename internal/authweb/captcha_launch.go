@@ -614,11 +614,11 @@ func desktopUser() string {
 	return ""
 }
 
-// captchaDesktopEnvironmentKeys is deliberately an exact allowlist. The bot
+// The platform lists are deliberately exact allowlists. The bot
 // process loads service credentials into its environment, so a root-owned GUI
 // launcher must never derive Chrome's environment by copying all parent values
 // and attempting to remove known secret names.
-var captchaDesktopEnvironmentKeys = []string{
+var captchaUnixDesktopEnvironmentKeys = []string{
 	// Desktop identity and executable/temp lookup.
 	"HOME",
 	"USER",
@@ -664,34 +664,90 @@ var captchaDesktopEnvironmentKeys = []string{
 	"__CF_USER_TEXT_ENCODING",
 }
 
-func allowlistedCaptchaDesktopEnvironment(environment []string) []string {
-	values := make(map[string]string, len(captchaDesktopEnvironmentKeys))
-	allowed := make(map[string]struct{}, len(captchaDesktopEnvironmentKeys))
-	for _, key := range captchaDesktopEnvironmentKeys {
-		allowed[key] = struct{}{}
+var captchaWindowsDesktopEnvironmentKeys = []string{
+	// Executable lookup, Windows system discovery, and temporary storage.
+	"PATH",
+	"PATHEXT",
+	"SYSTEMROOT",
+	"WINDIR",
+	"SYSTEMDRIVE",
+	"TEMP",
+	"TMP",
+
+	// User identity, home, and per-user/shared application data.
+	"USERPROFILE",
+	"USERNAME",
+	"USERDOMAIN",
+	"USERDOMAIN_ROAMINGPROFILE",
+	"HOME",
+	"USER",
+	"LOGNAME",
+	"HOMEDRIVE",
+	"HOMEPATH",
+	"HOMESHARE",
+	"APPDATA",
+	"LOCALAPPDATA",
+	"PROGRAMDATA",
+	"ALLUSERSPROFILE",
+
+	// Standard locale/timezone fields.
+	"LANG",
+	"LANGUAGE",
+	"LC_ALL",
+	"LC_ADDRESS",
+	"LC_COLLATE",
+	"LC_CTYPE",
+	"LC_IDENTIFICATION",
+	"LC_MEASUREMENT",
+	"LC_MESSAGES",
+	"LC_MONETARY",
+	"LC_NAME",
+	"LC_NUMERIC",
+	"LC_PAPER",
+	"LC_TELEPHONE",
+	"LC_TIME",
+	"TZ",
+}
+
+type captchaDesktopEnvironmentValue struct {
+	key   string
+	value string
+}
+
+func allowlistedCaptchaDesktopEnvironment(goos string, environment []string) []string {
+	keys := captchaUnixDesktopEnvironmentKeys
+	caseInsensitive := goos == "windows"
+	if caseInsensitive {
+		keys = captchaWindowsDesktopEnvironmentKeys
+	}
+	normalize := func(key string) string {
+		if caseInsensitive {
+			return strings.ToUpper(key)
+		}
+		return key
+	}
+	values := make(map[string]captchaDesktopEnvironmentValue, len(keys))
+	allowed := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		allowed[normalize(key)] = struct{}{}
 	}
 	for _, entry := range environment {
 		key, value, ok := strings.Cut(entry, "=")
 		if !ok {
 			continue
 		}
-		if _, ok := allowed[key]; ok {
-			values[key] = value
+		normalizedKey := normalize(key)
+		if _, ok := allowed[normalizedKey]; ok {
+			values[normalizedKey] = captchaDesktopEnvironmentValue{key: key, value: value}
 		}
 	}
 	filtered := make([]string, 0, len(values))
-	for _, key := range captchaDesktopEnvironmentKeys {
-		if value, ok := values[key]; ok {
-			filtered = append(filtered, key+"="+value)
+	for _, key := range keys {
+		if selected, ok := values[normalize(key)]; ok {
+			filtered = append(filtered, selected.key+"="+selected.value)
 		}
 	}
 	return filtered
-}
-
-func allowlistedCaptchaChromeCommand(bin string, args []string) *exec.Cmd {
-	cmd := exec.Command(bin, args...)
-	cmd.Env = allowlistedCaptchaDesktopEnvironment(os.Environ())
-	return cmd
 }
 
 func desktopEnv(username string) []string {
@@ -705,7 +761,7 @@ func desktopEnv(username string) []string {
 		"USER="+username,
 		"LOGNAME="+username,
 	)
-	return allowlistedCaptchaDesktopEnvironment(sourceEnvironment)
+	return allowlistedCaptchaDesktopEnvironment(runtime.GOOS, sourceEnvironment)
 }
 
 func chownPath(path, username string) error {

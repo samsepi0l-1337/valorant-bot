@@ -64,7 +64,7 @@ var defaultCaptchaChromeExecSystem = captchaChromeExecSystem{
 	exec:      syscall.Exec,
 }
 
-func chromeCommand(bin string, args []string) (*exec.Cmd, error) {
+func platformCaptchaChromeCommand(bin string, args []string) (captchaChromePlatformCommand, error) {
 	runtime := currentCaptchaChromeCommandRuntime
 	effectiveUID := -1
 	if runtime.effectiveUID != nil {
@@ -75,24 +75,28 @@ func chromeCommand(bin string, args []string) (*exec.Cmd, error) {
 		username = strings.TrimSpace(runtime.desktopUser())
 	}
 	if effectiveUID != 0 || username == "" || username == "root" {
-		return allowlistedCaptchaChromeCommand(bin, args), nil
+		return captchaChromePlatformCommand{
+			cmd:         exec.Command(bin, args...),
+			goos:        runtime.goos,
+			environment: os.Environ(),
+		}, nil
 	}
 	if runtime.lookupIdentity == nil || runtime.executable == nil {
-		return nil, fmt.Errorf("desktop Chrome identity helper is unavailable")
+		return captchaChromePlatformCommand{}, fmt.Errorf("desktop Chrome identity helper is unavailable")
 	}
 	identity, err := runtime.lookupIdentity(username)
 	if err != nil {
-		return nil, fmt.Errorf("resolve desktop Chrome identity %q: %w", username, err)
+		return captchaChromePlatformCommand{}, fmt.Errorf("resolve desktop Chrome identity %q: %w", username, err)
 	}
 	if identity.uid < 0 || identity.gid < 0 {
-		return nil, fmt.Errorf("invalid desktop Chrome identity %q", username)
+		return captchaChromePlatformCommand{}, fmt.Errorf("invalid desktop Chrome identity %q", username)
 	}
 	executable, err := runtime.executable()
 	if err != nil {
-		return nil, fmt.Errorf("resolve desktop Chrome exec helper: %w", err)
+		return captchaChromePlatformCommand{}, fmt.Errorf("resolve desktop Chrome exec helper: %w", err)
 	}
 	if strings.TrimSpace(executable) == "" {
-		return nil, fmt.Errorf("desktop Chrome exec helper path is empty")
+		return captchaChromePlatformCommand{}, fmt.Errorf("desktop Chrome exec helper path is empty")
 	}
 	groups := normalizedCaptchaDesktopGroups(identity.gid, identity.groups)
 	helperArgs := []string{
@@ -107,9 +111,6 @@ func chromeCommand(bin string, args []string) (*exec.Cmd, error) {
 	if runtime.desktopEnv != nil {
 		sourceEnvironment = runtime.desktopEnv(username)
 	}
-	environment := allowlistedCaptchaDesktopEnvironment(sourceEnvironment)
-	environment = setCaptchaEnvironment(environment, captchaChromeExecEnvironment, "1")
-
 	var cmd *exec.Cmd
 	if runtime.goos == "darwin" {
 		launchctlArgs := []string{"asuser", strconv.Itoa(identity.uid), executable}
@@ -118,8 +119,12 @@ func chromeCommand(bin string, args []string) (*exec.Cmd, error) {
 	} else {
 		cmd = exec.Command(executable, helperArgs...)
 	}
-	cmd.Env = environment
-	return cmd, nil
+	return captchaChromePlatformCommand{
+		cmd:                 cmd,
+		goos:                runtime.goos,
+		environment:         sourceEnvironment,
+		internalEnvironment: []string{captchaChromeExecEnvironment + "=1"},
+	}, nil
 }
 
 func lookupCaptchaDesktopIdentity(username string) (captchaDesktopIdentity, error) {
@@ -244,7 +249,7 @@ func runCaptchaChromeExecHelper(args, environment []string, system captchaChrome
 		return fmt.Errorf("final desktop Chrome process group=%d, want owned group=%d", got, pgid)
 	}
 	execArgs := append([]string{target}, args[5:]...)
-	cleanEnvironment := removeCaptchaEnvironment(environment, captchaChromeExecEnvironment, captchaChromeExecPGIDEnvironment)
+	cleanEnvironment := allowlistedCaptchaDesktopEnvironment(runtime.GOOS, environment)
 	if err := system.exec(target, execArgs, cleanEnvironment); err != nil {
 		return fmt.Errorf("exec desktop Chrome: %w", err)
 	}
@@ -272,27 +277,6 @@ func setCaptchaEnvironment(environment []string, key, value string) []string {
 		}
 	}
 	return append(result, prefix+value)
-}
-
-func removeCaptchaEnvironment(environment []string, keys ...string) []string {
-	prefixes := make([]string, len(keys))
-	for i, key := range keys {
-		prefixes[i] = key + "="
-	}
-	result := make([]string, 0, len(environment))
-	for _, entry := range environment {
-		remove := false
-		for _, prefix := range prefixes {
-			if strings.HasPrefix(entry, prefix) {
-				remove = true
-				break
-			}
-		}
-		if !remove {
-			result = append(result, entry)
-		}
-	}
-	return result
 }
 
 func captchaEnvironmentValue(environment []string, key string) string {
