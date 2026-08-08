@@ -388,13 +388,21 @@ func (f *remoteCaptchaWebSocketFixture) fireGraceTimer(t *testing.T, timer chan 
 
 func (f *remoteCaptchaWebSocketFixture) dial(t *testing.T, cookie *http.Cookie, origin string) (*websocket.Conn, *http.Response, error) {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	return f.dialContext(ctx, cookie, origin)
+}
+
+func (f *remoteCaptchaWebSocketFixture) dialContext(ctx context.Context, cookie *http.Cookie, origin string) (*websocket.Conn, *http.Response, error) {
 	header := make(http.Header)
 	header.Set("Origin", origin)
 	if cookie != nil {
 		header.Set("Cookie", cookie.String())
 	}
 	wsURL := "ws://" + strings.TrimPrefix(f.httpServer.URL, "http://") + "/api/auth/captcha/remote/ws"
-	return websocket.DefaultDialer.Dial(wsURL, header)
+	dialer := *websocket.DefaultDialer
+	dialer.HandshakeTimeout = time.Second
+	return dialer.DialContext(ctx, wsURL, header)
 }
 
 func redeemedRemoteCaptchaViewerCookie(t *testing.T, s *Server, bearer string) *http.Cookie {
@@ -839,6 +847,121 @@ func TestRemoteCaptchaWebSocketReconnectChurnOwnsOneGraceWorkerAndShutdownDrains
 		t.Fatalf("shutdown published an unexpected grace timer %s", extra)
 	default:
 	}
+}
+
+func TestRemoteCaptchaWebSocketReconnectAndShutdownJoinCanceledGraceBeforeReturn(t *testing.T) {
+	t.Run("reconnect joins", func(t *testing.T) {
+		fixture := newRemoteCaptchaWebSocketFixture(t)
+		connection, response, err := fixture.dial(t, fixture.cookie, fixture.origin)
+		if err != nil {
+			t.Fatalf("initial dial response=%v err=%v", response, err)
+		}
+		select {
+		case <-fixture.streamOwners:
+		case <-time.After(time.Second):
+			t.Fatal("remote stream did not start")
+		}
+		hookEntered := make(chan struct{})
+		hookRelease := make(chan struct{})
+		var hookEnteredOnce sync.Once
+		fixture.server.beforeRemoteCaptchaGraceDoneForTest = func() {
+			hookEnteredOnce.Do(func() { close(hookEntered) })
+			<-hookRelease
+		}
+		if err := connection.Close(); err != nil {
+			t.Fatal(err)
+		}
+		_ = fixture.nextGraceTimer(t)
+
+		type dialResult struct {
+			connection *websocket.Conn
+			response   *http.Response
+			err        error
+		}
+		dialDone := make(chan dialResult, 1)
+		dialCtx, cancelDial := context.WithTimeout(context.Background(), time.Second)
+		defer cancelDial()
+		go func() {
+			gotConnection, gotResponse, gotErr := fixture.dialContext(dialCtx, fixture.cookie, fixture.origin)
+			dialDone <- dialResult{connection: gotConnection, response: gotResponse, err: gotErr}
+		}()
+		select {
+		case <-hookEntered:
+		case <-time.After(time.Second):
+			close(hookRelease)
+			t.Fatal("canceled grace worker did not reach the pre-done hook")
+		}
+		select {
+		case early := <-dialDone:
+			close(hookRelease)
+			if early.connection != nil {
+				_ = early.connection.Close()
+			}
+			t.Fatalf("reconnect returned before canceled grace worker joined: response=%v err=%v", early.response, early.err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		close(hookRelease)
+		var reconnected dialResult
+		select {
+		case reconnected = <-dialDone:
+		case <-time.After(time.Second):
+			t.Fatal("reconnect did not return after canceled grace worker joined")
+		}
+		if reconnected.err != nil {
+			t.Fatalf("reconnect response=%v err=%v", reconnected.response, reconnected.err)
+		}
+		fixture.server.beforeRemoteCaptchaGraceDoneForTest = nil
+		if err := reconnected.connection.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("shutdown joins", func(t *testing.T) {
+		fixture := newRemoteCaptchaWebSocketFixture(t)
+		connection, response, err := fixture.dial(t, fixture.cookie, fixture.origin)
+		if err != nil {
+			t.Fatalf("initial dial response=%v err=%v", response, err)
+		}
+		select {
+		case <-fixture.streamOwners:
+		case <-time.After(time.Second):
+			t.Fatal("remote stream did not start")
+		}
+		hookEntered := make(chan struct{})
+		hookRelease := make(chan struct{})
+		var hookEnteredOnce sync.Once
+		fixture.server.beforeRemoteCaptchaGraceDoneForTest = func() {
+			hookEnteredOnce.Do(func() { close(hookEntered) })
+			<-hookRelease
+		}
+		if err := connection.Close(); err != nil {
+			t.Fatal(err)
+		}
+		_ = fixture.nextGraceTimer(t)
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- fixture.server.Close() }()
+		select {
+		case <-hookEntered:
+		case <-time.After(time.Second):
+			close(hookRelease)
+			t.Fatal("shutdown-canceled grace worker did not reach the pre-done hook")
+		}
+		select {
+		case err := <-closeDone:
+			close(hookRelease)
+			t.Fatalf("shutdown returned before grace worker joined: %v", err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		close(hookRelease)
+		select {
+		case err := <-closeDone:
+			if err != nil {
+				t.Fatalf("shutdown after grace join: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("shutdown did not return after grace worker joined")
+		}
+	})
 }
 
 func TestRemoteCaptchaWebSocketProtocolViolationsFailClosedWithoutGrace(t *testing.T) {

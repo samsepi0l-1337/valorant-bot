@@ -223,6 +223,20 @@ func TestRemoteCaptchaViewerScriptReconnectsAndCoalescesNewestPointerMove(t *tes
 		if (__state.sockets.length !== 2) throw new Error("scheduled reconnect callback did not invoke connect");
 	`)
 
+	retryExpired := newRemoteCaptchaViewerRuntime(t, "")
+	assertRemoteCaptchaViewerJS(t, retryExpired, `
+		__state.sockets[0].listeners.close({code: 1006});
+		const firstRetry = __state.timers.find(timer => !timer.cleared);
+		if (!firstRetry) throw new Error("initial transport loss did not schedule retry");
+		firstRetry.cleared = true;
+		firstRetry.callback();
+		if (__state.sockets.length !== 2) throw new Error("initial retry did not reconnect");
+		__state.wallNow = 1000 + 60001;
+		__state.sockets[1].listeners.close({code: 1006});
+		if (__state.timers.some(timer => !timer.cleared)) throw new Error("retry window expiry scheduled another timer");
+		if (__state.sockets.length !== 2) throw new Error("retry window expiry opened another connection");
+	`)
+
 	pointer := newRemoteCaptchaViewerRuntime(t, "")
 	assertRemoteCaptchaViewerJS(t, pointer, `
 		const move = __state.canvasListeners.pointermove;

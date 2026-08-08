@@ -194,6 +194,9 @@ type Server struct {
 	remoteCaptchaWebSocketTiming  remoteCaptchaWebSocketTiming
 	// Test-only notification after a remote viewer grace timer fires.
 	afterRemoteCaptchaGraceTimerForTest func()
+	// Test-only synchronization immediately before a canceled grace worker
+	// publishes its done signal and leaves the lifecycle wait group.
+	beforeRemoteCaptchaGraceDoneForTest func()
 	// Test-only synchronization seam for the cancellation claim critical section.
 	beforePasswordWaitCancellationClaim func()
 	// Test-only synchronization seam for the retained-browser reaper exit handoff.

@@ -432,6 +432,9 @@ func (s *Server) releaseRemoteCaptchaWebSocket(claim remoteCaptchaWebSocketClaim
 func (s *Server) expireRemoteCaptchaDisconnectGrace(relay *remoteCaptchaRelay, generation uint64, timer <-chan time.Time, graceCtx context.Context, cancelGrace context.CancelFunc, done chan<- struct{}) {
 	defer func() {
 		cancelGrace()
+		if hook := s.beforeRemoteCaptchaGraceDoneForTest; hook != nil {
+			hook()
+		}
 		close(done)
 		s.lifecycleWG.Done()
 	}()
