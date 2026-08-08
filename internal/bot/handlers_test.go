@@ -112,6 +112,8 @@ func (f *fakeAuth) ValidatePasswordMFA(mfaState, discordUserID string) (string, 
 	return f.validateHint, f.validateErr
 }
 
+func (*fakeAuth) CancelPasswordMFA(string, string) error { return nil }
+
 type memAccounts struct {
 	byUser map[string][]store.Account
 }

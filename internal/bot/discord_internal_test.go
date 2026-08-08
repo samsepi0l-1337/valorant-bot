@@ -175,6 +175,36 @@ type consumedAfterSuccessMFAAuth struct {
 	mfaInteractionAuth
 }
 
+type mfaDeliveryAuth struct {
+	mfaInteractionAuth
+	waitMFAState    string
+	waitMFAHint     string
+	waitErr         error
+	cancelErr       error
+	cancelCalls     atomic.Int32
+	cancelSucceeded atomic.Bool
+	cancelMu        sync.Mutex
+	cancelState     string
+	cancelUser      string
+}
+
+func (a *mfaDeliveryAuth) WaitPasswordLogin(context.Context, string) (string, string, string, error) {
+	return "", a.waitMFAState, a.waitMFAHint, a.waitErr
+}
+
+func (a *mfaDeliveryAuth) CancelPasswordMFA(mfaState, discordUserID string) error {
+	a.cancelCalls.Add(1)
+	a.cancelMu.Lock()
+	a.cancelState = mfaState
+	a.cancelUser = discordUserID
+	a.cancelMu.Unlock()
+	if a.cancelErr != nil {
+		return a.cancelErr
+	}
+	a.cancelSucceeded.Store(true)
+	return nil
+}
+
 func (a *consumedAfterSuccessMFAAuth) ValidatePasswordMFA(mfaState, discordUserID string) (string, error) {
 	a.validateCalls.Add(1)
 	if a.completeCalls.Load() != 0 {
@@ -278,6 +308,8 @@ func (a *mfaInteractionAuth) CompletePasswordMFA(_ context.Context, mfaState, di
 	}
 	return a.completeDisplay, a.completeErr
 }
+
+func (*mfaInteractionAuth) CancelPasswordMFA(string, string) error { return nil }
 
 type capturedInteractionResponse struct {
 	Type discordgo.InteractionResponseType `json:"type"`
@@ -623,6 +655,52 @@ func TestCaptchaTerminalEditSuppressesConcurrentReopenStatus(t *testing.T) {
 	}
 }
 
+// Mutation caught: holding captchaEditGuard's mutex while Discord's webhook is
+// blocked violates lock/I/O separation even if the higher-level edit is serialized.
+func TestCaptchaEditDoesNotHoldGuardMutexAcrossDiscordIO(t *testing.T) {
+	requestStarted := make(chan struct{}, 1)
+	releaseRequest := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestStarted <- struct{}{}
+		<-releaseRequest
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(srv.Close)
+	originalWebhookEndpoint := discordgo.EndpointWebhookMessage
+	discordgo.EndpointWebhookMessage = func(_, _, _ string) string { return srv.URL + "/original" }
+	t.Cleanup(func() { discordgo.EndpointWebhookMessage = originalWebhookEndpoint })
+	session, err := discordgo.New("Bot test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handlers{}
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID: "interaction-guard-io", AppID: "application-1", Token: "token-guard-io",
+	}}
+	editDone := make(chan error, 1)
+	go func() {
+		editDone <- h.editCaptchaInteraction(session, interaction, "captcha-state", Response{Content: "terminal"}, true)
+	}()
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		close(releaseRequest)
+		t.Fatal("Discord edit did not start")
+	}
+	guard := h.captchaEditGuard("captcha-state")
+	if !guard.TryLock() {
+		close(releaseRequest)
+		<-editDone
+		t.Fatal("captcha edit guard mutex was held across Discord I/O")
+	}
+	guard.Unlock()
+	close(releaseRequest)
+	if err := <-editDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCaptchaTerminalEditSuppressesLateReopenWatcher(t *testing.T) {
 	waitStarted := make(chan struct{}, 1)
 	waitRelease := make(chan struct{})
@@ -675,6 +753,8 @@ func (*passwordButtonAuth) CompletePasswordMFA(context.Context, string, string, 
 	return "", nil
 }
 
+func (*passwordButtonAuth) CancelPasswordMFA(string, string) error { return nil }
+
 func (a *acknowledgementCheckingAuth) BeginQRAuth(context.Context, string) (string, string, error) {
 	if !a.acknowledged.Load() {
 		a.beginBeforeACK.Store(true)
@@ -723,6 +803,8 @@ func (*acknowledgementCheckingAuth) ValidatePasswordMFA(string, string) (string,
 func (*acknowledgementCheckingAuth) CompletePasswordMFA(context.Context, string, string, string) (string, error) {
 	return "", nil
 }
+
+func (*acknowledgementCheckingAuth) CancelPasswordMFA(string, string) error { return nil }
 
 func TestMFAOpenComponentPassesOwnerToValidation(t *testing.T) {
 	session, responses := newInteractionResponseCapture(t)
@@ -1044,6 +1126,46 @@ func TestMFAModalSubmitAcknowledgesBeforeBlockingCompletion(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("invalid MFA result did not edit the originating message")
 	}
+}
+
+// Mutation caught: holding mfaSubmissionGuard's mutex across Riot completion
+// couples the edit-control lock to external I/O and can block unrelated cleanup.
+func TestMFASubmitDoesNotHoldGuardMutexAcrossRiotIO(t *testing.T) {
+	session, capture := newMFAInteractionCapture(t, nil)
+	completeStarted := make(chan struct{}, 1)
+	completeRelease := make(chan struct{})
+	auth := &mfaInteractionAuth{
+		firstCompleteStarted: completeStarted,
+		firstCompleteRelease: completeRelease,
+		completeErr:          fmt.Errorf("riot response: %w", riot.ErrPasswordInvalidCode),
+	}
+	h := &Handlers{Auth: auth}
+	done := make(chan struct{})
+	go func() {
+		h.onModal(session, mfaModalSubmitInteraction("interaction-mfa-guard-io", "owner-1", "mfa-state-1", "000000"))
+		close(done)
+	}()
+	select {
+	case <-completeStarted:
+	case <-time.After(time.Second):
+		close(completeRelease)
+		t.Fatal("MFA completion did not start")
+	}
+	guard := h.mfaSubmissionGuard("mfa-state-1")
+	if !guard.TryLock() {
+		close(completeRelease)
+		<-done
+		t.Fatal("MFA submission guard mutex was held across Riot I/O")
+	}
+	guard.Unlock()
+	close(completeRelease)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("MFA submit did not finish")
+	}
+	<-capture.responses
+	<-capture.edits
 }
 
 func TestMFAModalWrongOwnerDoesNotEditOwnerMessage(t *testing.T) {
@@ -1386,6 +1508,93 @@ func TestMFATerminalFailureClearsCachedHint(t *testing.T) {
 	}
 	if len(response.Components) != 0 {
 		t.Fatalf("terminal MFA failure exposed retry controls: %#v", response.Components)
+	}
+}
+
+// Mutation caught: omitting owner-bound rollback after a failed terminal edit
+// retains an unreachable MFA continuation; canceling on success, no MFA, or an
+// owner mismatch destroys a continuation that may still be reachable elsewhere.
+func TestPasswordCaptchaWatcherRollsBackOnlyUndeliveredOwnedMFA(t *testing.T) {
+	tests := []struct {
+		name              string
+		failedEdit        bool
+		mfaState          string
+		cancelErr         error
+		wantCancelCalls   int32
+		wantCancelSuccess bool
+		wantLocalState    bool
+	}{
+		{
+			name:              "failed terminal edit cancels owner continuation",
+			failedEdit:        true,
+			mfaState:          "mfa-state-1",
+			wantCancelCalls:   1,
+			wantCancelSuccess: true,
+		},
+		{
+			name:           "successful terminal edit keeps continuation",
+			mfaState:       "mfa-state-1",
+			wantLocalState: true,
+		},
+		{
+			name:       "failed edit without MFA has nothing to cancel",
+			failedEdit: true,
+		},
+		{
+			name:            "wrong owner cannot cancel continuation",
+			failedEdit:      true,
+			mfaState:        "mfa-state-1",
+			cancelErr:       authweb.ErrMFAOwner,
+			wantCancelCalls: 1,
+			wantLocalState:  true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			auth := &mfaDeliveryAuth{
+				waitMFAState: test.mfaState,
+				waitMFAHint:  "a***@example.com",
+				cancelErr:    test.cancelErr,
+			}
+			var session *discordgo.Session
+			if test.failedEdit {
+				session = newFailedOriginalEditSession(t)
+			} else {
+				session, _ = newMFAInteractionCapture(t, nil)
+			}
+			h := &Handlers{Auth: auth}
+			if test.mfaState != "" {
+				h.mfaSubmissionGuard(test.mfaState)
+			}
+			t.Cleanup(func() { _ = h.Shutdown(context.Background()) })
+			interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+				ID: "interaction-mfa-delivery", AppID: "application-1", Token: "token-mfa-delivery",
+				User: &discordgo.User{ID: "owner-1"},
+			}}
+
+			h.watchPasswordCaptcha(context.Background(), session, interaction, "captcha-state", i18n.KO)
+
+			if got := auth.cancelCalls.Load(); got != test.wantCancelCalls {
+				t.Errorf("MFA cancellation calls=%d, want %d", got, test.wantCancelCalls)
+			}
+			if got := auth.cancelSucceeded.Load(); got != test.wantCancelSuccess {
+				t.Errorf("MFA cancellation success=%v, want %v", got, test.wantCancelSuccess)
+			}
+			auth.cancelMu.Lock()
+			cancelState, cancelUser := auth.cancelState, auth.cancelUser
+			auth.cancelMu.Unlock()
+			if test.wantCancelCalls != 0 && (cancelState != test.mfaState || cancelUser != "owner-1") {
+				t.Errorf("MFA cancellation state=%q user=%q", cancelState, cancelUser)
+			}
+			localState := h.mfaHintFor(test.mfaState) != ""
+			h.mfaSubmitMu.Lock()
+			_, guardExists := h.mfaSubmitGuards[test.mfaState]
+			h.mfaSubmitMu.Unlock()
+			localState = localState || guardExists
+			if localState != test.wantLocalState {
+				t.Errorf("cached MFA hint/control retained=%v, want %v", localState, test.wantLocalState)
+			}
+		})
 	}
 }
 

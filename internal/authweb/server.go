@@ -263,6 +263,11 @@ func (s *Server) handleCatcherPing(w http.ResponseWriter, r *http.Request) {
 
 // BeginAuth creates a pending auth state and returns the Discord login button URL.
 func (s *Server) BeginAuth(discordUserID string) (loginURL, state string, err error) {
+	_, lifecycleDone, err := s.beginLifecycleOperation(context.Background())
+	if err != nil {
+		return "", "", err
+	}
+	defer lifecycleDone()
 	state, err = newState()
 	if err != nil {
 		return "", "", err
@@ -271,7 +276,17 @@ func (s *Server) BeginAuth(discordUserID string) (loginURL, state string, err er
 	if err := s.store.PutAuthPending(state, discordUserID, expiresAt); err != nil {
 		return "", "", err
 	}
-	s.setOutcome(state, authOutcome{Done: false})
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_, _, rollbackErr := s.store.TakeAuthPending(state)
+		if rollbackErr != nil {
+			return "", "", errors.Join(ErrServerClosed, fmt.Errorf("rollback pending auth: %w", rollbackErr))
+		}
+		return "", "", ErrServerClosed
+	}
+	s.outcomes[state] = authOutcome{Done: false}
+	s.mu.Unlock()
 	loginURL = s.authBaseURL + "/login?state=" + url.QueryEscape(state)
 	return loginURL, state, nil
 }
@@ -395,6 +410,31 @@ func (s *Server) ValidatePasswordMFA(mfaState, discordUserID string) (hint strin
 		return "", ErrMFAOwner
 	}
 	return formatMFAHint(pending.challenge), nil
+}
+
+// CancelPasswordMFA atomically detaches an owner-bound continuation, cancels
+// its flow, and joins any in-flight submission without holding Server.mu. A
+// missing or already-consumed state is an idempotent success.
+func (s *Server) CancelPasswordMFA(mfaState, discordUserID string) error {
+	mfaState = strings.TrimSpace(mfaState)
+	discordUserID = strings.TrimSpace(discordUserID)
+	s.mu.Lock()
+	pending, ok := s.mfaPending[mfaState]
+	if !ok {
+		s.mu.Unlock()
+		return nil
+	}
+	if pending.discordUserID != discordUserID {
+		s.mu.Unlock()
+		return ErrMFAOwner
+	}
+	delete(s.mfaPending, mfaState)
+	s.mu.Unlock()
+	if pending.flow != nil {
+		pending.flow.cancel()
+		pending.flow.wg.Wait()
+	}
+	return nil
 }
 
 // CompletePasswordMFA finishes a password login after the Discord MFA modal.
@@ -555,6 +595,11 @@ func (s *Server) completePasswordTokens(ctx context.Context, discordUserID strin
 
 // WaitBrowserLogin blocks until the browser OAuth callback completes for state.
 func (s *Server) WaitBrowserLogin(ctx context.Context, state string) (displayName string, err error) {
+	opCtx, lifecycleDone, err := s.beginLifecycleOperation(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer lifecycleDone()
 	ticker := time.NewTicker(s.qrPollInterval)
 	defer ticker.Stop()
 	for {
@@ -568,17 +613,24 @@ func (s *Server) WaitBrowserLogin(ctx context.Context, state string) (displayNam
 			return o.Display, nil
 		}
 		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
+		case <-opCtx.Done():
+			if s.isClosed() {
+				return "", ErrServerClosed
+			}
+			return "", opCtx.Err()
 		case <-ticker.C:
 		}
 	}
 }
 
-func (s *Server) setOutcome(state string, o authOutcome) {
+func (s *Server) setOutcome(state string, o authOutcome) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
 	s.outcomes[state] = o
+	return true
 }
 
 func (s *Server) getOutcome(state string) (authOutcome, bool) {
@@ -602,6 +654,19 @@ func riotAuthorizeURL(state string) string {
 // CompleteFromRedirectURL links a Riot account from an OAuth redirect URL
 // captured when Riot sends the browser to http://localhost/redirect (this bot).
 func (s *Server) CompleteFromRedirectURL(ctx context.Context, state, redirectURL, regionFallback string) (displayName string, err error) {
+	opCtx, lifecycleDone, err := s.beginLifecycleOperation(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer lifecycleDone()
+	displayName, err = s.completeFromRedirectURL(opCtx, state, redirectURL, regionFallback)
+	if err != nil && s.isClosed() {
+		return "", ErrServerClosed
+	}
+	return displayName, err
+}
+
+func (s *Server) completeFromRedirectURL(ctx context.Context, state, redirectURL, regionFallback string) (displayName string, err error) {
 	discordUserID, ok, err := s.store.TakeAuthPending(state)
 	if err != nil {
 		return "", err
@@ -614,7 +679,23 @@ func (s *Server) CompleteFromRedirectURL(ctx context.Context, state, redirectURL
 	if err != nil {
 		return "", err
 	}
-	return s.linkAccount(ctx, discordUserID, accessToken, idToken, "access_token="+accessToken, regionFallback)
+	prepared, err := s.prepareAccountLink(ctx, discordUserID, accessToken, idToken, "access_token="+accessToken, regionFallback)
+	if err != nil {
+		return "", err
+	}
+	// Claim the irreversible commit before Server.closed can advance. Shutdown
+	// joins the enrolled operation, so a commit that wins this boundary may
+	// finish without holding Server.mu across store or notifier I/O.
+	s.mu.Lock()
+	if s.closed || ctx.Err() != nil {
+		s.mu.Unlock()
+		return "", ErrServerClosed
+	}
+	s.mu.Unlock()
+	if err := s.commitAccountLink(prepared); err != nil {
+		return "", err
+	}
+	return prepared.display, nil
 }
 
 type preparedAccountLink struct {
@@ -791,6 +872,13 @@ func setCORS(w http.ResponseWriter) {
 
 func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 	setCORS(w)
+	opCtx, lifecycleDone, lifecycleErr := s.beginLifecycleOperation(r.Context())
+	if lifecycleErr != nil {
+		http.Error(w, lifecycleErr.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	defer lifecycleDone()
+	r = r.WithContext(opCtx)
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
@@ -803,12 +891,20 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	display, err := s.CompleteFromRedirectURL(r.Context(), state, redirectURL, region)
+	display, err := s.completeFromRedirectURL(opCtx, state, redirectURL, region)
 	if err != nil {
+		if s.isClosed() {
+			err = ErrServerClosed
+		}
 		log.Printf("auth callback error: %v", err)
-		s.setOutcome(state, authOutcome{Done: true, OK: false, Error: err.Error()})
+		if !s.setOutcome(state, authOutcome{Done: true, OK: false, Error: err.Error()}) {
+			err = ErrServerClosed
+		}
 		msg := err.Error()
 		code := http.StatusBadRequest
+		if errors.Is(err, ErrServerClosed) {
+			code = http.StatusServiceUnavailable
+		}
 		if strings.Contains(msg, "entitlements") || strings.Contains(msg, "userinfo") || strings.Contains(msg, "player names") {
 			code = http.StatusBadGateway
 		}
@@ -816,7 +912,10 @@ func (s *Server) handleCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.setOutcome(state, authOutcome{Done: true, OK: true, Display: display})
+	if !s.setOutcome(state, authOutcome{Done: true, OK: true, Display: display}) {
+		http.Error(w, ErrServerClosed.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = fmt.Fprintf(w, successHTML, html.EscapeString(display))

@@ -60,6 +60,7 @@ type chromeBrowserController struct {
 	waitErr          error
 	closeDevTools    func(context.Context, string) error
 	terminateProcess func(*os.Process, <-chan struct{}) error
+	waitProcessExit  func(*os.Process, <-chan struct{}, time.Duration) bool
 	removeProfile    func(string, string) error
 	closeMu          sync.Mutex
 	closed           bool
@@ -136,12 +137,10 @@ func startChromeLoggedWithRemove(cmd *exec.Cmd, profileRoot, profileDir string, 
 }
 
 func cleanupFailedChromeLaunch(controller *chromeBrowserController, launchErr error) (captchaBrowserController, error) {
-	removeErr := controller.removeOwnedProfile()
-	if removeErr == nil {
-		controller.closed = true
+	closeErr := controller.Close()
+	if closeErr == nil {
 		return nil, launchErr
 	}
-	closeErr := &captchaBrowserCloseError{ProcessExited: true, Err: removeErr}
 	return controller, errors.Join(launchErr, closeErr)
 }
 
@@ -181,7 +180,11 @@ func (c *chromeBrowserController) close() error {
 	}
 
 	ownedProcess := c.cmd != nil && c.cmd.Process != nil
-	processExited := !ownedProcess || waitForCaptchaProcessExit(c.exited, 0)
+	waitProcessExit := c.waitProcessExit
+	if waitProcessExit == nil {
+		waitProcessExit = waitForCaptchaOwnedProcessExit
+	}
+	processExited := !ownedProcess || waitProcessExit(c.cmd.Process, c.exited, 0)
 	graceful := false
 	if profileErr == nil && ownedProcess && !processExited {
 		ctx, cancel := context.WithTimeout(context.Background(), devToolsCloseTimeout)
@@ -191,7 +194,7 @@ func (c *chromeBrowserController) close() error {
 
 	var terminateErr error
 	if ownedProcess && !processExited {
-		if !graceful || !waitForCaptchaProcessExit(c.exited, chromeExitTimeout) {
+		if !graceful || !waitProcessExit(c.cmd.Process, c.exited, chromeExitTimeout) {
 			terminate := c.terminateProcess
 			if terminate == nil {
 				terminate = terminateCaptchaProcess
@@ -200,7 +203,7 @@ func (c *chromeBrowserController) close() error {
 		}
 	}
 
-	processExited = !ownedProcess || waitForCaptchaProcessExit(c.exited, 0)
+	processExited = !ownedProcess || waitProcessExit(c.cmd.Process, c.exited, 0)
 	if ownedProcess && !processExited && terminateErr == nil {
 		terminateErr = fmt.Errorf("captcha Chrome process did not exit")
 	}

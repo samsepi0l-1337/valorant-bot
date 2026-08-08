@@ -20,6 +20,7 @@ type AuthStarter interface {
 	LaunchPasswordCaptcha(ctx context.Context, state, discordUserID string) error
 	WaitPasswordLogin(ctx context.Context, state string) (displayName, mfaState, mfaHint string, err error)
 	ValidatePasswordMFA(mfaState, discordUserID string) (hint string, err error)
+	CancelPasswordMFA(mfaState, discordUserID string) error
 	CompletePasswordMFA(ctx context.Context, mfaState, discordUserID, code string) (displayName string, err error)
 }
 
@@ -115,15 +116,16 @@ type Handlers struct {
 	mfaSubmitGuards map[string]*mfaSubmissionGuard
 }
 
-type captchaEditGuard struct {
+type interactionEditGuard struct {
 	sync.Mutex
 	terminal bool
+	busy     bool
+	changed  chan struct{}
 }
 
-type mfaSubmissionGuard struct {
-	sync.Mutex
-	terminal bool
-}
+type captchaEditGuard struct{ interactionEditGuard }
+
+type mfaSubmissionGuard struct{ interactionEditGuard }
 
 // Response is a Discord reply shape tests can assert without the gateway.
 type Response struct {

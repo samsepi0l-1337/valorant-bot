@@ -317,6 +317,27 @@ func (h *Handlers) cancelPasswordLogin(state, discordUserID string) {
 	}
 }
 
+func (h *Handlers) cancelPasswordMFA(mfaState, discordUserID string) bool {
+	if h.Auth == nil || strings.TrimSpace(mfaState) == "" {
+		return false
+	}
+	if err := h.Auth.CancelPasswordMFA(mfaState, discordUserID); err != nil {
+		if !errors.Is(err, authweb.ErrMFAOwner) {
+			log.Printf("interaction: cancel MFA continuation: %s", discordRESTErrorLog(err))
+		}
+		return false
+	}
+	h.clearMFAHint(mfaState)
+	h.mfaSubmitMu.Lock()
+	guard := h.mfaSubmitGuards[mfaState]
+	delete(h.mfaSubmitGuards, mfaState)
+	h.mfaSubmitMu.Unlock()
+	if guard != nil {
+		guard.markTerminal()
+	}
+	return true
+}
+
 // HandlePasswordCaptchaComplete builds the Discord reply after browser captcha finishes.
 func (h *Handlers) HandlePasswordCaptchaComplete(display, mfaState, mfaHint string, err error, lang i18n.Lang) Response {
 	if err != nil {

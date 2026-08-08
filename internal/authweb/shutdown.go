@@ -41,6 +41,7 @@ func (s *Server) shutdown() {
 		passwordCleanups []passwordStateCleanup
 		commitStates     []string
 		mfaFlows         []*mfaFlow
+		shutdownErr      error
 		tlsServer        *http.Server
 		tlsListener      net.Listener
 		tlsDone          <-chan struct{}
@@ -71,7 +72,6 @@ func (s *Server) shutdown() {
 		}
 	}
 	clear(s.qrSessions)
-	clear(s.outcomes)
 	tlsServer = s.captchaTLSServer
 	tlsListener = s.captchaTLSListener
 	tlsDone = s.captchaTLSDone
@@ -99,7 +99,6 @@ func (s *Server) shutdown() {
 		s.cleanupPasswordState(state)
 	}
 
-	var shutdownErr error
 	if tlsServer != nil {
 		tlsCtx, cancel := context.WithTimeout(context.Background(), captchaShutdownTimeout)
 		err := tlsServer.Shutdown(tlsCtx)
@@ -128,6 +127,23 @@ func (s *Server) shutdown() {
 	}
 
 	s.lifecycleWG.Wait()
+
+	// Lifecycle enrollment and the closed publication gate make this the final
+	// stable set of legacy browser-auth states. Consume persisted pending rows
+	// outside Server.mu, then leave no in-memory outcome behind.
+	s.mu.Lock()
+	legacyStates := make([]string, 0, len(s.outcomes))
+	for state := range s.outcomes {
+		legacyStates = append(legacyStates, state)
+	}
+	clear(s.outcomes)
+	s.mu.Unlock()
+	for _, state := range legacyStates {
+		if _, _, err := s.store.TakeAuthPending(state); err != nil {
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("rollback pending browser auth: %w", err))
+		}
+	}
+
 	if err := s.retryRetainedCaptchaBrowsers(3); err != nil {
 		shutdownErr = errors.Join(shutdownErr, err)
 	}

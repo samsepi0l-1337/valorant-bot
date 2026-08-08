@@ -172,7 +172,7 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseModal,
 			Data: PasswordLoginModal(lang),
-		}); err != nil {
+		}, discordgo.WithContext(ctx)); err != nil {
 			log.Printf("interaction: password modal: %s", discordRESTErrorLog(err))
 		}
 		return
@@ -183,23 +183,28 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 		if err != nil {
 			h.clearMFAHint(mfaState)
 			if errors.Is(err, authweb.ErrMFAOwner) {
-				if rerr := respondEphemeral(s, i, mfaTerminalMessage(lang, err)); rerr != nil {
+				if rerr := respondEphemeral(ctx, s, i, mfaTerminalMessage(lang, err)); rerr != nil {
 					log.Printf("interaction: mfa validation response: %s", discordRESTErrorLog(rerr))
 				}
 				return
 			}
-			if rerr := deferComponentUpdate(s, i); rerr != nil {
+			if rerr := deferComponentUpdate(ctx, s, i); rerr != nil {
 				log.Printf("interaction: defer stale mfa component: %s", discordRESTErrorLog(rerr))
 				return
 			}
 			lang = h.userLang(userID)
 			guard := h.mfaSubmissionGuard(mfaState)
-			guard.Lock()
-			defer guard.Unlock()
-			if guard.terminal {
+			acquired, guardErr := guard.begin(ctx)
+			if guardErr != nil {
+				log.Printf("interaction: stale mfa guard: %s", discordRESTErrorLog(guardErr))
 				return
 			}
-			if rerr := editInteraction(s, i, Response{
+			if !acquired {
+				return
+			}
+			terminalApplied := false
+			defer func() { guard.finish(terminalApplied) }()
+			if rerr := editInteraction(ctx, s, i, Response{
 				Content:    mfaTerminalMessage(lang, err),
 				Embeds:     []*discordgo.MessageEmbed{},
 				Components: []discordgo.MessageComponent{},
@@ -207,19 +212,19 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 				log.Printf("interaction: stale mfa component edit: %s", discordRESTErrorLog(rerr))
 				return
 			}
-			guard.terminal = true
+			terminalApplied = true
 			return
 		}
 		if err := s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseModal,
 			Data: MFALoginModal(mfaState, hint, lang),
-		}); err != nil {
+		}, discordgo.WithContext(ctx)); err != nil {
 			log.Printf("interaction: mfa modal: %s", discordRESTErrorLog(err))
 		}
 		return
 	}
 	if data.CustomID == customIDAuthQR {
-		if err := deferComponentUpdate(s, i); err != nil {
+		if err := deferComponentUpdate(ctx, s, i); err != nil {
 			log.Printf("interaction: defer qr component: %s", discordRESTErrorLog(err))
 			return
 		}
@@ -227,7 +232,7 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 		resp, qrState, err := h.HandleAuthQR(ctx, userID, lang)
 		if err != nil {
 			log.Printf("interaction: qr component error: %v", err)
-			if rerr := editInteraction(s, i, Response{
+			if rerr := editInteraction(ctx, s, i, Response{
 				Content:    i18n.T(lang, "error.prefix") + err.Error(),
 				Embeds:     []*discordgo.MessageEmbed{},
 				Components: []discordgo.MessageComponent{},
@@ -236,7 +241,7 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 			}
 			return
 		}
-		if rerr := editInteractionWithFiles(s, i, resp); rerr != nil {
+		if rerr := editInteractionWithFiles(ctx, s, i, resp); rerr != nil {
 			log.Printf("interaction: qr component edit failed: %s", discordRESTErrorLog(rerr))
 		}
 		if qrState != "" {
@@ -245,7 +250,7 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 		return
 	}
 	if strings.HasPrefix(data.CustomID, customIDAuthCaptchaPref) {
-		if err := deferComponentUpdate(s, i); err != nil {
+		if err := deferComponentUpdate(ctx, s, i); err != nil {
 			log.Printf("interaction: defer captcha component: %s", discordRESTErrorLog(err))
 			return
 		}
@@ -263,7 +268,7 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 			}
 		}
 		terminal := resp.Components != nil && len(resp.Components) == 0
-		if rerr := h.editCaptchaInteractionThen(s, i, state, resp, terminal, func() {
+		if rerr := h.editCaptchaInteractionThen(ctx, s, i, state, resp, terminal, func() {
 			if launched {
 				h.startPasswordCaptchaWatcher(s, i, state, lang)
 			}
@@ -282,7 +287,7 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 	case strings.HasPrefix(data.CustomID, customIDShopPagePrefix):
 		owner, _, noop, ok := parseShopPageCustomID(data.CustomID)
 		if !ok {
-			_ = updateComponentMessage(s, i, Response{Content: i18n.T(lang, "error.prefix") + "invalid shop navigation"})
+			_ = updateComponentMessage(ctx, s, i, Response{Content: i18n.T(lang, "error.prefix") + "invalid shop navigation"})
 			return
 		}
 		if noop {
@@ -290,7 +295,7 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 		}
 		if owner != userID {
 			resp, _ := h.HandleShopNav(owner, 0, userID, lang)
-			if rerr := respondEphemeralEmbed(s, i, resp); rerr != nil {
+			if rerr := respondEphemeralEmbed(ctx, s, i, resp); rerr != nil {
 				log.Printf("interaction: shop owner response: %s", discordRESTErrorLog(rerr))
 			}
 			return
@@ -298,31 +303,31 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 	case strings.HasPrefix(data.CustomID, customIDWishlistAddPrefix):
 		owner := strings.TrimPrefix(data.CustomID, customIDWishlistAddPrefix)
 		if owner != userID {
-			_ = respondEphemeral(s, i, i18n.T(lang, "wishlist.pick_denied"))
+			_ = respondEphemeral(ctx, s, i, i18n.T(lang, "wishlist.pick_denied"))
 			return
 		}
 		if len(data.Values) == 0 {
-			_ = updateComponentMessage(s, i, Response{Content: i18n.T(lang, "error.prefix") + "no selection"})
+			_ = updateComponentMessage(ctx, s, i, Response{Content: i18n.T(lang, "error.prefix") + "no selection"})
 			return
 		}
 	case strings.HasPrefix(data.CustomID, customIDWishlistRemovePrefix):
 		owner := strings.TrimPrefix(data.CustomID, customIDWishlistRemovePrefix)
 		if owner != userID {
-			_ = respondEphemeral(s, i, i18n.T(lang, "wishlist.pick_denied"))
+			_ = respondEphemeral(ctx, s, i, i18n.T(lang, "wishlist.pick_denied"))
 			return
 		}
 		if len(data.Values) == 0 {
-			_ = updateComponentMessage(s, i, Response{Content: i18n.T(lang, "error.prefix") + "no selection"})
+			_ = updateComponentMessage(ctx, s, i, Response{Content: i18n.T(lang, "error.prefix") + "no selection"})
 			return
 		}
 	case strings.HasPrefix(data.CustomID, customIDChannelTimePrefix):
 		guildID := strings.TrimPrefix(data.CustomID, customIDChannelTimePrefix)
 		if i.GuildID != "" && i.GuildID != guildID {
-			_ = respondEphemeral(s, i, i18n.T(lang, "channel.time_denied"))
+			_ = respondEphemeral(ctx, s, i, i18n.T(lang, "channel.time_denied"))
 			return
 		}
 		if len(data.Values) == 0 {
-			_ = updateComponentMessage(s, i, Response{Content: i18n.T(lang, "error.prefix") + "no selection"})
+			_ = updateComponentMessage(ctx, s, i, Response{Content: i18n.T(lang, "error.prefix") + "no selection"})
 			return
 		}
 	default:
@@ -333,11 +338,11 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 	if strings.HasPrefix(data.CustomID, customIDChannelTimePrefix) {
 		// The channel settings menu is public, so preserve its source and send
 		// the clicker a separate ephemeral result after the database write.
-		deferErr = deferInteraction(s, i, true)
+		deferErr = deferInteraction(ctx, s, i, true)
 	} else {
 		// Shop navigation is public and wishlist menus are already ephemeral;
 		// both should update their originating message.
-		deferErr = deferComponentUpdate(s, i)
+		deferErr = deferComponentUpdate(ctx, s, i)
 	}
 	if deferErr != nil {
 		log.Printf("interaction: defer component: %s", discordRESTErrorLog(deferErr))
@@ -402,7 +407,7 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 
 	if err != nil {
 		log.Printf("interaction: component error: %v", err)
-		_ = editInteraction(s, i, Response{
+		_ = editInteraction(ctx, s, i, Response{
 			Content:    i18n.T(lang, "error.prefix") + err.Error(),
 			Components: []discordgo.MessageComponent{},
 		})
@@ -411,7 +416,7 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 	if !keepComponents {
 		resp.Components = []discordgo.MessageComponent{}
 	}
-	if rerr := editInteraction(s, i, resp); rerr != nil {
+	if rerr := editInteraction(ctx, s, i, resp); rerr != nil {
 		log.Printf("interaction: component update failed: %s", discordRESTErrorLog(rerr))
 	}
 }
@@ -427,7 +432,7 @@ func (h *Handlers) onModalContext(ctx context.Context, s *discordgo.Session, i *
 
 	switch {
 	case data.CustomID == customIDAuthPWModal:
-		if err := deferInteraction(s, i, true); err != nil {
+		if err := deferInteraction(ctx, s, i, true); err != nil {
 			log.Printf("interaction: defer password modal: %s", discordRESTErrorLog(err))
 			return
 		}
@@ -442,7 +447,7 @@ func (h *Handlers) onModalContext(ctx context.Context, s *discordgo.Session, i *
 				Components: []discordgo.MessageComponent{},
 			}
 		}
-		if rerr := editInteraction(s, i, resp); rerr != nil {
+		if rerr := editInteraction(ctx, s, i, resp); rerr != nil {
 			log.Printf("interaction: password captcha edit: %s", discordRESTErrorLog(rerr))
 			if passwordState != "" {
 				h.cancelPasswordLogin(passwordState, userID)
@@ -454,23 +459,28 @@ func (h *Handlers) onModalContext(ctx context.Context, s *discordgo.Session, i *
 			lang := h.cachedUserLang(userID)
 			h.clearMFAHint(mfaState)
 			if errors.Is(err, authweb.ErrMFAOwner) {
-				if rerr := respondEphemeral(s, i, mfaTerminalMessage(lang, err)); rerr != nil {
+				if rerr := respondEphemeral(ctx, s, i, mfaTerminalMessage(lang, err)); rerr != nil {
 					log.Printf("interaction: mfa submit validation response: %s", discordRESTErrorLog(rerr))
 				}
 				return
 			}
-			if rerr := deferComponentUpdate(s, i); rerr != nil {
+			if rerr := deferComponentUpdate(ctx, s, i); rerr != nil {
 				log.Printf("interaction: defer stale mfa modal: %s", discordRESTErrorLog(rerr))
 				return
 			}
 			lang = h.userLang(userID)
 			guard := h.mfaSubmissionGuard(mfaState)
-			guard.Lock()
-			defer guard.Unlock()
-			if guard.terminal {
+			acquired, guardErr := guard.begin(ctx)
+			if guardErr != nil {
+				log.Printf("interaction: stale mfa modal guard: %s", discordRESTErrorLog(guardErr))
 				return
 			}
-			if rerr := editInteraction(s, i, Response{
+			if !acquired {
+				return
+			}
+			terminalApplied := false
+			defer func() { guard.finish(terminalApplied) }()
+			if rerr := editInteraction(ctx, s, i, Response{
 				Content:    mfaTerminalMessage(lang, err),
 				Embeds:     []*discordgo.MessageEmbed{},
 				Components: []discordgo.MessageComponent{},
@@ -478,22 +488,27 @@ func (h *Handlers) onModalContext(ctx context.Context, s *discordgo.Session, i *
 				log.Printf("interaction: stale mfa modal edit: %s", discordRESTErrorLog(rerr))
 				return
 			}
-			guard.terminal = true
+			terminalApplied = true
 			return
 		}
 		guard := h.mfaSubmissionGuard(mfaState)
-		if err := deferComponentUpdate(s, i); err != nil {
+		if err := deferComponentUpdate(ctx, s, i); err != nil {
 			log.Printf("interaction: defer mfa modal: %s", discordRESTErrorLog(err))
 			return
 		}
 		lang := h.userLang(userID)
 		authCtx, cancel := context.WithTimeout(ctx, interactionCallbackTimeout)
 		defer cancel()
-		guard.Lock()
-		defer guard.Unlock()
-		if guard.terminal {
+		acquired, guardErr := guard.begin(authCtx)
+		if guardErr != nil {
+			log.Printf("interaction: mfa submit guard: %s", discordRESTErrorLog(guardErr))
 			return
 		}
+		if !acquired {
+			return
+		}
+		terminalApplied := false
+		defer func() { guard.finish(terminalApplied) }()
 		resp, err := h.HandlePasswordMFA(authCtx, mfaState, userID, modalValue(data, "code"), lang)
 		if err != nil {
 			resp = Response{
@@ -502,12 +517,12 @@ func (h *Handlers) onModalContext(ctx context.Context, s *discordgo.Session, i *
 				Components: []discordgo.MessageComponent{},
 			}
 		}
-		if rerr := editInteraction(s, i, resp); rerr != nil {
+		if rerr := editInteraction(ctx, s, i, resp); rerr != nil {
 			log.Printf("interaction: mfa result edit: %s", discordRESTErrorLog(rerr))
 			return
 		}
 		if len(resp.Components) == 0 {
-			guard.terminal = true
+			terminalApplied = true
 		}
 	default:
 		log.Printf("interaction: ignoring modal %q", data.CustomID)
@@ -553,6 +568,57 @@ func (h *Handlers) mfaSubmissionGuard(state string) *mfaSubmissionGuard {
 	return guard
 }
 
+func (g *interactionEditGuard) begin(ctx context.Context) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		g.Lock()
+		if g.terminal {
+			g.Unlock()
+			return false, nil
+		}
+		if !g.busy {
+			g.busy = true
+			if g.changed == nil {
+				g.changed = make(chan struct{})
+			}
+			g.Unlock()
+			return true, nil
+		}
+		changed := g.changed
+		g.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+}
+
+func (g *interactionEditGuard) finish(terminal bool) {
+	g.Lock()
+	if terminal {
+		g.terminal = true
+	}
+	g.busy = false
+	if g.changed != nil {
+		close(g.changed)
+		g.changed = nil
+	}
+	g.Unlock()
+}
+
+func (g *interactionEditGuard) markTerminal() {
+	g.Lock()
+	g.terminal = true
+	if !g.busy && g.changed != nil {
+		close(g.changed)
+		g.changed = nil
+	}
+	g.Unlock()
+}
+
 func modalValue(data discordgo.ModalSubmitInteractionData, customID string) string {
 	for _, row := range data.Components {
 		actions, ok := row.(*discordgo.ActionsRow)
@@ -581,17 +647,17 @@ func modalValue(data discordgo.ModalSubmitInteractionData, customID string) stri
 	return ""
 }
 
-func respondEphemeral(s *discordgo.Session, i *discordgo.InteractionCreate, content string) error {
+func respondEphemeral(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, content string) error {
 	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
 			Content: content,
 			Flags:   discordgo.MessageFlagsEphemeral,
 		},
-	})
+	}, discordgo.WithContext(ctx))
 }
 
-func respondEphemeralWithComponents(s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
+func respondEphemeralWithComponents(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
 	components := resp.Components
 	if components == nil {
 		components = []discordgo.MessageComponent{}
@@ -603,10 +669,10 @@ func respondEphemeralWithComponents(s *discordgo.Session, i *discordgo.Interacti
 			Components: components,
 			Flags:      discordgo.MessageFlagsEphemeral,
 		},
-	})
+	}, discordgo.WithContext(ctx))
 }
 
-func respondEphemeralEmbed(s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
+func respondEphemeralEmbed(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
 	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{
@@ -614,10 +680,10 @@ func respondEphemeralEmbed(s *discordgo.Session, i *discordgo.InteractionCreate,
 			Embeds:  resp.Embeds,
 			Flags:   discordgo.MessageFlagsEphemeral,
 		},
-	})
+	}, discordgo.WithContext(ctx))
 }
 
-func updateComponentMessage(s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
+func updateComponentMessage(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
 	var embeds *[]*discordgo.MessageEmbed
 	if resp.Embeds != nil {
 		embeds = &resp.Embeds
@@ -634,16 +700,16 @@ func updateComponentMessage(s *discordgo.Session, i *discordgo.InteractionCreate
 			Embeds:     derefEmbeds(embeds),
 			Components: components,
 		},
-	})
+	}, discordgo.WithContext(ctx))
 }
 
-func deferComponentUpdate(s *discordgo.Session, i *discordgo.InteractionCreate) error {
+func deferComponentUpdate(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate) error {
 	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredMessageUpdate,
-	})
+	}, discordgo.WithContext(ctx))
 }
 
-func editInteractionWithFiles(s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
+func editInteractionWithFiles(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
 	components := resp.Components
 	if components == nil {
 		components = []discordgo.MessageComponent{}
@@ -656,7 +722,7 @@ func editInteractionWithFiles(s *discordgo.Session, i *discordgo.InteractionCrea
 		Components:  &components,
 		Files:       resp.Files,
 		Attachments: attachmentsForFiles(resp.Files),
-	})
+	}, discordgo.WithContext(ctx))
 	return err
 }
 
@@ -689,7 +755,7 @@ func (h *Handlers) onAppCommandContext(ctx context.Context, s *discordgo.Session
 
 	// ACK within Discord's 3s window before any DB/network work.
 	ephemeral := commandEphemeral(data.Name)
-	if err := deferInteraction(s, i, ephemeral); err != nil {
+	if err := deferInteraction(ctx, s, i, ephemeral); err != nil {
 		log.Printf("interaction: defer /%s failed: %s", data.Name, discordRESTErrorLog(err))
 		return
 	}
@@ -737,13 +803,13 @@ func (h *Handlers) onAppCommandContext(ctx context.Context, s *discordgo.Session
 		resp, err = h.HandleLanguage(userID, optionString(data.Options, "lang"))
 	default:
 		log.Printf("interaction: ignoring unknown command %q", data.Name)
-		_ = editInteraction(s, i, Response{Content: "Unknown command."})
+		_ = editInteraction(ctx, s, i, Response{Content: "Unknown command."})
 		return
 	}
 
 	if err != nil {
 		log.Printf("interaction: /%s error: %v", data.Name, err)
-		if rerr := editInteraction(s, i, Response{
+		if rerr := editInteraction(ctx, s, i, Response{
 			Content: i18n.T(lang, "error.prefix") + err.Error(),
 		}); rerr != nil {
 			log.Printf("interaction: edit error: %s", discordRESTErrorLog(rerr))
@@ -751,7 +817,7 @@ func (h *Handlers) onAppCommandContext(ctx context.Context, s *discordgo.Session
 		return
 	}
 	resp.Ephemeral = ephemeral
-	if rerr := editInteraction(s, i, resp); rerr != nil {
+	if rerr := editInteraction(ctx, s, i, resp); rerr != nil {
 		log.Printf("interaction: edit /%s failed: %s", data.Name, discordRESTErrorLog(rerr))
 	}
 }
@@ -788,7 +854,7 @@ func (h *Handlers) watchQRLogin(ctx context.Context, s *discordgo.Session, i *di
 	if err != nil {
 		log.Printf("interaction: qr login state=%s: %v", continuationLogValue(state), err)
 	}
-	if rerr := editInteraction(s, i, h.HandleAuthComplete(display, err, lang)); rerr != nil {
+	if rerr := editInteraction(ctx, s, i, h.HandleAuthComplete(display, err, lang)); rerr != nil {
 		log.Printf("interaction: qr login edit failed: %s", discordRESTErrorLog(rerr))
 	}
 }
@@ -830,31 +896,40 @@ func (h *Handlers) watchPasswordCaptcha(ctx context.Context, s *discordgo.Sessio
 		log.Printf("interaction: password captcha state=%s: %v", continuationLogValue(state), err)
 	}
 	resp := h.HandlePasswordCaptchaComplete(display, mfaState, mfaHint, err, lang)
-	if rerr := h.editCaptchaInteraction(s, i, state, resp, true); rerr != nil {
+	if rerr := h.editCaptchaInteractionContext(ctx, s, i, state, resp, true); rerr != nil {
 		log.Printf("interaction: password captcha edit failed: %s", discordRESTErrorLog(rerr))
+		if mfaState != "" {
+			h.cancelPasswordMFA(mfaState, interactionUserID(i))
+		}
 	}
 }
 
 func (h *Handlers) editCaptchaInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, state string, resp Response, terminal bool) error {
-	return h.editCaptchaInteractionThen(s, i, state, resp, terminal, nil)
+	return h.editCaptchaInteractionContext(context.Background(), s, i, state, resp, terminal)
+}
+
+func (h *Handlers) editCaptchaInteractionContext(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, state string, resp Response, terminal bool) error {
+	return h.editCaptchaInteractionThen(ctx, s, i, state, resp, terminal, nil)
 }
 
 // editCaptchaInteractionThen serializes a CAPTCHA edit and its dependent
 // action under the same per-state guard. This prevents a terminal completion
 // from landing between a reopen status edit and watcher enrollment.
-func (h *Handlers) editCaptchaInteractionThen(s *discordgo.Session, i *discordgo.InteractionCreate, state string, resp Response, terminal bool, afterApplied func()) error {
+func (h *Handlers) editCaptchaInteractionThen(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, state string, resp Response, terminal bool, afterApplied func()) error {
 	guard := h.captchaEditGuard(state)
-	guard.Lock()
-	defer guard.Unlock()
-	if guard.terminal {
-		return nil
-	}
-	if err := editInteraction(s, i, resp); err != nil {
+	acquired, err := guard.begin(ctx)
+	if err != nil {
 		return err
 	}
-	if terminal {
-		guard.terminal = true
+	if !acquired {
+		return nil
 	}
+	terminalApplied := false
+	defer func() { guard.finish(terminalApplied) }()
+	if err := editInteraction(ctx, s, i, resp); err != nil {
+		return err
+	}
+	terminalApplied = terminal
 	if afterApplied != nil {
 		afterApplied()
 	}
@@ -906,7 +981,7 @@ func commandEphemeral(name string) bool {
 	}
 }
 
-func deferInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, ephemeral bool) error {
+func deferInteraction(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, ephemeral bool) error {
 	flags := discordgo.MessageFlags(0)
 	if ephemeral {
 		flags = discordgo.MessageFlagsEphemeral
@@ -914,10 +989,10 @@ func deferInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, ephe
 	return s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 		Data: &discordgo.InteractionResponseData{Flags: flags},
-	})
+	}, discordgo.WithContext(ctx))
 }
 
-func editInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
+func editInteraction(ctx context.Context, s *discordgo.Session, i *discordgo.InteractionCreate, resp Response) error {
 	var embeds *[]*discordgo.MessageEmbed
 	if resp.Embeds != nil {
 		embeds = &resp.Embeds
@@ -935,7 +1010,7 @@ func editInteraction(s *discordgo.Session, i *discordgo.InteractionCreate, resp 
 		Components:  components,
 		Files:       resp.Files,
 		Attachments: &[]*discordgo.MessageAttachment{},
-	})
+	}, discordgo.WithContext(ctx))
 	return err
 }
 
