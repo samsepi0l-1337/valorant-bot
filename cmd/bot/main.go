@@ -41,6 +41,7 @@ func botConfig(cfg config.Config) valorantbot.Config {
 		DiscordGuildID:     cfg.DiscordGuildID,
 		BotSecret:          cfg.BotSecret,
 		AuthPort:           cfg.AuthPort,
+		AuthBindAddress:    cfg.AuthBindAddress,
 		AuthBaseURL:        cfg.AuthBaseURL,
 		DatabasePath:       cfg.DatabasePath,
 		StoreResetCron:     cfg.StoreResetCron,

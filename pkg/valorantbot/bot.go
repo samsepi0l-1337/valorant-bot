@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/dosfsociety/valorant-bot/internal/authweb"
 	"github.com/dosfsociety/valorant-bot/internal/bot"
+	appconfig "github.com/dosfsociety/valorant-bot/internal/config"
 	"github.com/dosfsociety/valorant-bot/internal/crypto"
 	"github.com/dosfsociety/valorant-bot/internal/netutil"
 	"github.com/dosfsociety/valorant-bot/internal/riot"
@@ -27,6 +30,7 @@ type Config struct {
 	DiscordGuildID     string
 	BotSecret          string
 	AuthPort           int
+	AuthBindAddress    string
 	AuthBaseURL        string
 	DatabasePath       string
 	StoreResetCron     string
@@ -85,6 +89,11 @@ func New(cfg Config) (*Bot, error) {
 	if cfg.AuthBaseURL == "" {
 		return nil, errors.New("AuthBaseURL is required")
 	}
+	bindAddress, err := appconfig.NormalizeAuthBindAddress(cfg.AuthBindAddress)
+	if err != nil {
+		return nil, err
+	}
+	cfg.AuthBindAddress = bindAddress
 	mode, err := netutil.NormalizeCaptchaBrowserMode(cfg.CaptchaBrowserMode, cfg.AuthBaseURL)
 	if err != nil {
 		return nil, err
@@ -162,7 +171,7 @@ func (b *Bot) Run(ctx context.Context) error {
 	})
 	defer authServer.Close()
 
-	addr := fmt.Sprintf("0.0.0.0:%d", b.cfg.AuthPort)
+	addr := authListenAddress(b.cfg.AuthBindAddress, b.cfg.AuthPort)
 	root := http.NewServeMux()
 	root.Handle("/", authServer.Handler())
 	root.HandleFunc(InvitePath, inviteRedirect(b.cfg.DiscordAppID))
@@ -277,4 +286,8 @@ func (b *Bot) Run(ctx context.Context) error {
 	go func() { handlerDone <- handlers.Shutdown(shutdownCtx) }()
 	go func() { schedulerDone <- schedulerTask.wait(shutdownCtx) }()
 	return errors.Join(<-httpDone, <-handlerDone, <-authDone, <-schedulerDone)
+}
+
+func authListenAddress(bindAddress string, port int) string {
+	return net.JoinHostPort(bindAddress, strconv.Itoa(port))
 }

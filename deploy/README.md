@@ -20,9 +20,16 @@
 
 `remote`에서만 `AUTH_PORT`가 공개 HTTPS 프록시/Cloudflare Tunnel 뒤에 있어야 합니다.
 `AUTH_BASE_URL`은 절대 `https://` 주소여야 하며 userinfo·query·fragment를 넣지 마세요.
+hostname을 권장하며 HTTPS IP 주소는 해당 IP에 유효한 TLS 인증서가 있을 때만 사용합니다.
 Cloudflare Tunnel은 뷰어 HTML, WebSocket 프레임, 검증된 입력만 전달합니다. Riot 페이지는
 Tunnel 아래에 프록시·프레임·재작성되지 않고 Pi Chromium 안에서 Riot의 실제 HTTPS origin으로
 열립니다. Windows/모바일 사용자는 다운로드·확장·인증서·localhost 리스너가 필요 없습니다.
+
+`AUTH_BIND_ADDRESS=127.0.0.1`이 기본이므로 bot의 `AUTH_PORT`는 proxy/tunnel upstream으로만
+수신합니다. LAN 직접 수신이 정말 필요하면 방화벽을 먼저 제한한 후에만 이 값을 LAN 주소나
+`0.0.0.0`으로 명시적으로 바꾸세요. nginx 예제는 WebSocket Upgrade와 `Host $http_host`를
+전달해 non-default port도 보존합니다. 애플리케이션은 `AUTH_BASE_URL`의 정적 host/origin을
+직접 검증하며 `X-Forwarded-*` 헤더로 인증 origin을 선택하지 않습니다.
 
 `local` 비밀번호 로그인은 봇 호스트 GUI 흐름입니다:
 
@@ -98,6 +105,9 @@ Real Arduino boards are not supported deployment targets for this Go bot.
 [`pi-cloudflare-tunnel.md`](pi-cloudflare-tunnel.md)를 따르세요. 빠른 Tunnel URL은
 재시작마다 바뀌므로 테스트용이며, 지속적 Discord 링크에는 이름 있는 Tunnel 또는 소유한
 HTTPS 역방향 프록시를 사용해야 합니다.
+
+QR과 `disabled` 모드는 인바운드 포트·Tunnel이 전혀 필요 없습니다. `remote`에서만 안정적인
+공개 HTTPS `AUTH_BASE_URL`과 WebSocket 지원 Tunnel/프록시가 필요합니다.
 
 Automated tests cover the local flow's state transitions and cleanup; they do
 not demonstrate a successful login against a live Riot account.

@@ -80,8 +80,9 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID
 | `BOT_SECRET`       | 예     | 세션 암호화 키 (**32자 이상**, 스크립트가 생성 가능) |
 | `AUTH_BASE_URL`    | 예     | `/invite` 주소; 원격 모드에서는 정확한 공개 HTTPS 주소 |
 | `AUTH_PORT`        | 아니오 | HTTP 포트 (기본 `8787`)                              |
+| `AUTH_BIND_ADDRESS` | 아니오 | 수신 주소 (기본 `127.0.0.1`)                         |
 | `CAPTCHA_BROWSER_MODE` | 아니오 | `local`(기본), `remote`, `disabled`              |
-| `CAPTCHA_DISPLAY`  | 원격 시 예 | 원격 Chromium 디스플레이 (Pi 기본 `:99`)            |
+| `CAPTCHA_DISPLAY`  | 원격 시 예 | 원격 Chromium 디스플레이 (기본 `:99`)               |
 | `DATABASE_PATH`    | 아니오 | SQLite 경로                                          |
 | `STORE_RESET_CRON` | 아니오 | 레거시 크론 문자열 (일일 시각은 `/channel time`)     |
 
@@ -93,6 +94,10 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID
 안내합니다. `remote`는 봇 호스트의 GUI Chromium 화면을 Discord 사용자의 브라우저로
 중계합니다. 이 경우 `AUTH_BASE_URL`은 쿼리·fragment·사용자 정보가 없는 절대
 `https://` 공개 주소여야 하며, 프록시/터널은 WebSocket을 통과시켜야 합니다.
+공개 DNS hostname을 권장합니다. HTTPS IP 주소를 사용할 수 있는 경우는 그 **IP 주소에 유효한
+TLS 인증서**가 있을 때뿐입니다. `AUTH_BIND_ADDRESS`는 기본 `127.0.0.1`로 유지해 proxy/tunnel
+upstream을 호스트 내부로 제한하세요. 의도적으로 LAN에서 직접 수신해야 할 때만 방화벽 규칙을
+먼저 제한한 뒤 이 값을 LAN 주소 또는 `0.0.0.0`으로 명시적으로 바꿉니다.
 사용자 PC에는 Windows용 다운로드, 확장 프로그램, localhost 리스너가 필요 없습니다.
 Pi 원격 배포는 [`deploy/pi-cloudflare-tunnel.md`](deploy/pi-cloudflare-tunnel.md)를
 따르세요.

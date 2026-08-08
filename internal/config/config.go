@@ -2,8 +2,11 @@ package config
 
 import (
 	"fmt"
+	"net/netip"
 	"os"
 	"strconv"
+	"strings"
+	"unicode"
 
 	"github.com/dosfsociety/valorant-bot/internal/netutil"
 )
@@ -15,6 +18,7 @@ type Config struct {
 	DiscordGuildID     string
 	BotSecret          string
 	AuthPort           int
+	AuthBindAddress    string
 	AuthBaseURL        string
 	DatabasePath       string
 	StoreResetCron     string
@@ -30,6 +34,7 @@ func Load() (Config, error) {
 		DiscordAppID:       os.Getenv("DISCORD_APP_ID"),
 		DiscordGuildID:     os.Getenv("DISCORD_GUILD_ID"),
 		BotSecret:          os.Getenv("BOT_SECRET"),
+		AuthBindAddress:    os.Getenv("AUTH_BIND_ADDRESS"),
 		AuthBaseURL:        os.Getenv("AUTH_BASE_URL"),
 		DatabasePath:       os.Getenv("DATABASE_PATH"),
 		StoreResetCron:     os.Getenv("STORE_RESET_CRON"),
@@ -53,6 +58,11 @@ func Load() (Config, error) {
 	if cfg.AuthBaseURL == "" {
 		return Config{}, fmt.Errorf("AUTH_BASE_URL is required")
 	}
+	bindAddress, err := NormalizeAuthBindAddress(cfg.AuthBindAddress)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.AuthBindAddress = bindAddress
 	mode, err := netutil.NormalizeCaptchaBrowserMode(cfg.CaptchaBrowserMode, cfg.AuthBaseURL)
 	if err != nil {
 		return Config{}, err
@@ -84,4 +94,30 @@ func Load() (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// NormalizeAuthBindAddress accepts only an IP literal or localhost. Keeping
+// resolution out of this setting makes the interface selected at startup
+// explicit; wildcard IPs remain available as an intentional operator override.
+func NormalizeAuthBindAddress(raw string) (string, error) {
+	if raw == "" {
+		return "127.0.0.1", nil
+	}
+	if strings.IndexFunc(raw, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) >= 0 {
+		return "", invalidAuthBindAddressError()
+	}
+	if strings.EqualFold(raw, "localhost") {
+		return "localhost", nil
+	}
+	address, err := netip.ParseAddr(raw)
+	if err != nil {
+		return "", invalidAuthBindAddressError()
+	}
+	return address.String(), nil
+}
+
+func invalidAuthBindAddressError() error {
+	return fmt.Errorf("AUTH_BIND_ADDRESS must be an IP literal or localhost without scheme, port, brackets, whitespace, or control characters")
 }

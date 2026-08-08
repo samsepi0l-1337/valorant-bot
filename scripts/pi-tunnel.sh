@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Optionally expose the bot's AUTH_PORT via a Cloudflare quick tunnel.
-# Password CAPTCHA does not need this tunnel: the Discord button asks the bot
-# process to open Chrome locally. Use a tunnel only for a public /invite page
-# or other AUTH_PORT helpers.
+# Optionally expose the bot's loopback AUTH_PORT via a Cloudflare quick tunnel.
+# In remote CAPTCHA mode this is test-only: persistent use needs a stable public
+# HTTPS AUTH_BASE_URL and a named tunnel/reverse proxy with WebSocket support.
+# QR/disabled mode needs no inbound port or tunnel.
 #
 # Usage (on the Pi, while valorant-bot is already listening on AUTH_PORT):
 #   ./scripts/pi-tunnel.sh
@@ -19,6 +19,12 @@
 set -euo pipefail
 
 PORT="${1:-${AUTH_PORT:-8787}}"
+if [[ -z "${CAPTCHA_BROWSER_MODE:-}" && -e /etc/valorant-bot/remote-captcha.conf ]]; then
+  # The opt-in deployment asset exists only while the remote display drop-in is active.
+  CAPTCHA_MODE=remote
+else
+  CAPTCHA_MODE="${CAPTCHA_BROWSER_MODE:-disabled}"
+fi
 
 if ! command -v cloudflared >/dev/null 2>&1; then
   cat >&2 <<'EOF'
@@ -35,7 +41,13 @@ EOF
 fi
 
 echo "Starting Cloudflare quick tunnel → http://127.0.0.1:${PORT}"
-echo "Optional public /invite URL: copy the https://….trycloudflare.com URL into AUTH_BASE_URL and restart the bot."
+if [[ "$CAPTCHA_MODE" == "remote" ]]; then
+  echo "Remote CAPTCHA mode: this quick tunnel is test-only."
+  echo "Production requires a stable public HTTPS AUTH_BASE_URL and Tunnel/reverse proxy WebSocket support."
+  echo "For this test, copy the printed https://….trycloudflare.com URL into AUTH_BASE_URL and restart the bot."
+else
+  echo "QR/disabled mode needs no inbound port or tunnel; this is optional for /invite only."
+fi
 echo
 
 exec cloudflared tunnel --url "http://127.0.0.1:${PORT}"

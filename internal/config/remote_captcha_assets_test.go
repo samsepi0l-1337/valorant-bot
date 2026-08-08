@@ -111,8 +111,10 @@ func TestRemoteCaptchaScriptsKeepOptInStateDeploymentOwned(t *testing.T) {
 	installer := readDeploymentAsset(t, root, "deploy/install.sh")
 	uninstaller := readDeploymentAsset(t, root, "deploy/uninstall.sh")
 
-	if body := shellFunction(t, setup, "write_env_file"); strings.Contains(body, "CAPTCHA_BROWSER_MODE") || strings.Contains(body, "CAPTCHA_DISPLAY") {
+	if body := shellFunction(t, setup, "write_env_file"); strings.Contains(body, "CAPTCHA_BROWSER_MODE=remote") || strings.Contains(body, "CAPTCHA_DISPLAY") {
 		t.Error("setup-pi writes remote CAPTCHA settings into the base env file")
+	} else if !strings.Contains(body, "CAPTCHA_BROWSER_MODE=disabled") {
+		t.Error("setup-pi base env does not explicitly default to QR-only disabled mode")
 	}
 	for _, script := range []string{setup, installer} {
 		if !strings.Contains(script, "[[ ! -x /usr/bin/Xvfb ]]") {
@@ -147,6 +149,72 @@ func TestRemoteCaptchaScriptsKeepOptInStateDeploymentOwned(t *testing.T) {
 	for _, forbidden := range []string{"userdel valorant", "groupdel valorant", "rm -rf"} {
 		if strings.Contains(uninstaller, forbidden) {
 			t.Errorf("uninstall contains unsafe cleanup %q", forbidden)
+		}
+	}
+}
+
+// Mutation caught: forwarding a rewritten Host, omitting websocket headers on
+// either TLS path, or binding the auth listener broadly breaks the public
+// remote viewer while exposing its private upstream unnecessarily.
+func TestRemoteCaptchaProxyAndPiAssetsKeepRemoteRelayPrivate(t *testing.T) {
+	root := repositoryRoot(t)
+	nginx := readDeploymentAsset(t, root, "deploy/nginx.example.conf")
+	piTunnel := readDeploymentAsset(t, root, "scripts/pi-tunnel.sh")
+	piSetup := readDeploymentAsset(t, root, "scripts/setup-pi.sh")
+	piEnv := readDeploymentAsset(t, root, "deploy/env.pi.example")
+
+	if !strings.Contains(nginx, "map $http_upgrade $connection_upgrade") {
+		t.Error("nginx does not derive a Connection header for websocket upgrades")
+	}
+	if got := strings.Count(nginx, "location /"); got != 2 {
+		t.Fatalf("nginx location count=%d, want HTTP and TLS locations", got)
+	}
+	locations := strings.Split(nginx, "location /")[1:]
+	for index, location := range locations {
+		endMarker := "\n    }"
+		if index == 1 {
+			endMarker = "\n#     }"
+		}
+		if endAt := strings.Index(location, endMarker); endAt >= 0 {
+			location = location[:endAt]
+		} else {
+			t.Fatalf("nginx location %d is unterminated", index+1)
+		}
+		for _, want := range []string{
+			"proxy_http_version 1.1;",
+			"proxy_set_header Host $http_host;",
+			"proxy_set_header Upgrade $http_upgrade;",
+			"proxy_set_header Connection $connection_upgrade;",
+		} {
+			if !strings.Contains(location, want) {
+				t.Errorf("nginx location missing %q", want)
+			}
+		}
+	}
+
+	if got := parseEnvironmentFile(t, piEnv)["CAPTCHA_BROWSER_MODE"]; got != "disabled" {
+		t.Errorf("Pi template CAPTCHA_BROWSER_MODE=%q, want disabled", got)
+	}
+	if got := parseEnvironmentFile(t, piEnv)["AUTH_BIND_ADDRESS"]; got != "127.0.0.1" {
+		t.Errorf("Pi template AUTH_BIND_ADDRESS=%q, want 127.0.0.1", got)
+	}
+	baseEnv := shellFunction(t, piSetup, "write_env_file")
+	for _, want := range []string{
+		"AUTH_BIND_ADDRESS=${AUTH_BIND_ADDRESS:-127.0.0.1}",
+		"CAPTCHA_BROWSER_MODE=disabled",
+	} {
+		if !strings.Contains(baseEnv, want) {
+			t.Errorf("Pi base-env generator missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		"CAPTCHA_BROWSER_MODE",
+		"stable public HTTPS AUTH_BASE_URL",
+		"quick tunnel is test-only",
+		"WebSocket",
+	} {
+		if !strings.Contains(piTunnel, want) {
+			t.Errorf("Pi tunnel output does not distinguish remote relay requirement %q", want)
 		}
 	}
 }

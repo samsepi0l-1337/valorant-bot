@@ -13,6 +13,7 @@ func clearEnv(t *testing.T) {
 		"DISCORD_GUILD_ID",
 		"BOT_SECRET",
 		"AUTH_PORT",
+		"AUTH_BIND_ADDRESS",
 		"AUTH_BASE_URL",
 		"DATABASE_PATH",
 		"STORE_RESET_CRON",
@@ -102,6 +103,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.AuthPort != 8787 {
 		t.Errorf("AuthPort = %d, want 8787", cfg.AuthPort)
 	}
+	if cfg.AuthBindAddress != "127.0.0.1" {
+		t.Errorf("AuthBindAddress = %q, want 127.0.0.1", cfg.AuthBindAddress)
+	}
 	if cfg.AuthBaseURL != "http://192.168.0.50:8787" {
 		t.Errorf("AuthBaseURL = %q", cfg.AuthBaseURL)
 	}
@@ -124,6 +128,7 @@ func TestLoad_Overrides(t *testing.T) {
 	setRequired(t)
 	t.Setenv("DISCORD_GUILD_ID", "guild-99")
 	t.Setenv("AUTH_PORT", "9999")
+	t.Setenv("AUTH_BIND_ADDRESS", "0.0.0.0")
 	t.Setenv("DATABASE_PATH", "/tmp/custom.db")
 	t.Setenv("STORE_RESET_CRON", "0 8 * * *")
 	t.Setenv("CAPTCHA_BROWSER_MODE", "REMOTE")
@@ -139,6 +144,9 @@ func TestLoad_Overrides(t *testing.T) {
 	}
 	if cfg.AuthPort != 9999 {
 		t.Errorf("AuthPort = %d, want 9999", cfg.AuthPort)
+	}
+	if cfg.AuthBindAddress != "0.0.0.0" {
+		t.Errorf("AuthBindAddress = %q, want 0.0.0.0", cfg.AuthBindAddress)
 	}
 	if cfg.DatabasePath != "/tmp/custom.db" {
 		t.Errorf("DatabasePath = %q", cfg.DatabasePath)
@@ -221,5 +229,57 @@ func TestLoad_InvalidAuthPort(t *testing.T) {
 	_, err := Load()
 	if err == nil {
 		t.Fatal("expected error for invalid AUTH_PORT")
+	}
+}
+
+// Mutation caught: trimming malformed values or accepting URL/host:port input
+// can silently broaden the listener beyond the operator's intended interface.
+func TestLoad_ValidatesAndCanonicalizesAuthBindAddress(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "localhost", raw: "LOCALHOST", want: "localhost"},
+		{name: "IPv4 loopback", raw: "127.0.0.1", want: "127.0.0.1"},
+		{name: "IPv4 any", raw: "0.0.0.0", want: "0.0.0.0"},
+		{name: "IPv6 loopback", raw: "::1", want: "::1"},
+		{name: "IPv6 any", raw: "::", want: "::"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			clearEnv(t)
+			setRequired(t)
+			t.Setenv("AUTH_BIND_ADDRESS", test.raw)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.AuthBindAddress != test.want {
+				t.Fatalf("AuthBindAddress = %q, want %q", cfg.AuthBindAddress, test.want)
+			}
+		})
+	}
+}
+
+func TestLoad_RejectsInvalidAuthBindAddress(t *testing.T) {
+	for _, raw := range []string{
+		"http://127.0.0.1",
+		"127.0.0.1:8787",
+		"[::1]",
+		"relay.example.com",
+		" 127.0.0.1",
+		"127.0.0.1 ",
+		"localhost\t",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			clearEnv(t)
+			setRequired(t)
+			t.Setenv("AUTH_BIND_ADDRESS", raw)
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load accepted invalid AUTH_BIND_ADDRESS %q", raw)
+			}
+		})
 	}
 }

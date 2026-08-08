@@ -23,12 +23,18 @@ MFA는 CAPTCHA 뷰어가 아니라 기존 Discord MFA 버튼과 모달로 계속
 ## 사전 조건
 
 1. 공개 DNS 이름과 TLS가 준비된 절대 HTTPS 주소가 필요합니다. 예:
-   `https://valorant-bot.example.com`.
-   `http://`, IP 주소만의 URL, query, fragment, userinfo는 사용할 수 없습니다.
+   `https://valorant-bot.example.com`. hostname을 권장합니다. HTTPS IP 주소는 그 IP 주소에
+   유효한 TLS 인증서가 있을 때만 사용할 수 있습니다. `http://`, query, fragment, userinfo는
+   사용할 수 없습니다.
 2. Tunnel/프록시는 `AUTH_PORT`의 HTTP와 WebSocket Upgrade를 그대로 전달해야 합니다.
 3. Pi 서비스 사용자 `valorant`가 실행할 Chromium과 Xvfb가 있어야 합니다.
 4. 방화벽은 Cloudflare Tunnel을 위한 **아웃바운드** 연결만 허용하면 됩니다. Pi에 80/443
    또는 Xvfb 포트를 열지 마세요.
+
+`AUTH_BIND_ADDRESS=127.0.0.1`이 기본이므로 bot의 `AUTH_PORT`는 Pi 내부에서만 수신합니다.
+의도적인 LAN 직접 수신이 필요한 경우에만 방화벽을 먼저 제한하고 `AUTH_BIND_ADDRESS`를 LAN
+주소 또는 `0.0.0.0`으로 명시적으로 override하세요. remote viewer는 여전히 안정적인 HTTPS
+proxy/Tunnel을 거쳐야 합니다.
 
 Raspberry Pi OS/Debian에서 의존성이 없으면 다음을 한 번 실행합니다.
 
@@ -108,6 +114,8 @@ drop-in을 복사하거나 임의의 display unit 이름을 만들지 말고, �
 ```dotenv
 AUTH_BASE_URL=https://valorant-bot.example.com
 AUTH_PORT=8787
+AUTH_BIND_ADDRESS=127.0.0.1
+CAPTCHA_BROWSER_MODE=disabled
 ```
 
 원격 값은 설치된 `/etc/valorant-bot/remote-captcha.conf`에서 확인합니다.
@@ -141,9 +149,11 @@ sudo journalctl -u valorant-captcha-display.service -u valorant-bot.service -n 1
 지속 운영에는 이름 있는 Tunnel과 소유한 도메인을 사용하고, public hostname의 서비스는
 `http://127.0.0.1:8787`로 지정합니다. Cloudflare 대시보드/`cloudflared` 설정에서 WebSocket
 지원이 꺼지지 않았는지 확인하세요. `AUTH_BASE_URL`의 host는 public hostname과 정확히
-일치해야 합니다.
+일치해야 합니다. 애플리케이션은 이 정적 `AUTH_BASE_URL`의 host/origin을 직접 검증하며,
+`X-Forwarded-*` 헤더를 신뢰해 인증 origin을 선택하지 않습니다.
 
-개발·점검용 quick tunnel은 다음처럼 실행할 수 있습니다.
+개발·점검용 quick tunnel은 다음처럼 실행할 수 있습니다. 설치된 remote deployment asset을
+감지해 remote 모드임을 표시하지만, quick tunnel은 **테스트 전용**입니다.
 
 ```bash
 ./scripts/pi-tunnel.sh 8787
@@ -152,6 +162,7 @@ sudo journalctl -u valorant-captcha-display.service -u valorant-bot.service -n 1
 출력된 `https://…trycloudflare.com` 주소를 `AUTH_BASE_URL`로 쓰고 봇을 재시작합니다.
 quick tunnel 주소는 프로세스를 다시 시작할 때 바뀌므로 지속적인 Discord 링크 origin으로는
 사용하지 마세요. 이 주소가 바뀌면 새 주소로 환경 변수를 수정하고 봇을 재시작해야 합니다.
+QR 또는 `disabled` 모드는 이 tunnel이나 인바운드 포트 없이 동작합니다.
 
 ## 운영 점검
 

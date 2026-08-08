@@ -34,7 +34,8 @@ Chrome/Chromium; headless Pi installations should use Riot Mobile QR.
 
 --remote-captcha is opt-in. It requires Xvfb and Chromium on the Pi and an
 HTTPS AUTH_BASE_URL. Missing packages are reported; this script never installs
-them automatically.
+them automatically. Base Pi installs use CAPTCHA_BROWSER_MODE=disabled (QR
+only); the --remote-captcha drop-in supplies remote mode separately.
 EOF
 }
 
@@ -127,6 +128,8 @@ DISCORD_APP_ID=${DISCORD_APP_ID}
 BOT_SECRET=${secret}
 AUTH_BASE_URL=${auth_base}
 AUTH_PORT=${AUTH_PORT:-8787}
+AUTH_BIND_ADDRESS=${AUTH_BIND_ADDRESS:-127.0.0.1}
+CAPTCHA_BROWSER_MODE=disabled
 DATABASE_PATH=/var/lib/valorant-bot/data/bot.db
 STORE_RESET_CRON=${STORE_RESET_CRON:-0 0 * * *}
 EOF
@@ -179,7 +182,13 @@ if [[ -n "$HOST" ]]; then
 
   echo
   echo "Pi setup complete on $HOST"
-  echo "  AUTH_BASE_URL=${AUTH_BASE_URL}  (/invite only; /auth needs no inbound URL)"
+  if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
+    echo "  remote CAPTCHA: stable public HTTPS AUTH_BASE_URL + WebSocket Tunnel/reverse proxy required"
+    echo "  AUTH_BASE_URL=${AUTH_BASE_URL}"
+  else
+    echo "  CAPTCHA_BROWSER_MODE=disabled (QR only; no inbound port or tunnel needed)"
+    echo "  AUTH_BASE_URL=${AUTH_BASE_URL}  (/invite only)"
+  fi
   echo "  invite: https://discord.com/oauth2/authorize?client_id=${DISCORD_APP_ID}"
   echo "  logs:   ssh $HOST 'sudo journalctl -u valorant-bot -f'"
   exit 0
@@ -214,6 +223,12 @@ rm -f "$ENV_TMP"
 
 echo
 echo "Pi setup complete"
-echo "  AUTH_BASE_URL=${AUTH_BASE_URL}"
+if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
+  echo "  remote CAPTCHA: stable public HTTPS AUTH_BASE_URL + WebSocket Tunnel/reverse proxy required"
+  echo "  AUTH_BASE_URL=${AUTH_BASE_URL}"
+else
+  echo "  CAPTCHA_BROWSER_MODE=disabled (QR only; no inbound port or tunnel needed)"
+  echo "  AUTH_BASE_URL=${AUTH_BASE_URL}  (/invite only)"
+fi
 echo "  invite: https://discord.com/oauth2/authorize?client_id=${DISCORD_APP_ID}"
 echo "  logs:   journalctl -u valorant-bot -f"

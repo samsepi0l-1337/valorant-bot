@@ -12,6 +12,7 @@ func TestNewBotFromConfigPreservesCaptchaBrowserFields(t *testing.T) {
 	_, err := newBotFromConfig(config.Config{
 		CaptchaBrowserMode: "remote",
 		CaptchaDisplay:     ":42",
+		AuthBindAddress:    "::1",
 	}, func(cfg valorantbot.Config) (*valorantbot.Bot, error) {
 		got = cfg
 		return &valorantbot.Bot{}, nil
@@ -24,5 +25,8 @@ func TestNewBotFromConfigPreservesCaptchaBrowserFields(t *testing.T) {
 	}
 	if got.CaptchaDisplay != ":42" {
 		t.Fatalf("CaptchaDisplay = %q, want :42", got.CaptchaDisplay)
+	}
+	if got.AuthBindAddress != "::1" {
+		t.Fatalf("AuthBindAddress = %q, want ::1", got.AuthBindAddress)
 	}
 }
