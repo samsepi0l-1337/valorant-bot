@@ -21,18 +21,7 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	bot, err := valorantbot.New(valorantbot.Config{
-		DiscordToken:       cfg.DiscordToken,
-		DiscordAppID:       cfg.DiscordAppID,
-		DiscordGuildID:     cfg.DiscordGuildID,
-		BotSecret:          cfg.BotSecret,
-		AuthPort:           cfg.AuthPort,
-		AuthBaseURL:        cfg.AuthBaseURL,
-		DatabasePath:       cfg.DatabasePath,
-		StoreResetCron:     cfg.StoreResetCron,
-		CaptchaBrowserMode: cfg.CaptchaBrowserMode,
-		CaptchaDisplay:     cfg.CaptchaDisplay,
-	})
+	bot, err := newBotFromConfig(cfg, valorantbot.New)
 	if err != nil {
 		log.Fatalf("bot: %v", err)
 	}
@@ -43,4 +32,23 @@ func main() {
 	if err := bot.Run(ctx); err != nil {
 		log.Fatalf("run: %v", err)
 	}
+}
+
+func botConfig(cfg config.Config) valorantbot.Config {
+	return valorantbot.Config{
+		DiscordToken:       cfg.DiscordToken,
+		DiscordAppID:       cfg.DiscordAppID,
+		DiscordGuildID:     cfg.DiscordGuildID,
+		BotSecret:          cfg.BotSecret,
+		AuthPort:           cfg.AuthPort,
+		AuthBaseURL:        cfg.AuthBaseURL,
+		DatabasePath:       cfg.DatabasePath,
+		StoreResetCron:     cfg.StoreResetCron,
+		CaptchaBrowserMode: cfg.CaptchaBrowserMode,
+		CaptchaDisplay:     cfg.CaptchaDisplay,
+	}
+}
+
+func newBotFromConfig(cfg config.Config, construct func(valorantbot.Config) (*valorantbot.Bot, error)) (*valorantbot.Bot, error) {
+	return construct(botConfig(cfg))
 }

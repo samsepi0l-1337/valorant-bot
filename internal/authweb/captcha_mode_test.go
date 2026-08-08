@@ -32,6 +32,34 @@ func TestNewStoresRemoteCaptchaBrowserConfig(t *testing.T) {
 	}
 }
 
+func TestRemoteCaptchaLaunchPassesConfiguredDisplay(t *testing.T) {
+	pw := &fakePasswordAuth{}
+	s := New(Deps{
+		AuthBaseURL:        "https://relay.example.com",
+		CaptchaBrowserMode: netutil.CaptchaBrowserRemote,
+		CaptchaDisplay:     ":42",
+		PasswordAuth:       pw,
+		PendingTTL:         time.Minute,
+	})
+	t.Cleanup(func() { _ = s.Close() })
+
+	var gotDisplay string
+	s.launchRemoteCaptchaBrowser = func(_ string, display string) (captchaBrowserController, error) {
+		gotDisplay = display
+		return newTestCaptchaBrowserController(), nil
+	}
+	_, state, err := s.BeginPasswordLogin(context.Background(), "owner-1", "riot-user", "password")
+	if err != nil {
+		t.Fatalf("BeginPasswordLogin: %v", err)
+	}
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
+		t.Fatalf("LaunchPasswordCaptcha: %v", err)
+	}
+	if gotDisplay != ":42" {
+		t.Fatalf("remote CAPTCHA display = %q, want :42", gotDisplay)
+	}
+}
+
 func TestDisabledCaptchaBrowserRejectsPasswordLaunchAndKeepsQRAvailable(t *testing.T) {
 	qr := &mockQRAuth{pollsUntilDone: 1}
 	pw := &fakeBrowserPasswordAuth{

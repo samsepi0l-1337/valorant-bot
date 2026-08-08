@@ -15,6 +15,7 @@ func TestNewNormalizesCaptchaBrowserConfig(t *testing.T) {
 		BotSecret:          "0123456789abcdef0123456789abcdef",
 		AuthBaseURL:        "https://relay.example.com",
 		CaptchaBrowserMode: " ReMoTe ",
+		CaptchaDisplay:     ":42",
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -22,8 +23,8 @@ func TestNewNormalizesCaptchaBrowserConfig(t *testing.T) {
 	if bot.cfg.CaptchaBrowserMode != "remote" {
 		t.Fatalf("CaptchaBrowserMode = %q, want remote", bot.cfg.CaptchaBrowserMode)
 	}
-	if bot.cfg.CaptchaDisplay != ":99" {
-		t.Fatalf("CaptchaDisplay = %q, want :99", bot.cfg.CaptchaDisplay)
+	if bot.cfg.CaptchaDisplay != ":42" {
+		t.Fatalf("CaptchaDisplay = %q, want :42", bot.cfg.CaptchaDisplay)
 	}
 }
 

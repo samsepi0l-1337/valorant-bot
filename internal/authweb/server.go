@@ -158,29 +158,30 @@ type Server struct {
 	mux                *http.ServeMux
 	captchaMux         *http.ServeMux
 
-	mu                       serverMutex
-	closed                   bool
-	lifecycleCtx             context.Context
-	lifecycleCancel          context.CancelFunc
-	lifecycleWG              sync.WaitGroup
-	shutdownOnce             sync.Once
-	shutdownDone             chan struct{}
-	shutdownErr              error
-	outcomes                 map[string]authOutcome
-	qrSessions               map[string]qrPending
-	mfaPending               map[string]mfaPending
-	passwordPending          map[string]passwordPending
-	passwordOutcomes         map[string]passwordOutcome
-	passwordReady            map[string]chan struct{}
-	captchaCloseFailures     map[*passwordFlow]captchaBrowserCloseFailure
-	captchaReaperRunning     bool
-	captchaTLSConfiguredPort int
-	captchaTLSPort           int
-	captchaTLSServer         *http.Server
-	captchaTLSListener       net.Listener
-	captchaTLSServeErr       error
-	captchaTLSDone           chan struct{}
-	launchCaptchaBrowser     func(string) (captchaBrowserController, error)
+	mu                         serverMutex
+	closed                     bool
+	lifecycleCtx               context.Context
+	lifecycleCancel            context.CancelFunc
+	lifecycleWG                sync.WaitGroup
+	shutdownOnce               sync.Once
+	shutdownDone               chan struct{}
+	shutdownErr                error
+	outcomes                   map[string]authOutcome
+	qrSessions                 map[string]qrPending
+	mfaPending                 map[string]mfaPending
+	passwordPending            map[string]passwordPending
+	passwordOutcomes           map[string]passwordOutcome
+	passwordReady              map[string]chan struct{}
+	captchaCloseFailures       map[*passwordFlow]captchaBrowserCloseFailure
+	captchaReaperRunning       bool
+	captchaTLSConfiguredPort   int
+	captchaTLSPort             int
+	captchaTLSServer           *http.Server
+	captchaTLSListener         net.Listener
+	captchaTLSServeErr         error
+	captchaTLSDone             chan struct{}
+	launchCaptchaBrowser       func(string) (captchaBrowserController, error)
+	launchRemoteCaptchaBrowser func(string, string) (captchaBrowserController, error)
 	// Test-only synchronization seam for the cancellation claim critical section.
 	beforePasswordWaitCancellationClaim func()
 	// Test-only synchronization seam for the retained-browser reaper exit handoff.
@@ -216,35 +217,36 @@ func New(d Deps) *Server {
 	}
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 	s := &Server{
-		authBaseURL:              strings.TrimRight(d.AuthBaseURL, "/"),
-		captchaBrowserMode:       mode,
-		captchaDisplay:           display,
-		pendingTTL:               ttl,
-		store:                    d.Store,
-		riot:                     d.Riot,
-		qrAuth:                   d.QRAuth,
-		passwordAuth:             d.PasswordAuth,
-		qrPollInterval:           poll,
-		boxer:                    d.Boxer,
-		onLinked:                 d.OnLinked,
-		mux:                      http.NewServeMux(),
-		captchaMux:               http.NewServeMux(),
-		outcomes:                 make(map[string]authOutcome),
-		qrSessions:               make(map[string]qrPending),
-		mfaPending:               make(map[string]mfaPending),
-		passwordPending:          make(map[string]passwordPending),
-		passwordOutcomes:         make(map[string]passwordOutcome),
-		passwordReady:            make(map[string]chan struct{}),
-		captchaCloseFailures:     make(map[*passwordFlow]captchaBrowserCloseFailure),
-		lifecycleCtx:             lifecycleCtx,
-		lifecycleCancel:          lifecycleCancel,
-		shutdownDone:             make(chan struct{}),
-		captchaTLSConfiguredPort: d.CaptchaTLSPort,
-		launchCaptchaBrowser:     launchSystemChrome,
+		authBaseURL:                strings.TrimRight(d.AuthBaseURL, "/"),
+		captchaBrowserMode:         mode,
+		captchaDisplay:             display,
+		pendingTTL:                 ttl,
+		store:                      d.Store,
+		riot:                       d.Riot,
+		qrAuth:                     d.QRAuth,
+		passwordAuth:               d.PasswordAuth,
+		qrPollInterval:             poll,
+		boxer:                      d.Boxer,
+		onLinked:                   d.OnLinked,
+		mux:                        http.NewServeMux(),
+		captchaMux:                 http.NewServeMux(),
+		outcomes:                   make(map[string]authOutcome),
+		qrSessions:                 make(map[string]qrPending),
+		mfaPending:                 make(map[string]mfaPending),
+		passwordPending:            make(map[string]passwordPending),
+		passwordOutcomes:           make(map[string]passwordOutcome),
+		passwordReady:              make(map[string]chan struct{}),
+		captchaCloseFailures:       make(map[*passwordFlow]captchaBrowserCloseFailure),
+		lifecycleCtx:               lifecycleCtx,
+		lifecycleCancel:            lifecycleCancel,
+		shutdownDone:               make(chan struct{}),
+		captchaTLSConfiguredPort:   d.CaptchaTLSPort,
+		launchCaptchaBrowser:       launchSystemChrome,
+		launchRemoteCaptchaBrowser: launchSystemChromeOnDisplay,
 	}
 	if mode == netutil.CaptchaBrowserRemote {
 		s.launchCaptchaBrowser = func(widgetURL string) (captchaBrowserController, error) {
-			return launchSystemChromeOnDisplay(widgetURL, display)
+			return s.launchRemoteCaptchaBrowser(widgetURL, display)
 		}
 	}
 	if mode == netutil.CaptchaBrowserDisabled {
