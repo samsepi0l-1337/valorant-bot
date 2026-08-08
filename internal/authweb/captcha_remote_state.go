@@ -32,6 +32,7 @@ type remoteCaptchaViewerSessionState struct {
 	flow               *passwordFlow
 	expiresAt          time.Time
 	active             bool
+	relay              *remoteCaptchaRelay
 }
 
 // remoteCaptchaViewer is the authenticated-session lookup seam consumed by
@@ -288,6 +289,9 @@ func (s *Server) finishRemoteCaptchaBindingCleanup(cleanup remoteCaptchaBindingC
 func clearRemoteCaptchaState(pending *passwordPending) {
 	if pending == nil {
 		return
+	}
+	if pending.remoteViewer.relay != nil {
+		pending.remoteViewer.relay.cancel()
 	}
 	pending.remoteGrant = remoteCaptchaGrant{}
 	pending.remoteViewer = remoteCaptchaViewerSessionState{}

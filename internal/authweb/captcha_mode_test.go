@@ -32,7 +32,7 @@ func TestNewStoresRemoteCaptchaBrowserConfig(t *testing.T) {
 	}
 }
 
-func TestRemoteCaptchaLaunchPassesConfiguredDisplay(t *testing.T) {
+func TestRemoteCaptchaLaunchWaitsForAuthenticatedViewer(t *testing.T) {
 	pw := &fakePasswordAuth{}
 	s := New(Deps{
 		AuthBaseURL:        "https://relay.example.com",
@@ -52,11 +52,12 @@ func TestRemoteCaptchaLaunchPassesConfiguredDisplay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginPasswordLogin: %v", err)
 	}
-	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err != nil {
-		t.Fatalf("LaunchPasswordCaptcha: %v", err)
+	if err := s.LaunchPasswordCaptcha(context.Background(), state, "owner-1"); err == nil ||
+		!strings.Contains(err.Error(), "authenticated viewer") {
+		t.Fatalf("LaunchPasswordCaptcha remote error = %v", err)
 	}
-	if gotDisplay != ":42" {
-		t.Fatalf("remote CAPTCHA display = %q, want :42", gotDisplay)
+	if gotDisplay != "" {
+		t.Fatalf("remote CAPTCHA launched before authenticated viewer with display %q", gotDisplay)
 	}
 }
 

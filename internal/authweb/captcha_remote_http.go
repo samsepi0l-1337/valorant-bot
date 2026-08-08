@@ -22,6 +22,7 @@ const (
 func (s *Server) registerRemoteCaptchaHTTPRoutes() {
 	s.mux.HandleFunc("GET /captcha/remote", s.handleRemoteCaptchaViewer)
 	s.mux.HandleFunc("POST /api/auth/captcha/remote/redeem", s.handleRemoteCaptchaRedeem)
+	s.mux.HandleFunc("GET /api/auth/captcha/remote/ws", s.handleRemoteCaptchaWebSocket)
 	s.mux.HandleFunc("POST /api/auth/captcha/remote/cancel", s.handleRemoteCaptchaCancel)
 }
 

@@ -179,6 +179,9 @@ func (s *Server) LaunchPasswordCaptcha(ctx context.Context, state, discordUserID
 	if pending.discordUserID != discordUserID {
 		return ErrCaptchaOwner
 	}
+	if s.captchaBrowserMode == netutil.CaptchaBrowserRemote {
+		return errors.New("remote CAPTCHA starts only after an authenticated viewer connects")
+	}
 	if _, officialBrowser := s.passwordAuth.(browserPasswordAuthClient); !officialBrowser {
 		if err := s.waitCaptchaTLS(3 * time.Second); err != nil {
 			return err
