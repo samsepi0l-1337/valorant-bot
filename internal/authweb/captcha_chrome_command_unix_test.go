@@ -4,6 +4,7 @@ package authweb
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/user"
@@ -16,8 +17,35 @@ import (
 	"time"
 )
 
-const captchaChromeExecTargetEnvironment = "VALORANT_CAPTCHA_CHROME_EXEC_TARGET"
-const captchaChromeExecTargetPGIDFileEnvironment = "VALORANT_CAPTCHA_CHROME_EXEC_TARGET_PGID_FILE"
+var captchaDesktopEnvironmentSafeTestValues = []string{
+	"HOME=/home/security-desktop-test",
+	"USER=security-desktop-test",
+	"LOGNAME=security-desktop-test",
+	"PATH=/security/safe/bin:/usr/bin:/bin",
+	"TMPDIR=/tmp/security-desktop-test",
+	"DISPLAY=:77",
+	"WAYLAND_DISPLAY=wayland-security-test",
+	"XAUTHORITY=/tmp/security-xauthority-test",
+	"DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/security-dbus-test",
+	"XDG_RUNTIME_DIR=/run/user/501-security-test",
+	"LANG=ko_KR.UTF-8",
+	"LC_CTYPE=ko_KR.UTF-8",
+	"__CF_USER_TEXT_ENCODING=0x1F5:0x3:0x33",
+}
+
+var captchaDesktopEnvironmentSecretTestValues = []string{
+	"DISCORD_TOKEN=security-followup-discord-sentinel",
+	"BOT_SECRET=security-followup-bot-sentinel",
+	"RIOT_SECURITY_FOLLOWUP=security-followup-riot-sentinel",
+	"AWS_SECRET_ACCESS_KEY=security-followup-cloud-sentinel",
+	"DATABASE_URL=postgres://security-followup-database-sentinel",
+	"HTTPS_PROXY=http://security-user:security-followup-proxy-sentinel@proxy.invalid",
+	"UNKNOWN_SECURITY_FOLLOWUP=security-followup-unknown-sentinel",
+}
+
+type captchaChromeExecTargetObservation struct {
+	Environment map[string]string `json:"environment"`
+}
 
 func installCaptchaChromeCommandRuntime(t *testing.T, runtime captchaChromeCommandRuntime) {
 	t.Helper()
@@ -28,6 +56,63 @@ func installCaptchaChromeCommandRuntime(t *testing.T, runtime captchaChromeComma
 
 func fakeCaptchaDesktopIdentity() captchaDesktopIdentity {
 	return captchaDesktopIdentity{uid: 501, gid: 20, groups: []int{20, 80}}
+}
+
+// Mutation caught: copying the injected environment wholesale, or filtering
+// only known credential prefixes, exposes arbitrary parent values to the
+// privileged desktop helper.
+func TestDesktopChromeHelperEnvironmentUsesExplicitAllowlist(t *testing.T) {
+	injected := append([]string(nil), captchaDesktopEnvironmentSafeTestValues...)
+	injected = append(injected, captchaDesktopEnvironmentSecretTestValues...)
+	installCaptchaChromeCommandRuntime(t, captchaChromeCommandRuntime{
+		goos:           "linux",
+		effectiveUID:   func() int { return 0 },
+		desktopUser:    func() string { return "security-desktop-test" },
+		executable:     func() (string, error) { return "/opt/valorant-bot", nil },
+		lookupIdentity: func(string) (captchaDesktopIdentity, error) { return fakeCaptchaDesktopIdentity(), nil },
+		desktopEnv:     func(string) []string { return append([]string(nil), injected...) },
+	})
+
+	cmd, err := chromeCommand("/opt/google-chrome", []string{"--incognito"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEnvironmentEntries(t, cmd.Env, captchaDesktopEnvironmentSafeTestValues)
+	assertEnvironmentKeysAbsent(t, cmd.Env, captchaDesktopEnvironmentSecretTestValues)
+	if !environmentContains(cmd.Env, captchaChromeExecEnvironment+"=1") {
+		t.Fatal("owned exec helper marker is absent from helper environment")
+	}
+	if captchaEnvironmentValue(cmd.Env, captchaChromeExecPGIDEnvironment) != "" {
+		t.Fatal("guardian PGID marker was added before process preparation")
+	}
+}
+
+// Mutation caught: restoring desktopEnv's os.Environ copy makes these unique
+// parent sentinels visible before the command-construction boundary.
+func TestDesktopEnvUsesExplicitAllowlist(t *testing.T) {
+	for _, entry := range captchaDesktopEnvironmentSafeTestValues[3:] {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			t.Fatalf("invalid safe test environment key %q", key)
+		}
+		t.Setenv(key, value)
+	}
+	for _, entry := range captchaDesktopEnvironmentSecretTestValues {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			t.Fatalf("invalid secret test environment key %q", key)
+		}
+		t.Setenv(key, value)
+	}
+
+	environment := desktopEnv("security-desktop-test")
+	assertEnvironmentEntries(t, environment, captchaDesktopEnvironmentSafeTestValues[3:])
+	assertEnvironmentKeysAbsent(t, environment, captchaDesktopEnvironmentSecretTestValues)
+	for _, want := range []string{"HOME=/Users/security-desktop-test", "USER=security-desktop-test", "LOGNAME=security-desktop-test"} {
+		if !environmentContains(environment, want) {
+			t.Fatalf("derived desktop identity field %q is absent", strings.SplitN(want, "=", 2)[0])
+		}
+	}
 }
 
 // Mutation caught: restoring the sudo-only Linux root path bypasses the
@@ -89,6 +174,9 @@ func TestChromeCommandDarwinPreservesBootstrapThroughOwnedExecHelper(t *testing.
 }
 
 func TestChromeCommandNonRootLaunchRemainsDirect(t *testing.T) {
+	t.Setenv("PATH", "/security/non-root/bin:/usr/bin:/bin")
+	t.Setenv("DISCORD_TOKEN", "security-followup-non-root-discord-sentinel")
+	t.Setenv("UNKNOWN_SECURITY_FOLLOWUP", "security-followup-non-root-unknown-sentinel")
 	installCaptchaChromeCommandRuntime(t, captchaChromeCommandRuntime{
 		goos:         "linux",
 		effectiveUID: func() int { return 1000 },
@@ -106,6 +194,10 @@ func TestChromeCommandNonRootLaunchRemainsDirect(t *testing.T) {
 	if cmd.Path != "/opt/google-chrome" || len(cmd.Args) != 2 || cmd.Args[1] != "--incognito" {
 		t.Fatalf("non-root Chrome launch was wrapped: path=%q args=%v", cmd.Path, cmd.Args)
 	}
+	if !environmentContains(cmd.Env, "PATH=/security/non-root/bin:/usr/bin:/bin") {
+		t.Fatal("non-root Chrome environment did not preserve the safe PATH field")
+	}
+	assertEnvironmentKeysAbsent(t, cmd.Env, []string{"DISCORD_TOKEN=x", "UNKNOWN_SECURITY_FOLLOWUP=x"})
 }
 
 // Mutation caught: deleting either final PGID verification lets the helper
@@ -163,11 +255,24 @@ func TestCaptchaChromeExecHelperFailsClosedOnFinalGroupMismatch(t *testing.T) {
 
 // This target runs only inside TestChromeCommandOwnedExecHelperRetainsGuardianPGID.
 func TestCaptchaChromeOwnedExecTarget(t *testing.T) {
-	if os.Getenv(captchaChromeExecTargetEnvironment) != "1" {
+	targetArgs := argumentsAfterSeparator(os.Args)
+	if len(targetArgs) != 2 {
 		return
 	}
-	path := os.Getenv(captchaChromeExecTargetPGIDFileEnvironment)
-	if err := os.WriteFile(path, []byte(strconv.Itoa(syscall.Getpgrp())), 0o600); err != nil {
+	if err := os.WriteFile(targetArgs[0], []byte(strconv.Itoa(syscall.Getpgrp())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	observedKeys := environmentKeys(captchaDesktopEnvironmentSafeTestValues, captchaDesktopEnvironmentSecretTestValues)
+	observedKeys = append(observedKeys, captchaChromeExecEnvironment, captchaChromeExecPGIDEnvironment)
+	observation := captchaChromeExecTargetObservation{Environment: make(map[string]string, len(observedKeys))}
+	for _, key := range observedKeys {
+		observation.Environment[key] = os.Getenv(key)
+	}
+	encoded, err := json.Marshal(observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(targetArgs[1], encoded, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(30 * time.Second)
@@ -175,30 +280,39 @@ func TestCaptchaChromeOwnedExecTarget(t *testing.T) {
 
 // Mutation caught: omitting guardian PGID injection or bypassing the helper
 // means the actual final exec target cannot report the prepared guardian PGID.
+// Copying the parent environment, or retaining either internal helper marker,
+// is caught by the same real helper-to-final-exec boundary.
 func TestChromeCommandOwnedExecHelperRetainsGuardianPGID(t *testing.T) {
 	identity := currentCaptchaDesktopIdentity(t)
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
+	root := t.TempDir()
+	targetSafeEnvironment := setCaptchaEnvironment(captchaDesktopEnvironmentSafeTestValues, "TMPDIR", root)
+	for _, entry := range append(append([]string(nil), targetSafeEnvironment...), captchaDesktopEnvironmentSecretTestValues...) {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			t.Fatalf("invalid final target test environment key %q", key)
+		}
+		t.Setenv(key, value)
+	}
 	installCaptchaChromeCommandRuntime(t, captchaChromeCommandRuntime{
 		goos:           "linux",
 		effectiveUID:   func() int { return 0 },
-		desktopUser:    func() string { return "desktop-test" },
+		desktopUser:    func() string { return "security-desktop-test" },
 		executable:     func() (string, error) { return executable, nil },
 		lookupIdentity: func(string) (captchaDesktopIdentity, error) { return identity, nil },
 		desktopEnv:     func(string) []string { return os.Environ() },
 	})
 
-	root := t.TempDir()
 	profileDir := filepath.Join(root, strings.Repeat("8", 32))
 	if err := os.Mkdir(profileDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	pgidFile := filepath.Join(root, "final-pgid")
-	t.Setenv(captchaChromeExecTargetEnvironment, "1")
-	t.Setenv(captchaChromeExecTargetPGIDFileEnvironment, pgidFile)
-	cmd, err := chromeCommand(executable, []string{"-test.run=^TestCaptchaChromeOwnedExecTarget$", "--"})
+	environmentFile := filepath.Join(root, "final-environment.json")
+	cmd, err := chromeCommand(executable, []string{"-test.run=^TestCaptchaChromeOwnedExecTarget$", "--", pgidFile, environmentFile})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,6 +348,30 @@ func TestChromeCommandOwnedExecHelperRetainsGuardianPGID(t *testing.T) {
 	}
 	if gotPGID != cmd.SysProcAttr.Pgid {
 		t.Fatalf("final exec target PGID=%d, want guardian PGID=%d", gotPGID, cmd.SysProcAttr.Pgid)
+	}
+	encodedEnvironment, err := os.ReadFile(environmentFile)
+	if err != nil {
+		t.Fatalf("read final target environment observation: %v", err)
+	}
+	var observation captchaChromeExecTargetObservation
+	if err := json.Unmarshal(encodedEnvironment, &observation); err != nil {
+		t.Fatalf("decode final target environment observation: %v", err)
+	}
+	for _, entry := range targetSafeEnvironment {
+		key, want, _ := strings.Cut(entry, "=")
+		if got := observation.Environment[key]; got != want {
+			t.Fatalf("safe final target environment key %q was not preserved", key)
+		}
+	}
+	for _, key := range environmentKeys(captchaDesktopEnvironmentSecretTestValues) {
+		if observation.Environment[key] != "" {
+			t.Fatalf("forbidden final target environment key %q was preserved", key)
+		}
+	}
+	for _, key := range []string{captchaChromeExecEnvironment, captchaChromeExecPGIDEnvironment} {
+		if observation.Environment[key] != "" {
+			t.Fatalf("internal helper environment key %q reached final target", key)
+		}
 	}
 	if err := controller.Close(); err != nil {
 		t.Fatalf("close owned final-exec target: %v", err)
@@ -276,4 +414,43 @@ func environmentContains(environment []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func assertEnvironmentEntries(t *testing.T, environment, wanted []string) {
+	t.Helper()
+	for _, entry := range wanted {
+		key, _, _ := strings.Cut(entry, "=")
+		if !environmentContains(environment, entry) {
+			t.Fatalf("required environment key %q was not preserved", key)
+		}
+	}
+}
+
+func assertEnvironmentKeysAbsent(t *testing.T, environment, forbidden []string) {
+	t.Helper()
+	for _, key := range environmentKeys(forbidden) {
+		if captchaEnvironmentValue(environment, key) != "" {
+			t.Fatalf("forbidden environment key %q was preserved", key)
+		}
+	}
+}
+
+func environmentKeys(groups ...[]string) []string {
+	var keys []string
+	for _, group := range groups {
+		for _, entry := range group {
+			key, _, _ := strings.Cut(entry, "=")
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func argumentsAfterSeparator(arguments []string) []string {
+	for i, argument := range arguments {
+		if argument == "--" {
+			return arguments[i+1:]
+		}
+	}
+	return nil
 }

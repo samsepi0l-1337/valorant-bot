@@ -75,7 +75,7 @@ func chromeCommand(bin string, args []string) (*exec.Cmd, error) {
 		username = strings.TrimSpace(runtime.desktopUser())
 	}
 	if effectiveUID != 0 || username == "" || username == "root" {
-		return exec.Command(bin, args...), nil
+		return allowlistedCaptchaChromeCommand(bin, args), nil
 	}
 	if runtime.lookupIdentity == nil || runtime.executable == nil {
 		return nil, fmt.Errorf("desktop Chrome identity helper is unavailable")
@@ -103,10 +103,11 @@ func chromeCommand(bin string, args []string) (*exec.Cmd, error) {
 		bin,
 	}
 	helperArgs = append(helperArgs, args...)
-	environment := os.Environ()
+	sourceEnvironment := os.Environ()
 	if runtime.desktopEnv != nil {
-		environment = runtime.desktopEnv(username)
+		sourceEnvironment = runtime.desktopEnv(username)
 	}
+	environment := allowlistedCaptchaDesktopEnvironment(sourceEnvironment)
 	environment = setCaptchaEnvironment(environment, captchaChromeExecEnvironment, "1")
 
 	var cmd *exec.Cmd

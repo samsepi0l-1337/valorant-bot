@@ -614,25 +614,98 @@ func desktopUser() string {
 	return ""
 }
 
+// captchaDesktopEnvironmentKeys is deliberately an exact allowlist. The bot
+// process loads service credentials into its environment, so a root-owned GUI
+// launcher must never derive Chrome's environment by copying all parent values
+// and attempting to remove known secret names.
+var captchaDesktopEnvironmentKeys = []string{
+	// Desktop identity and executable/temp lookup.
+	"HOME",
+	"USER",
+	"LOGNAME",
+	"PATH",
+	"TMPDIR",
+	"TMP",
+	"TEMP",
+
+	// X11, Wayland, desktop-session, and user-session bus discovery.
+	"DISPLAY",
+	"WAYLAND_DISPLAY",
+	"XAUTHORITY",
+	"DBUS_SESSION_BUS_ADDRESS",
+	"XDG_RUNTIME_DIR",
+	"XDG_SESSION_ID",
+	"XDG_SESSION_TYPE",
+	"XDG_SESSION_CLASS",
+	"XDG_CURRENT_DESKTOP",
+	"XDG_SESSION_DESKTOP",
+	"XDG_SEAT",
+	"XDG_VTNR",
+	"DESKTOP_SESSION",
+	"DESKTOP_STARTUP_ID",
+
+	// Standard locale/timezone fields plus the Darwin user text encoding.
+	"LANG",
+	"LANGUAGE",
+	"LC_ALL",
+	"LC_ADDRESS",
+	"LC_COLLATE",
+	"LC_CTYPE",
+	"LC_IDENTIFICATION",
+	"LC_MEASUREMENT",
+	"LC_MESSAGES",
+	"LC_MONETARY",
+	"LC_NAME",
+	"LC_NUMERIC",
+	"LC_PAPER",
+	"LC_TELEPHONE",
+	"LC_TIME",
+	"TZ",
+	"__CF_USER_TEXT_ENCODING",
+}
+
+func allowlistedCaptchaDesktopEnvironment(environment []string) []string {
+	values := make(map[string]string, len(captchaDesktopEnvironmentKeys))
+	allowed := make(map[string]struct{}, len(captchaDesktopEnvironmentKeys))
+	for _, key := range captchaDesktopEnvironmentKeys {
+		allowed[key] = struct{}{}
+	}
+	for _, entry := range environment {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if _, ok := allowed[key]; ok {
+			values[key] = value
+		}
+	}
+	filtered := make([]string, 0, len(values))
+	for _, key := range captchaDesktopEnvironmentKeys {
+		if value, ok := values[key]; ok {
+			filtered = append(filtered, key+"="+value)
+		}
+	}
+	return filtered
+}
+
+func allowlistedCaptchaChromeCommand(bin string, args []string) *exec.Cmd {
+	cmd := exec.Command(bin, args...)
+	cmd.Env = allowlistedCaptchaDesktopEnvironment(os.Environ())
+	return cmd
+}
+
 func desktopEnv(username string) []string {
 	home := filepath.Join("/Users", username)
 	if u, err := user.Lookup(username); err == nil && u.HomeDir != "" {
 		home = u.HomeDir
 	}
-	env := os.Environ()
-	filtered := make([]string, 0, len(env)+4)
-	for _, e := range env {
-		if strings.HasPrefix(e, "HOME=") || strings.HasPrefix(e, "USER=") || strings.HasPrefix(e, "LOGNAME=") {
-			continue
-		}
-		filtered = append(filtered, e)
-	}
-	filtered = append(filtered,
+	sourceEnvironment := append([]string(nil), os.Environ()...)
+	sourceEnvironment = append(sourceEnvironment,
 		"HOME="+home,
 		"USER="+username,
 		"LOGNAME="+username,
 	)
-	return filtered
+	return allowlistedCaptchaDesktopEnvironment(sourceEnvironment)
 }
 
 func chownPath(path, username string) error {
