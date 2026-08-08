@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dop251/goja"
 	"github.com/dosfsociety/valorant-bot/internal/netutil"
 )
 
@@ -194,6 +196,117 @@ func TestRemoteCaptchaHTTPShellCoalescesPointerMoveAtSixtyHertz(t *testing.T) {
 	}
 	if strings.Contains(body, `canvas.addEventListener("pointermove",event=>pointer("move",event))`) {
 		t.Fatal("viewer sends each native pointermove without coalescing")
+	}
+}
+
+// Mutation contract: this executes the exact shipped script, so replacing the
+// reconnect callback with a no-op, changing its delay to zero, or sending every
+// native pointermove makes the assertions below fail. String-presence checks do
+// not prove any of those behaviors.
+func TestRemoteCaptchaViewerScriptReconnectsAndCoalescesNewestPointerMove(t *testing.T) {
+	redeemed := newRemoteCaptchaViewerRuntime(t, "#fragment-secret")
+	assertRemoteCaptchaViewerJS(t, redeemed, `
+		if (__state.historyCalls.length !== 1) throw new Error("fragment was not cleared");
+		if (__state.fetchCalls.length !== 1) throw new Error("fragment grant was not redeemed exactly once");
+		if (__state.sockets.length !== 1) throw new Error("redeemed viewer did not connect");
+	`)
+
+	reloaded := newRemoteCaptchaViewerRuntime(t, "")
+	assertRemoteCaptchaViewerJS(t, reloaded, `
+		if (__state.fetchCalls.length !== 0) throw new Error("hashless cookie reload tried to redeem a grant");
+		if (__state.sockets.length !== 1) throw new Error("hashless cookie reload did not connect");
+		__state.sockets[0].listeners.close({code: 1006});
+		const reconnect = __state.timers.find(timer => !timer.cleared);
+		if (!reconnect) throw new Error("transport close did not schedule reconnect");
+		if (reconnect.delay !== 1000) throw new Error("reconnect delay must be the bounded nonzero 1000ms interval");
+		reconnect.callback();
+		if (__state.sockets.length !== 2) throw new Error("scheduled reconnect callback did not invoke connect");
+	`)
+
+	pointer := newRemoteCaptchaViewerRuntime(t, "")
+	assertRemoteCaptchaViewerJS(t, pointer, `
+		const move = __state.canvasListeners.pointermove;
+		if (typeof move !== "function") throw new Error("pointermove handler missing");
+		const event = clientX => ({clientX, clientY: 25, preventDefault() {}});
+		__state.performanceNow = 0;
+		move(event(10));
+		move(event(20));
+		const firstFlushes = __state.timers.filter(timer => !timer.cleared);
+		if (firstFlushes.length !== 1) throw new Error("pointer moves were not coalesced behind one timer");
+		if (firstFlushes[0].delay < 16) throw new Error("pointer move flush was scheduled below the 60Hz interval");
+		firstFlushes[0].callback();
+		if (__state.sockets[0].sent.length !== 1) throw new Error("coalesced pointer move did not send exactly once");
+		if (JSON.parse(__state.sockets[0].sent[0]).x !== 20) throw new Error("coalescing did not retain the newest pointer move");
+		move(event(30));
+		move(event(40));
+		const secondFlushes = __state.timers.filter(timer => !timer.cleared && timer !== firstFlushes[0]);
+		if (secondFlushes.length !== 1) throw new Error("second pointer burst did not schedule exactly one timer");
+		if (secondFlushes[0].delay < 16) throw new Error("subsequent pointer flush was scheduled below the 60Hz interval");
+		secondFlushes[0].callback();
+		if (__state.sockets[0].sent.length !== 2) throw new Error("second pointer burst did not send exactly once");
+		if (JSON.parse(__state.sockets[0].sent[1]).x !== 40) throw new Error("second burst did not retain newest pointer move");
+	`)
+}
+
+func newRemoteCaptchaViewerRuntime(t *testing.T, hash string) *goja.Runtime {
+	t.Helper()
+	encodedHash, err := json.Marshal(hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := goja.New()
+	harness := `
+		var __state = {
+			canvasListeners: Object.create(null), cancelListeners: Object.create(null),
+			fetchCalls: [], historyCalls: [], sockets: [], timers: [],
+			performanceNow: 0, wallNow: 1000, nextTimer: 1
+		};
+		var __canvas = {
+			width: 1280, height: 900,
+			getContext: function() { return {drawImage: function() {}}; },
+			addEventListener: function(name, listener) { __state.canvasListeners[name] = listener; },
+			getBoundingClientRect: function() { return {left: 0, top: 0, width: 1280, height: 900}; },
+			setPointerCapture: function() {}
+		};
+		var __status = {textContent: ""};
+		var __cancel = {disabled: true, addEventListener: function(name, listener) { __state.cancelListeners[name] = listener; }};
+		var document = {getElementById: function(id) { return id === "viewer" ? __canvas : id === "status" ? __status : __cancel; }};
+		var location = {hash: ` + string(encodedHash) + `, pathname: "/captcha/remote", protocol: "https:", host: "relay.example.com"};
+		var history = {replaceState: function() { __state.historyCalls.push(Array.from(arguments)); location.hash = ""; }};
+		function WebSocket(url) {
+			this.url = url; this.readyState = WebSocket.OPEN; this.binaryType = "";
+			this.listeners = Object.create(null); this.sent = []; __state.sockets.push(this);
+		}
+		WebSocket.OPEN = 1;
+		WebSocket.prototype.addEventListener = function(name, listener) { this.listeners[name] = listener; };
+		WebSocket.prototype.send = function(payload) { this.sent.push(payload); };
+		WebSocket.prototype.close = function() {};
+		async function fetch() { __state.fetchCalls.push(Array.from(arguments)); return {ok: true}; }
+		async function createImageBitmap() { return {width: 1280, height: 900, close: function() {}}; }
+		var performance = {now: function() { return __state.performanceNow; }};
+		var Date = {now: function() { return __state.wallNow; }};
+		function setTimeout(callback, delay) {
+			var timer = {id: __state.nextTimer++, callback: callback, delay: delay, cleared: false};
+			__state.timers.push(timer); return timer.id;
+		}
+		function clearTimeout(id) {
+			var timer = __state.timers.find(function(candidate) { return candidate.id === id; });
+			if (timer) timer.cleared = true;
+		}
+	`
+	if _, err := runtime.RunString(harness); err != nil {
+		t.Fatalf("initialize pure-Go viewer runtime: %v", err)
+	}
+	if _, err := runtime.RunString(remoteCaptchaViewerScript); err != nil {
+		t.Fatalf("execute shipped viewer script: %v", err)
+	}
+	return runtime
+}
+
+func assertRemoteCaptchaViewerJS(t *testing.T, runtime *goja.Runtime, source string) {
+	t.Helper()
+	if _, err := runtime.RunString(source); err != nil {
+		t.Fatalf("shipped viewer behavior: %v", err)
 	}
 }
 

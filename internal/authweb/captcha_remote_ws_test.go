@@ -621,6 +621,14 @@ func TestRemoteCaptchaWebSocketRelaysBinaryFramesAndTypedInput(t *testing.T) {
 
 func TestRemoteCaptchaWebSocketReconnectsSameSessionInsideGraceAndExpiresAfterGrace(t *testing.T) {
 	fixture := newRemoteCaptchaWebSocketFixture(t)
+	wantExpiresAt := fixture.clock.Now().Add(60 * time.Second)
+	fixture.server.mu.Lock()
+	pendingAtStart := fixture.server.passwordPending[fixture.state]
+	if !pendingAtStart.remoteViewer.expiresAt.Equal(wantExpiresAt) {
+		fixture.server.mu.Unlock()
+		t.Fatalf("initial viewer expiresAt=%s, want independent literal %s", pendingAtStart.remoteViewer.expiresAt, wantExpiresAt)
+	}
+	fixture.server.mu.Unlock()
 	first, response, err := fixture.dial(t, fixture.cookie, fixture.origin)
 	if err != nil {
 		t.Fatalf("first dial response=%v err=%v", response, err)
@@ -676,6 +684,10 @@ func TestRemoteCaptchaWebSocketReconnectsSameSessionInsideGraceAndExpiresAfterGr
 	}
 	fixture.server.mu.Lock()
 	pending = fixture.server.passwordPending[fixture.state]
+	if !pending.remoteViewer.expiresAt.Equal(wantExpiresAt) || !pending.remoteViewer.relay.expiresAt.Equal(wantExpiresAt) {
+		fixture.server.mu.Unlock()
+		t.Fatalf("reconnect changed absolute expiry: viewer=%s relay=%s want=%s", pending.remoteViewer.expiresAt, pending.remoteViewer.relay.expiresAt, wantExpiresAt)
+	}
 	if pending.remoteViewer.relay.graceDone != nil || pending.remoteViewer.relay.graceCancel != nil {
 		fixture.server.mu.Unlock()
 		t.Fatal("same-session reconnect retained a stale grace worker")
@@ -732,6 +744,100 @@ func TestRemoteCaptchaWebSocketReconnectsSameSessionInsideGraceAndExpiresAfterGr
 			status = expiryResponse.StatusCode
 		}
 		t.Fatalf("post-grace reconnect status=%d err=%v, want 401", status, expiryErr)
+	}
+}
+
+// Mutation contract: removing stale-grace cancellation/joining, publishing a
+// second timer, or failing to enroll the live grace worker in shutdown makes
+// this bounded churn test fail.
+func TestRemoteCaptchaWebSocketReconnectChurnOwnsOneGraceWorkerAndShutdownDrainsIt(t *testing.T) {
+	fixture := newRemoteCaptchaWebSocketFixture(t)
+	connection, response, err := fixture.dial(t, fixture.cookie, fixture.origin)
+	if err != nil {
+		t.Fatalf("initial dial response=%v err=%v", response, err)
+	}
+	select {
+	case <-fixture.streamOwners:
+	case <-time.After(time.Second):
+		t.Fatal("remote stream did not start")
+	}
+
+	for cycle := 0; cycle < 3; cycle++ {
+		if err := connection.Close(); err != nil {
+			t.Fatal(err)
+		}
+		_ = fixture.nextGraceTimer(t)
+		fixture.server.mu.Lock()
+		pending := fixture.server.passwordPending[fixture.state]
+		staleDone := pending.remoteViewer.relay.graceDone
+		if staleDone == nil || pending.remoteViewer.relay.graceCancel == nil {
+			fixture.server.mu.Unlock()
+			t.Fatalf("cycle %d did not publish exactly one cancelable grace worker", cycle)
+		}
+		fixture.server.mu.Unlock()
+		select {
+		case extra := <-fixture.graceDurations:
+			t.Fatalf("cycle %d published overlapping grace timer %s", cycle, extra)
+		default:
+		}
+
+		connection, response, err = fixture.dial(t, fixture.cookie, fixture.origin)
+		if err != nil {
+			t.Fatalf("cycle %d reconnect response=%v err=%v", cycle, response, err)
+		}
+		select {
+		case <-staleDone:
+		default:
+			t.Fatalf("cycle %d reconnect returned before stale grace worker terminated", cycle)
+		}
+		select {
+		case <-fixture.graceStops:
+		case <-time.After(time.Second):
+			t.Fatalf("cycle %d reconnect did not stop stale grace timer", cycle)
+		}
+		fixture.server.mu.Lock()
+		pending = fixture.server.passwordPending[fixture.state]
+		if pending.remoteViewer.relay.graceDone != nil || pending.remoteViewer.relay.graceCancel != nil {
+			fixture.server.mu.Unlock()
+			t.Fatalf("cycle %d reconnect retained stale grace ownership", cycle)
+		}
+		fixture.server.mu.Unlock()
+	}
+
+	if err := connection.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = fixture.nextGraceTimer(t)
+	fixture.server.mu.Lock()
+	finalDone := fixture.server.passwordPending[fixture.state].remoteViewer.relay.graceDone
+	fixture.server.mu.Unlock()
+	if finalDone == nil {
+		t.Fatal("final disconnect did not publish current grace worker")
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- fixture.server.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("shutdown during disconnect: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not drain the current grace worker")
+	}
+	select {
+	case <-finalDone:
+	default:
+		t.Fatal("shutdown returned before current grace worker terminated")
+	}
+	select {
+	case <-fixture.graceStops:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not stop current grace timer")
+	}
+	select {
+	case extra := <-fixture.graceDurations:
+		t.Fatalf("shutdown published an unexpected grace timer %s", extra)
+	default:
 	}
 }
 
