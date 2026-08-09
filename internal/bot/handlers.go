@@ -36,27 +36,36 @@ const (
 	customIDAuthMFAOpenPref       = "auth:mfaopen:"
 )
 
-// HandleAuth returns the dual auth chooser: Riot Mobile QR or Discord modal ID login.
+// HandleAuth returns the configured auth chooser. Disabled password auth
+// exposes Riot Mobile QR only.
 func (h *Handlers) HandleAuth(ctx context.Context, discordUserID string, lang i18n.Lang) (Response, error) {
 	_ = ctx
 	_ = discordUserID
+	passwordEnabled := h.Auth != nil && h.Auth.PasswordLoginEnabled()
+	contentKey := "auth.choose"
+	if !passwordEnabled {
+		contentKey = "auth.choose.qr_only"
+	}
+	buttons := []discordgo.MessageComponent{
+		discordgo.Button{
+			Label:    i18n.T(lang, "auth.choose.qr"),
+			Style:    discordgo.PrimaryButton,
+			CustomID: customIDAuthQR,
+		},
+	}
+	if passwordEnabled {
+		buttons = append(buttons, discordgo.Button{
+			Label:    i18n.T(lang, "auth.choose.password"),
+			Style:    discordgo.SecondaryButton,
+			CustomID: customIDAuthPassword,
+		})
+	}
 	return Response{
 		Ephemeral: true,
-		Content:   i18n.T(lang, "auth.choose"),
+		Content:   i18n.T(lang, contentKey),
 		Components: []discordgo.MessageComponent{
 			discordgo.ActionsRow{
-				Components: []discordgo.MessageComponent{
-					discordgo.Button{
-						Label:    i18n.T(lang, "auth.choose.qr"),
-						Style:    discordgo.PrimaryButton,
-						CustomID: customIDAuthQR,
-					},
-					discordgo.Button{
-						Label:    i18n.T(lang, "auth.choose.password"),
-						Style:    discordgo.SecondaryButton,
-						CustomID: customIDAuthPassword,
-					},
-				},
+				Components: buttons,
 			},
 		},
 	}, nil
@@ -245,6 +254,13 @@ func (h *Handlers) handlePasswordLogin(ctx context.Context, discordUserID, usern
 	}
 	captchaURL, state, err := h.Auth.BeginPasswordLogin(ctx, discordUserID, username, password)
 	if err != nil {
+		if errors.Is(err, authweb.ErrPasswordLoginDisabled) {
+			return Response{
+				Ephemeral:  true,
+				Content:    i18n.T(lang, "auth.password.disabled"),
+				Components: []discordgo.MessageComponent{},
+			}, "", false, nil
+		}
 		errText := strings.ToLower(err.Error())
 		if strings.Contains(errText, "chrome") || strings.Contains(errText, "chromium") {
 			return Response{

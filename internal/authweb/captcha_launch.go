@@ -74,6 +74,16 @@ type chromeBrowserController struct {
 	removeProfile    func(string, string) error
 	closeMu          sync.Mutex
 	closed           bool
+
+	riotCaptchaMu                     sync.Mutex
+	riotCaptchaReady                  chan struct{}
+	riotCaptchaReadyOnce              sync.Once
+	riotCaptchaPublished              bool
+	riotCaptchaSurface                riotCaptchaSurface
+	riotCaptchaSurfaceErr             error
+	beforeRiotCaptchaReadyWaitForTest func()
+	riotCaptchaCurtainMu              sync.Mutex
+	riotCaptchaCurtainSession         string
 }
 
 // captchaProcessOwnership makes group disappearance monotonic for one

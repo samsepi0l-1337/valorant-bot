@@ -19,7 +19,13 @@
 | `disabled` | 비밀번호 CAPTCHA를 거절하고 QR 안내 | QR만 사용 |
 
 `remote`에서만 `AUTH_PORT`가 공개 HTTPS 프록시/Cloudflare Tunnel 뒤에 있어야 합니다.
-`AUTH_BASE_URL`은 절대 `https://` 주소여야 하며 userinfo·query·fragment를 넣지 마세요.
+`AUTH_BASE_URL`은 host가 비어 있지 않은 단 하나의 절대 `https://` origin이어야 합니다.
+userinfo·query·fragment·공백·제어문자와 `/` 외의 path를 넣지 마세요. 설치 스크립트는
+서비스·사용자·파일을 변경하기 전에 이 형식을 검사하고, 런타임에서는 애플리케이션의
+canonicalizer가 다시 권위 있게 검증합니다.
+`setup-pi.sh --host`는 build/scp 전에 sudo 암호 입력용 원격 TTY를 유지한 일회성 Python
+validator로 대상의 기존 `/etc/valorant-bot/env`를 읽습니다. 검사기는 대상에 설치되지 않으며,
+기존 origin이 caller 값과 정확히 다르면 어느 값도 출력하지 않고 중단합니다.
 hostname을 권장하며 HTTPS IP 주소는 해당 IP에 유효한 TLS 인증서가 있을 때만 사용합니다.
 Cloudflare Tunnel은 뷰어 HTML, WebSocket 프레임, 검증된 입력만 전달합니다. Riot 페이지는
 Tunnel 아래에 프록시·프레임·재작성되지 않고 Pi Chromium 안에서 Riot의 실제 HTTPS origin으로
@@ -52,14 +58,13 @@ nor the bot opens a localhost callback server.
 | `AUTH_PORT` (8787) | `/invite`, 원격 모드의 HTTPS 프록시 upstream |
 | 80                 | unused                                    |
 
-### Raspberry Pi and server authentication
+### Raspberry Pi와 서버 인증
 
-The GUI password flow is supported on macOS and Linux. Windows, headless Pi,
-VPS, and Docker deployments should use Riot Mobile QR. The default `systemd`
-deployment is deliberately a non-login `valorant` user
-service. It has no desktop session or display configuration, so it cannot open
-GUI Chrome even on a GUI-equipped Pi/server. Use Riot Mobile QR with the
-default service; headless Pi, VPS, and Docker deployments support QR only.
+기본 `systemd` 배포는 비로그인 `valorant` 사용자와 `disabled` 모드로 실행되므로 Riot
+Mobile QR을 사용합니다. headless Pi에서 `--remote-captcha`를 명시하면 별도 Xvfb와
+Chromium 중계가 활성화되어 비밀번호 CAPTCHA도 사용할 수 있습니다. Xvfb가 시작되지
+않더라도 soft `Wants=` 의존성 덕분에 봇과 QR은 계속 실행되고, 원격 비밀번호 방식만
+실패 닫힘 처리됩니다. HTTPS/Xvfb/Chromium을 준비하지 않는 VPS·Docker는 QR을 사용하세요.
 
 To test or use password login on a GUI-equipped host, run a second, foreground
 instance only from the account that is currently logged into the desktop. Do
@@ -118,6 +123,9 @@ not demonstrate a successful login against a live Riot account.
 - `valorant-bot.service` — unit file
 - `remote-captcha.conf` — 원격 모드 전용 환경 파일 (설치 시 base env와 분리)
 - `valorant-captcha-display.service` — private Xvfb display unit
+- `valorant-captcha-display.tmpfiles` — private outer auth dir와 root-sticky nested socket dir
+- `prepare-captcha-display-auth` — 부팅/서비스 시작마다 X11 cookie를 만드는 helper
+- `validate-remote-captcha-origin.py` — 설치 변경 전 원격 HTTPS origin 검사기
 - `nginx.example.conf` — optional reverse proxy
 - `env.*.example` — environment templates
 - `../scripts/pi-tunnel.sh` — Cloudflare quick tunnel (원격 CAPTCHA 테스트 또는 `/invite`)

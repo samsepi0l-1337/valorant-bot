@@ -24,10 +24,11 @@ MFA는 CAPTCHA 뷰어가 아니라 기존 Discord MFA 버튼과 모달로 계속
 
 1. 공개 DNS 이름과 TLS가 준비된 절대 HTTPS 주소가 필요합니다. 예:
    `https://valorant-bot.example.com`. hostname을 권장합니다. HTTPS IP 주소는 그 IP 주소에
-   유효한 TLS 인증서가 있을 때만 사용할 수 있습니다. `http://`, query, fragment, userinfo는
-   사용할 수 없습니다.
+   유효한 TLS 인증서가 있을 때만 사용할 수 있습니다. host는 비어 있으면 안 되고,
+   `http://`, query, fragment, userinfo, 공백·제어문자, `/` 외의 path는 사용할 수 없습니다.
 2. Tunnel/프록시는 `AUTH_PORT`의 HTTP와 WebSocket Upgrade를 그대로 전달해야 합니다.
-3. Pi 서비스 사용자 `valorant`가 실행할 Chromium과 Xvfb가 있어야 합니다.
+3. Pi 서비스 사용자 `valorant`가 실행할 Chromium, Xvfb, `xauth`, `mcookie`와 설치 전
+   origin 검사에 쓰는 Python 3가 있어야 합니다.
 4. 방화벽은 Cloudflare Tunnel을 위한 **아웃바운드** 연결만 허용하면 됩니다. Pi에 80/443
    또는 Xvfb 포트를 열지 마세요.
 
@@ -39,8 +40,7 @@ proxy/Tunnel을 거쳐야 합니다.
 Raspberry Pi OS/Debian에서 의존성이 없으면 다음을 한 번 실행합니다.
 
 ```bash
-sudo apt update
-sudo apt install xvfb chromium
+sudo apt-get update && sudo apt-get install -y xvfb chromium xauth util-linux python3
 ```
 
 배포 스크립트의 원격 옵션은 의존성을 자동 설치하지 않습니다. 패키지를 설치한 뒤 다시
@@ -61,33 +61,17 @@ sudo AUTH_BASE_URL=https://valorant-bot.example.com \
 ### 기존 설치 마이그레이션
 
 이미 설치된 Pi는 `setup-pi.sh`를 실행하기 **전에** base 환경 파일의
-`AUTH_BASE_URL`을 선택한 공개 HTTPS origin으로 바꿉니다. 아래 명령은 기존 줄을 한 번만
-교체하고, 줄이 없을 때만 하나를 추가합니다. 나머지 환경 값·파일 권한은 유지합니다.
-`https://valorant-bot.example.com`을 운영 origin으로 바꾸되, query, fragment, userinfo,
-공백, `|`, `&`, `\` 문자를 넣지 마세요.
+`AUTH_BASE_URL`을 선택한 공개 HTTPS origin으로 바꿉니다. 먼저 저장소에 포함된 검사기로
+값을 검증한 뒤 `sudoedit`로 기존 줄을 정확히 한 줄만 수정하세요. 나머지 환경 값·파일
+권한은 유지됩니다. 설치 프로그램도 실제로 사용할 환경 파일에 `AUTH_BASE_URL`이 정확히
+한 번만 있는지 확인하고, 모든 설치·systemd 변경 전에 같은 형식 검사를 다시 수행합니다.
 
 ```bash
 CAPTCHA_AUTH_BASE_URL='https://valorant-bot.example.com'
-case "$CAPTCHA_AUTH_BASE_URL" in
-  https://|*'?'*|*'#'*|*'@'*|*' '*|*'|'*|*'&'*|*'\'*)
-    echo 'AUTH_BASE_URL must be an absolute HTTPS origin without userinfo, query, or fragment' >&2
-    exit 1
-    ;;
-  https://*) ;;
-  *)
-    echo 'AUTH_BASE_URL must start with https://' >&2
-    exit 1
-    ;;
-esac
-
-if sudo grep -q '^AUTH_BASE_URL=' /etc/valorant-bot/env; then
-  sudo sed -i "s|^AUTH_BASE_URL=.*$|AUTH_BASE_URL=${CAPTCHA_AUTH_BASE_URL}|" /etc/valorant-bot/env
-else
-  printf 'AUTH_BASE_URL=%s\n' "$CAPTCHA_AUTH_BASE_URL" | sudo tee -a /etc/valorant-bot/env >/dev/null
-fi
+python3 ./deploy/validate-remote-captcha-origin.py "$CAPTCHA_AUTH_BASE_URL"
+sudoedit /etc/valorant-bot/env
+sudo AUTH_BASE_URL="$CAPTCHA_AUTH_BASE_URL" ./scripts/setup-pi.sh --remote-captcha
 unset CAPTCHA_AUTH_BASE_URL
-
-sudo ./scripts/setup-pi.sh --remote-captcha
 ```
 
 마이그레이션 명령 자체는 서비스를 재시작하지 않습니다. 마지막 설치 명령이 원격 display
@@ -101,8 +85,13 @@ sudo ./scripts/setup-pi.sh --remote-captcha
 2. 설치 프로그램이 별도로 생성하는
    `/etc/systemd/system/valorant-bot.service.d/remote-captcha.conf`는
    systemd **drop-in**입니다. 이것이 원격 환경 파일을 읽고,
-   `valorant-captcha-display.service`를 `Requires=`/`After=`로 연결하며,
-   private X11 Unix socket의 bind mount를 두 서비스에 공유합니다.
+   `valorant-captcha-display.service`를 `Wants=`/`After=`로 연결하며,
+   root-sticky nested X11 Unix socket 디렉터리만 두 PrivateTmp namespace에 bind합니다.
+   bot 쪽 bind는 source가 없으면 무시하는 systemd `-` prefix를 사용하므로 display 준비
+   실패가 QR-capable bot의 시작 실패로 전파되지 않습니다. Xauthority는 별도의 outer
+   `/run` 경로에 유지됩니다.
+   `Requires=`를 사용하지 않으므로 Xvfb가 실패해도 bot과 Riot Mobile QR은 계속 동작하고,
+   원격 비밀번호 CAPTCHA만 지역화된 오류로 실패 닫힘 처리됩니다.
 
 따라서 `--remote-captcha`는 기본 `/etc/valorant-bot/env`에 원격 모드를 쓰지 않습니다.
 그 파일은 공용 봇 설정만, 원격 환경 파일은 원격 display 설정만 가집니다. 수동으로
@@ -123,13 +112,16 @@ CAPTCHA_BROWSER_MODE=disabled
 ```dotenv
 CAPTCHA_BROWSER_MODE=remote
 CAPTCHA_DISPLAY=:99
+XAUTHORITY=/run/valorant-captcha-display/Xauthority
 ```
 
 Xvfb를 먼저 시작하고 봇을 재시작합니다.
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now valorant-captcha-display.service
+sudo systemctl enable valorant-captcha-display.service valorant-bot.service
+sudo systemctl start valorant-captcha-display.service || \
+  echo 'Xvfb 시작 실패: 원격 비밀번호 CAPTCHA는 사용할 수 없지만 QR은 계속 사용 가능'
 sudo systemctl restart valorant-bot.service
 sudo systemctl status valorant-captcha-display.service valorant-bot.service --no-pager
 ```
@@ -140,9 +132,14 @@ sudo systemctl status valorant-captcha-display.service valorant-bot.service --no
 sudo journalctl -u valorant-captcha-display.service -u valorant-bot.service -n 100 --no-pager
 ```
 
-`valorant-captcha-display.service`는 `valorant` 사용자 소유의 `:99` 화면을 만들고, TCP listen을
-비활성화합니다. Chromium 및 Xvfb가 없거나 HTTPS 설정이 유효하지 않으면 원격 비밀번호
-로그인은 실패 닫힘으로 처리되고 QR은 계속 사용할 수 있습니다.
+`valorant-captcha-display.service`는 outer `/run/valorant-captcha-display`를
+`valorant:valorant` mode `0700`으로 유지합니다. Xtrans가 요구하는 socket 디렉터리는 그
+아래 `X11-unix`이며 `root:root` mode `01777`입니다. 두 서비스는 이 nested 디렉터리만
+`/tmp/.X11-unix`로 bind하고 TCP listen을 비활성화합니다. 서비스가 시작될 때마다
+`mcookie`로 새 MIT-MAGIC-COOKIE-1을 만들며, Xvfb의 정확한 `-auth` 파일과 Chromium의
+`XAUTHORITY`는 outer 디렉터리의 같은 mode `0600` 파일을 가리킵니다. cookie 값은 출력하거나
+로그에 남기지 않습니다. Chromium·Xvfb·X11 인증 또는 HTTPS 설정이 유효하지 않으면 원격
+비밀번호 로그인은 실패 닫힘으로 처리되고 QR은 계속 사용할 수 있습니다.
 
 ## Cloudflare Tunnel
 
@@ -172,7 +169,7 @@ QR 또는 `disabled` 모드는 이 tunnel이나 인바운드 포트 없이 동�
 sudo systemctl is-active valorant-captcha-display.service
 sudo systemctl is-active valorant-bot.service
 sudo grep -E '^(AUTH_BASE_URL|AUTH_PORT)=' /etc/valorant-bot/env
-sudo grep -E '^(CAPTCHA_BROWSER_MODE|CAPTCHA_DISPLAY)=' /etc/valorant-bot/remote-captcha.conf
+sudo grep -E '^(CAPTCHA_BROWSER_MODE|CAPTCHA_DISPLAY|XAUTHORITY)=' /etc/valorant-bot/remote-captcha.conf
 ```
 
 Discord의 같은 사용자가 받은 링크를 외부 브라우저에서 열어 CAPTCHA 프레임과 클릭/휠이
@@ -192,6 +189,13 @@ sudo systemctl stop valorant-bot.service
 sudo systemctl disable --now valorant-captcha-display.service
 sudo rm -f /etc/systemd/system/valorant-bot.service.d/remote-captcha.conf
 sudo rm -f /etc/valorant-bot/remote-captcha.conf
+sudo rm -f /etc/systemd/system/valorant-captcha-display.service
+sudo rm -f /etc/tmpfiles.d/valorant-captcha-display.conf
+sudo rm -f /usr/local/libexec/valorant-bot/prepare-captcha-display-auth
+sudo rmdir /usr/local/libexec/valorant-bot 2>/dev/null || true
+sudo rm -f /run/valorant-captcha-display/Xauthority
+sudo rmdir /run/valorant-captcha-display/X11-unix 2>/dev/null || true
+sudo rmdir /run/valorant-captcha-display 2>/dev/null || true
 sudo sed -i '/^CAPTCHA_BROWSER_MODE=/d; /^CAPTCHA_DISPLAY=/d' /etc/valorant-bot/env
 printf 'CAPTCHA_BROWSER_MODE=disabled\n' | sudo tee -a /etc/valorant-bot/env >/dev/null
 sudo systemctl daemon-reload

@@ -40,7 +40,62 @@ type Config struct {
 
 // Bot is the Valorant Discord store bot.
 type Bot struct {
-	cfg Config
+	cfg     Config
+	runtime botRuntime
+}
+
+// botRuntime keeps the process-bound operations behind narrow function seams.
+// Production uses the concrete adapters below; lifecycle tests replace only
+// external boundaries and continue exercising Bot.Run itself. The Discord
+// session is always passed by pointer because discordgo.Session owns mutexes.
+type botRuntime struct {
+	listen                func(network, address string) (net.Listener, error)
+	fetchClientVersion    func(context.Context) (string, error)
+	ensureSkinCacheLoaded func(context.Context, *skins.Cache) error
+	newDiscordSession     func(token string) (*discordgo.Session, error)
+	registerHandlers      func(*discordgo.Session, *bot.Handlers)
+	openDiscord           func(*discordgo.Session) error
+	closeDiscord          func(*discordgo.Session) error
+	startScheduler        func(context.Context, *scheduler.Scheduler, string) error
+	shutdownHTTP          func(*http.Server, context.Context) error
+	closeHTTP             func(*http.Server) error
+	shutdownHandlers      func(*bot.Handlers, context.Context) error
+	closeHandlers         func(*bot.Handlers)
+	shutdownAuth          func(*authweb.Server, context.Context) error
+	closeAuth             func(*authweb.Server) error
+	closeStore            func(*store.Store) error
+}
+
+func defaultBotRuntime() botRuntime {
+	return botRuntime{
+		listen:             net.Listen,
+		fetchClientVersion: func(ctx context.Context) (string, error) { return riot.FetchClientVersion(ctx, nil) },
+		ensureSkinCacheLoaded: func(ctx context.Context, cache *skins.Cache) error {
+			return cache.EnsureLoaded(ctx, skins.LangKO)
+		},
+		newDiscordSession: func(token string) (*discordgo.Session, error) {
+			return discordgo.New(token)
+		},
+		registerHandlers: bot.RegisterHandlers,
+		openDiscord:      func(session *discordgo.Session) error { return session.Open() },
+		closeDiscord:     func(session *discordgo.Session) error { return session.Close() },
+		startScheduler: func(ctx context.Context, scheduler *scheduler.Scheduler, cronExpr string) error {
+			return scheduler.Start(ctx, cronExpr)
+		},
+		shutdownHTTP: func(server *http.Server, ctx context.Context) error { return server.Shutdown(ctx) },
+		closeHTTP:    func(server *http.Server) error { return server.Close() },
+		shutdownHandlers: func(handlers *bot.Handlers, ctx context.Context) error {
+			return handlers.Shutdown(ctx)
+		},
+		closeHandlers: func(handlers *bot.Handlers) {
+			_ = handlers.Shutdown(context.Background())
+		},
+		shutdownAuth: func(server *authweb.Server, ctx context.Context) error {
+			return server.Shutdown(ctx)
+		},
+		closeAuth:  func(server *authweb.Server) error { return server.Close() },
+		closeStore: func(st *store.Store) error { return st.Close() },
+	}
 }
 
 type trackedScheduler struct {
@@ -108,22 +163,77 @@ func New(cfg Config) (*Bot, error) {
 	if cfg.CaptchaDisplay == "" {
 		cfg.CaptchaDisplay = ":99"
 	}
-	return &Bot{cfg: cfg}, nil
+	return &Bot{cfg: cfg, runtime: defaultBotRuntime()}, nil
 }
 
 // Run starts the Discord bot, auth HTTP server, daily scheduler, and supporting services.
 func (b *Bot) Run(ctx context.Context) error {
+	runtime := b.runtime
+	if runtime.listen == nil {
+		runtime = defaultBotRuntime()
+	}
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+
 	lock, err := acquireInstanceLock(b.cfg.DatabasePath)
 	if err != nil {
 		return err
 	}
 	defer lock.Close()
 
+	addr := authListenAddress(b.cfg.AuthBindAddress, b.cfg.AuthPort)
+	listener, err := runtime.listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("auth http listen %s: %w", addr, err)
+	}
+	listenerTransferred := false
+	defer func() {
+		if !listenerTransferred {
+			_ = listener.Close()
+		}
+	}()
+
 	st, err := store.Open(b.cfg.DatabasePath)
 	if err != nil {
 		return fmt.Errorf("store: %w", err)
 	}
-	defer st.Close()
+
+	var (
+		authServer    *authweb.Server
+		handlers      *bot.Handlers
+		httpSrv       *http.Server
+		dg            *discordgo.Session
+		discordOpen   bool
+		schedulerTask *trackedScheduler
+	)
+	// A scheduler that outlives the bounded shutdown still joins before the
+	// HTTP, interaction, auth, Discord, and store dependencies disappear.
+	defer func() {
+		closeRuntimeAfterScheduler(
+			schedulerTask,
+			func() {
+				if httpSrv != nil {
+					_ = runtime.closeHTTP(httpSrv)
+				}
+			},
+			func() {
+				if handlers != nil {
+					runtime.closeHandlers(handlers)
+				}
+			},
+			func() {
+				if authServer != nil {
+					_ = runtime.closeAuth(authServer)
+				}
+			},
+			func() {
+				if discordOpen {
+					_ = runtime.closeDiscord(dg)
+				}
+			},
+			func() { _ = runtime.closeStore(st) },
+		)
+	}()
 
 	boxer, err := crypto.NewBoxer(b.cfg.BotSecret)
 	if err != nil {
@@ -131,24 +241,24 @@ func (b *Bot) Run(ctx context.Context) error {
 	}
 
 	riotClient := riot.NewClient(nil)
-	if ver, err := riot.FetchClientVersion(ctx, nil); err != nil {
+	if ver, err := runtime.fetchClientVersion(runCtx); err != nil {
 		log.Printf("riot client version: using default (%v)", err)
 	} else {
 		riotClient.ClientVersion = ver
 		log.Printf("riot client version: %s", ver)
 	}
 	skinCache := skins.NewCache(nil, "")
-	if err := skinCache.EnsureLoaded(ctx, skins.LangKO); err != nil {
+	if err := runtime.ensureSkinCacheLoaded(runCtx, skinCache); err != nil {
 		log.Printf("skins cache: load failed (shop names may be limited): %v", err)
 	}
 
-	dg, err := discordgo.New("Bot " + b.cfg.DiscordToken)
+	dg, err = runtime.newDiscordSession("Bot " + b.cfg.DiscordToken)
 	if err != nil {
 		return fmt.Errorf("discord session: %w", err)
 	}
 	dg.Identify.Intents = discordgo.IntentsGuilds | discordgo.IntentsGuildMessages
 
-	authServer := authweb.New(authweb.Deps{
+	authServer = authweb.New(authweb.Deps{
 		AuthBaseURL:        b.cfg.AuthBaseURL,
 		CaptchaBrowserMode: netutil.CaptchaBrowserMode(b.cfg.CaptchaBrowserMode),
 		CaptchaDisplay:     b.cfg.CaptchaDisplay,
@@ -169,22 +279,14 @@ func (b *Bot) Run(ctx context.Context) error {
 			}
 		},
 	})
-	defer authServer.Close()
 
-	addr := authListenAddress(b.cfg.AuthBindAddress, b.cfg.AuthPort)
 	root := http.NewServeMux()
 	root.Handle("/", authServer.Handler())
 	root.HandleFunc(InvitePath, inviteRedirect(b.cfg.DiscordAppID))
-	httpSrv := &http.Server{
+	httpSrv = &http.Server{
 		Addr:    addr,
 		Handler: root,
 	}
-	defer httpSrv.Close()
-	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("auth http: %v", err)
-		}
-	}()
 	warnIfLoopbackAuthBase(b.cfg.AuthBaseURL, b.cfg.AuthPort)
 
 	shopFetcher := &bot.ShopFetcher{
@@ -193,7 +295,7 @@ func (b *Bot) Run(ctx context.Context) error {
 		Riot:     riotClient,
 		Skins:    skinCache,
 	}
-	handlers := &bot.Handlers{
+	handlers = &bot.Handlers{
 		Auth:     authServer,
 		Accounts: st,
 		Shops:    shopFetcher,
@@ -202,16 +304,19 @@ func (b *Bot) Run(ctx context.Context) error {
 		Guilds:   st,
 		Lang:     st,
 	}
-	bot.RegisterHandlers(dg, handlers)
+	runtime.registerHandlers(dg, handlers)
 
 	cmds := bot.Commands()
 	appID := b.cfg.DiscordAppID
 
 	registerGuildCmds := func(s *discordgo.Session, guildID string) {
-		if guildID == "" {
+		if guildID == "" || runCtx.Err() != nil {
 			return
 		}
-		if _, err := s.ApplicationCommandBulkOverwrite(appID, guildID, cmds); err != nil {
+		if _, err := s.ApplicationCommandBulkOverwrite(appID, guildID, cmds, discordgo.WithContext(runCtx)); err != nil {
+			if runCtx.Err() != nil {
+				return
+			}
 			log.Printf("register commands for guild %s: %v", guildID, err)
 			return
 		}
@@ -222,27 +327,33 @@ func (b *Bot) Run(ctx context.Context) error {
 		registerGuildCmds(s, g.ID)
 	})
 
-	if err := dg.Open(); err != nil {
+	if err := runtime.openDiscord(dg); err != nil {
 		return fmt.Errorf("discord open: %w", err)
 	}
-	// A scheduler that outlives the bounded shutdown still joins before the
-	// HTTP, interaction, auth, Discord, and store dependencies disappear.
-	var schedulerTask *trackedScheduler
-	defer func() {
-		closeRuntimeAfterScheduler(
-			schedulerTask,
-			func() { _ = httpSrv.Close() },
-			func() { _ = handlers.Shutdown(context.Background()) },
-			func() { _ = authServer.Close() },
-			func() { _ = dg.Close() },
-		)
+	discordOpen = true
+
+	serveDone := make(chan error, 1)
+	listenerTransferred = true
+	go func() {
+		serveDone <- httpSrv.Serve(listener)
+		// Serve owns and closes the listener. Any return before the parent asks
+		// us to stop is terminal, so abort context-aware startup work at once.
+		cancelRun()
 	}()
 
 	// Clear global commands so they don't duplicate guild-scoped ones.
-	if _, err := dg.ApplicationCommandBulkOverwrite(appID, "", []*discordgo.ApplicationCommand{}); err != nil {
+	if _, err := dg.ApplicationCommandBulkOverwrite(
+		appID,
+		"",
+		[]*discordgo.ApplicationCommand{},
+		discordgo.WithContext(runCtx),
+	); err != nil && runCtx.Err() == nil {
 		log.Printf("clear global commands: %v", err)
 	}
 	for _, g := range dg.State.Guilds {
+		if runCtx.Err() != nil {
+			break
+		}
 		registerGuildCmds(dg, g.ID)
 	}
 
@@ -259,21 +370,36 @@ func (b *Bot) Run(ctx context.Context) error {
 		Channels:  poster,
 		DMs:       poster,
 	}
-	schedulerTask = startTrackedScheduler(func() error {
-		err := sched.Start(ctx, cronExpr)
-		if errors.Is(err, context.Canceled) {
-			return nil
-		}
-		if err != nil {
-			log.Printf("scheduler: %v", err)
-		}
-		return err
-	})
+	var runErr error
+	intendedShutdown := false
+	select {
+	case <-ctx.Done():
+		intendedShutdown = true
+	case serveErr := <-serveDone:
+		runErr = unexpectedHTTPServeError(serveErr)
+	default:
+		schedulerTask = startTrackedScheduler(func() error {
+			err := runtime.startScheduler(runCtx, sched, cronExpr)
+			if runCtx.Err() != nil && errors.Is(err, runCtx.Err()) {
+				return nil
+			}
+			if err != nil {
+				log.Printf("scheduler: %v", err)
+			}
+			return err
+		})
 
-	log.Printf("valorant-bot running (auth %s, discord connected, daily schedule Asia/Seoul hourly)", addr)
-	log.Print(formatInviteLog(appID, b.cfg.AuthBaseURL))
+		log.Printf("valorant-bot running (auth %s, discord connected, daily schedule Asia/Seoul hourly)", addr)
+		log.Print(formatInviteLog(appID, b.cfg.AuthBaseURL))
 
-	<-ctx.Done()
+		select {
+		case <-ctx.Done():
+			intendedShutdown = true
+		case serveErr := <-serveDone:
+			runErr = unexpectedHTTPServeError(serveErr)
+		}
+	}
+	cancelRun()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -281,11 +407,29 @@ func (b *Bot) Run(ctx context.Context) error {
 	authDone := make(chan error, 1)
 	handlerDone := make(chan error, 1)
 	schedulerDone := make(chan error, 1)
-	go func() { httpDone <- httpSrv.Shutdown(shutdownCtx) }()
-	go func() { authDone <- authServer.Shutdown(shutdownCtx) }()
-	go func() { handlerDone <- handlers.Shutdown(shutdownCtx) }()
-	go func() { schedulerDone <- schedulerTask.wait(shutdownCtx) }()
-	return errors.Join(<-httpDone, <-handlerDone, <-authDone, <-schedulerDone)
+	go func() { httpDone <- runtime.shutdownHTTP(httpSrv, shutdownCtx) }()
+	go func() { authDone <- runtime.shutdownAuth(authServer, shutdownCtx) }()
+	go func() { handlerDone <- runtime.shutdownHandlers(handlers, shutdownCtx) }()
+	if schedulerTask == nil {
+		schedulerDone <- nil
+	} else {
+		go func() { schedulerDone <- schedulerTask.wait(shutdownCtx) }()
+	}
+	shutdownErr := errors.Join(<-httpDone, <-handlerDone, <-authDone, <-schedulerDone)
+	if intendedShutdown {
+		serveErr := <-serveDone
+		if !errors.Is(serveErr, http.ErrServerClosed) {
+			runErr = unexpectedHTTPServeError(serveErr)
+		}
+	}
+	return errors.Join(runErr, shutdownErr)
+}
+
+func unexpectedHTTPServeError(err error) error {
+	if err == nil {
+		return errors.New("auth http serve: stopped unexpectedly")
+	}
+	return fmt.Errorf("auth http serve: %w", err)
 }
 
 func authListenAddress(bindAddress string, port int) string {

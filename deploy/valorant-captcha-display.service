@@ -7,10 +7,13 @@ Before=valorant-bot.service
 Type=simple
 User=valorant
 Group=valorant
-# The installer-owned tmpfiles entry prepares this root:root 1777 directory.
-# It is bind-mounted into both PrivateTmp namespaces as the X11 Unix socket.
-BindPaths=/run/valorant-captcha-display:/tmp/.X11-unix
-ExecStart=/usr/bin/Xvfb :99 -screen 0 1280x900x24 -nolisten tcp
+# tmpfiles keeps the outer Xauthority directory valorant-only and prepares a
+# nested root-owned sticky directory that satisfies Xtrans. Only the nested
+# socket directory is bind-mounted over this service's private /tmp path.
+BindPaths=/run/valorant-captcha-display/X11-unix:/tmp/.X11-unix
+ExecStartPre=/usr/local/libexec/valorant-bot/prepare-captcha-display-auth
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1280x900x24 -nolisten tcp -auth /run/valorant-captcha-display/Xauthority
+ExecStopPost=/usr/bin/rm -f /run/valorant-captcha-display/Xauthority
 Restart=on-failure
 RestartSec=5
 

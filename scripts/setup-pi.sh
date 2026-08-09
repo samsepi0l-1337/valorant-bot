@@ -17,6 +17,9 @@ ARCH="arm64"
 YES=0
 SKIP_START=0
 REMOTE_CAPTCHA=0
+REMOTE_CAPTCHA_ORIGIN_VALIDATOR="${ROOT}/deploy/validate-remote-captcha-origin.py"
+LOCAL_SETUP_TMP_DIR=""
+REMOTE_SETUP_TMP_DIR=""
 
 usage() {
   cat <<'EOF'
@@ -29,13 +32,14 @@ Usage: ./scripts/setup-pi.sh [options]
   --remote-captcha  Run Chromium on the private Xvfb :99 display for HTTPS relay
   -h, --help        Show help
 
-/auth needs no inbound port. Password login requires a Pi desktop session with
-Chrome/Chromium; headless Pi installations should use Riot Mobile QR.
+/auth QR needs no inbound port. A headless Pi can use Riot Mobile QR, or the
+explicit --remote-captcha HTTPS relay when its extra dependencies are ready.
 
---remote-captcha is opt-in. It requires Xvfb and Chromium on the Pi and an
-HTTPS AUTH_BASE_URL. Missing packages are reported; this script never installs
-them automatically. Base Pi installs use CAPTCHA_BROWSER_MODE=disabled (QR
-only); the --remote-captcha drop-in supplies remote mode separately.
+--remote-captcha is opt-in. It requires Xvfb, Chromium, xauth, mcookie, Python
+3, and one exact HTTPS AUTH_BASE_URL origin. Missing packages are reported;
+this script never installs them automatically. Base Pi installs use
+CAPTCHA_BROWSER_MODE=disabled (QR only); the --remote-captcha drop-in supplies
+remote mode separately.
 EOF
 }
 
@@ -60,7 +64,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 prompt() {
-  local var="$1" label="$2"
+  local var="$1" label="$2" mode="${3:-plain}" value=""
   if [[ -n "${!var:-}" ]]; then
     return 0
   fi
@@ -73,9 +77,63 @@ prompt() {
     exit 1
   fi
   printf "%s: " "$label"
-  read -r "$var"
+  if [[ "$mode" == "secret" ]]; then
+    if ! IFS= read -rs value; then
+      printf '\n'
+      return 1
+    fi
+    printf '\n'
+  else
+    IFS= read -r value
+  fi
+  printf -v "$var" '%s' "$value"
   export "$var"
 }
+
+cleanup_local_setup_tmp() {
+  local directory="${LOCAL_SETUP_TMP_DIR:-}"
+  if [[ -z "$directory" ]]; then
+    return 0
+  fi
+  rm -f -- "${directory}/env"
+  rmdir -- "$directory" 2>/dev/null || true
+  LOCAL_SETUP_TMP_DIR=""
+}
+
+cleanup_remote_setup_tmp() {
+  local directory="${REMOTE_SETUP_TMP_DIR:-}"
+  if [[ -z "$directory" || -z "$HOST" ]]; then
+    return 0
+  fi
+  ssh "$HOST" "rm -f -- '${directory}/valorant-bot' '${directory}/valorant.env'; rmdir -- '${directory}'" \
+    >/dev/null 2>&1 || true
+  REMOTE_SETUP_TMP_DIR=""
+}
+
+cleanup_setup_temps() {
+  local exit_status=$?
+  set +e
+  cleanup_local_setup_tmp
+  cleanup_remote_setup_tmp
+  return "$exit_status"
+}
+
+create_local_setup_tmp() {
+  local temp_root="${TMPDIR:-/tmp}"
+  LOCAL_SETUP_TMP_DIR="$(mktemp -d "${temp_root%/}/valorant-bot-setup.XXXXXX")"
+  chmod 0700 "$LOCAL_SETUP_TMP_DIR"
+}
+
+create_remote_setup_tmp() {
+  REMOTE_SETUP_TMP_DIR="$(ssh "$HOST" 'umask 077; mktemp -d /tmp/valorant-bot-install.XXXXXX')"
+  if [[ ! "$REMOTE_SETUP_TMP_DIR" =~ ^/tmp/valorant-bot-install\.[[:alnum:]]{6,}$ ]]; then
+    REMOTE_SETUP_TMP_DIR=""
+    echo "remote setup temporary directory creation failed" >&2
+    return 1
+  fi
+}
+
+trap cleanup_setup_temps EXIT
 
 remote_captcha_dependencies() {
   local missing=0
@@ -89,17 +147,49 @@ remote_captcha_dependencies() {
     echo "remote CAPTCHA dependency missing: Chromium" >&2
     missing=1
   fi
+  if [[ ! -x /usr/bin/xauth ]]; then
+    echo "remote CAPTCHA dependency missing: xauth" >&2
+    missing=1
+  fi
+  if [[ ! -x /usr/bin/mcookie ]]; then
+    echo "remote CAPTCHA dependency missing: mcookie (util-linux)" >&2
+    missing=1
+  fi
+  if [[ ! -x /usr/bin/python3 ]]; then
+    echo "remote CAPTCHA dependency missing: python3 (install-time origin validator)" >&2
+    missing=1
+  fi
   if [[ "$missing" -ne 0 ]]; then
-    echo "Install dependencies first: sudo apt-get update && sudo apt-get install -y xvfb chromium" >&2
+    echo "Install dependencies first: sudo apt-get update && sudo apt-get install -y xvfb chromium xauth util-linux python3" >&2
     return 1
   fi
 }
 
-require_remote_captcha_https() {
+validate_remote_captcha_origin() {
   local auth_base="$1"
-  if [[ "$auth_base" != https://* ]]; then
-    echo "--remote-captcha requires HTTPS AUTH_BASE_URL (got ${auth_base})" >&2
-    exit 1
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required to validate remote CAPTCHA AUTH_BASE_URL" >&2
+    return 1
+  fi
+  python3 "$REMOTE_CAPTCHA_ORIGIN_VALIDATOR" "$auth_base"
+}
+
+validate_remote_target_origin() {
+  local auth_base="$1"
+  local validator_payload auth_base_payload
+  local remote_bootstrap='import base64,sys; source=base64.b64decode(sys.argv.pop(1)); sys.argv[-1]=base64.b64decode(sys.argv[-1]).decode("utf-8"); exec(compile(source,"<remote-captcha-origin-validator>","exec"),{"__name__":"__main__"})'
+
+  # Keep stdin attached to the forced remote TTY so sudo can prompt. The
+  # deployment-owned validator and already-validated caller origin travel as
+  # one-line base64 values rather than putting the URL itself in the command.
+  validator_payload="$(python3 -c 'import base64,sys; sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode("ascii"))' \
+    < "$REMOTE_CAPTCHA_ORIGIN_VALIDATOR")"
+  auth_base_payload="$(printf '%s' "$auth_base" | \
+    python3 -c 'import base64,sys; sys.stdout.write(base64.b64encode(sys.stdin.buffer.read()).decode("ascii"))')"
+  if ! ssh -tt "$HOST" \
+    "sudo /usr/bin/python3 -c '$remote_bootstrap' '$validator_payload' --target-env /etc/valorant-bot/env '$auth_base_payload'"; then
+    echo "remote CAPTCHA target preflight failed" >&2
+    return 1
   fi
 }
 
@@ -137,9 +227,12 @@ EOF
 
 if [[ -n "$HOST" ]]; then
   if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
-    ssh "$HOST" 'if [[ ! -x /usr/bin/Xvfb ]] || (! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1); then echo "remote CAPTCHA dependencies are missing" >&2; echo "Install dependencies first: sudo apt-get update && sudo apt-get install -y xvfb chromium" >&2; exit 1; fi'
+    AUTH_BASE_URL="${AUTH_BASE_URL:-}"
+    validate_remote_captcha_origin "$AUTH_BASE_URL"
+    ssh "$HOST" 'missing=0; [[ -x /usr/bin/Xvfb ]] || { echo "remote CAPTCHA dependency missing: Xvfb" >&2; missing=1; }; [[ -x /usr/bin/xauth ]] || { echo "remote CAPTCHA dependency missing: xauth" >&2; missing=1; }; [[ -x /usr/bin/mcookie ]] || { echo "remote CAPTCHA dependency missing: mcookie (util-linux)" >&2; missing=1; }; [[ -x /usr/bin/python3 ]] || { echo "remote CAPTCHA dependency missing: python3 (install-time origin validator)" >&2; missing=1; }; if ! command -v chromium >/dev/null 2>&1 && ! command -v chromium-browser >/dev/null 2>&1 && ! command -v google-chrome >/dev/null 2>&1; then echo "remote CAPTCHA dependency missing: Chromium" >&2; missing=1; fi; if [[ "$missing" -ne 0 ]]; then echo "Install dependencies first: sudo apt-get update && sudo apt-get install -y xvfb chromium xauth util-linux python3" >&2; exit 1; fi'
+    validate_remote_target_origin "$AUTH_BASE_URL"
   fi
-  prompt DISCORD_TOKEN "Discord bot token (DISCORD_TOKEN)"
+  prompt DISCORD_TOKEN "Discord bot token (DISCORD_TOKEN)" secret
   prompt DISCORD_APP_ID "Discord application ID (DISCORD_APP_ID)"
   if [[ "$ARCH" == armv7 ]]; then
     echo "building linux/armv7…"
@@ -152,7 +245,8 @@ if [[ -n "$HOST" ]]; then
   fi
 
   REMOTE_DIR="valorant-bot-deploy"
-  scp -q "$BIN" "$HOST:/tmp/valorant-bot"
+  create_remote_setup_tmp
+  scp -q "$BIN" "$HOST:${REMOTE_SETUP_TMP_DIR}/valorant-bot"
   ssh "$HOST" "mkdir -p ~/${REMOTE_DIR}"
   scp -q -r deploy scripts "$HOST:~/${REMOTE_DIR}/"
 
@@ -163,15 +257,16 @@ if [[ -n "$HOST" ]]; then
   fi
   AUTH_BASE_URL="${AUTH_BASE_URL:-http://${PI_IP}:8787}"
   if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
-    require_remote_captcha_https "$AUTH_BASE_URL"
+    validate_remote_captcha_origin "$AUTH_BASE_URL"
   fi
 
-  ENV_TMP="$(mktemp)"
+  create_local_setup_tmp
+  ENV_TMP="${LOCAL_SETUP_TMP_DIR}/env"
   write_env_file "$ENV_TMP" "$AUTH_BASE_URL"
-  scp -q "$ENV_TMP" "$HOST:/tmp/valorant.env"
-  rm -f "$ENV_TMP"
+  scp -q "$ENV_TMP" "$HOST:${REMOTE_SETUP_TMP_DIR}/valorant.env"
+  cleanup_local_setup_tmp
 
-  INSTALL_FLAGS=(--binary /tmp/valorant-bot --env /tmp/valorant.env)
+  INSTALL_FLAGS=(--binary "${REMOTE_SETUP_TMP_DIR}/valorant-bot" --env "${REMOTE_SETUP_TMP_DIR}/valorant.env")
   if [[ "$SKIP_START" -eq 1 ]]; then
     INSTALL_FLAGS+=(--skip-start)
   fi
@@ -179,6 +274,7 @@ if [[ -n "$HOST" ]]; then
     INSTALL_FLAGS+=(--remote-captcha)
   fi
   ssh -t "$HOST" "cd ~/${REMOTE_DIR} && sudo ./deploy/install.sh ${INSTALL_FLAGS[*]}"
+  cleanup_remote_setup_tmp
 
   echo
   echo "Pi setup complete on $HOST"
@@ -204,12 +300,13 @@ fi
 LAN_IP="$(detect_lan_ip)"
 AUTH_BASE_URL="${AUTH_BASE_URL:-http://${LAN_IP}:8787}"
 if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
+  validate_remote_captcha_origin "$AUTH_BASE_URL"
   remote_captcha_dependencies
-  require_remote_captcha_https "$AUTH_BASE_URL"
 fi
-prompt DISCORD_TOKEN "Discord bot token (DISCORD_TOKEN)"
+prompt DISCORD_TOKEN "Discord bot token (DISCORD_TOKEN)" secret
 prompt DISCORD_APP_ID "Discord application ID (DISCORD_APP_ID)"
-ENV_TMP="$(mktemp)"
+create_local_setup_tmp
+ENV_TMP="${LOCAL_SETUP_TMP_DIR}/env"
 write_env_file "$ENV_TMP" "$AUTH_BASE_URL"
 INSTALL_FLAGS=(--env "$ENV_TMP")
 if [[ "$SKIP_START" -eq 1 ]]; then
@@ -219,7 +316,7 @@ if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
   INSTALL_FLAGS+=(--remote-captcha)
 fi
 ./deploy/install.sh "${INSTALL_FLAGS[@]}"
-rm -f "$ENV_TMP"
+cleanup_local_setup_tmp
 
 echo
 echo "Pi setup complete"

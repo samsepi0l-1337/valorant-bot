@@ -38,6 +38,7 @@ func T(lang Lang, key string) string {
 
 var ko = map[string]string{
 	"auth.choose":                   "Riot 계정 연동 방식을 선택하세요.\n• **Riot Mobile**: QR 스캔 후 앱에서 승인\n• **아이디 로그인**: ① Discord에 아이디/비밀번호 → ② 봇 PC Chrome에서 「로봇이 아닙니다」 → ③(있을 때만) 2FA 코드",
+	"auth.choose.qr_only":           "이 봇에서는 **Riot Mobile QR**로만 Riot 계정을 연동할 수 있습니다.",
 	"auth.choose.qr":                "Riot Mobile QR",
 	"auth.choose.password":          "아이디 로그인",
 	"auth.prompt":                   "**Riot Mobile** 앱으로 아래 QR 코드를 스캔한 뒤 **로그인 승인**을 눌러주세요.\n휴대폰에서 Discord를 보고 있다면 아래 버튼을 눌러 바로 승인할 수 있습니다.\n승인하면 자동으로 연동됩니다. (약 3분 후 만료)",
@@ -46,6 +47,7 @@ var ko = map[string]string{
 	"auth.password.username":        "아이디 / 이메일",
 	"auth.password.password":        "비밀번호",
 	"auth.password.failed":          "로그인 실패: %v\n아이디/비밀번호를 확인한 뒤 다시 시도하세요.",
+	"auth.password.disabled":        "이 봇에서는 아이디 로그인을 사용할 수 없습니다. `/auth`에서 **Riot Mobile QR**을 사용하세요.",
 	"auth.captcha.prompt":           "아래 버튼을 누르면 봇이 실행 중인 Mac/Linux PC에서 Riot 공식 Chrome 캡차 창을 엽니다.\n그 창에 표시되는 **「로봇이 아닙니다」** 캡차를 완료하세요.",
 	"auth.captcha.button":           "캡차 창 열기",
 	"auth.captcha.launched":         "봇 PC에서 Chrome 캡차 창을 열었습니다.",
@@ -113,6 +115,7 @@ var ko = map[string]string{
 
 var en = map[string]string{
 	"auth.choose":                   "Choose how to link your Riot account.\n• **Riot Mobile**: scan the QR and approve in the app\n• **ID login**: ① Discord username/password → ② bot-PC Chrome 「I'm not a robot」 → ③ 2FA code only if required",
+	"auth.choose.qr_only":           "This bot supports Riot account linking through **Riot Mobile QR** only.",
 	"auth.choose.qr":                "Riot Mobile QR",
 	"auth.choose.password":          "ID login",
 	"auth.prompt":                   "Scan the QR code below with the **Riot Mobile** app and approve the login.\nOn a phone, tap the button below to approve directly.\nLinking happens automatically once approved. (expires in ~3 minutes)",
@@ -121,6 +124,7 @@ var en = map[string]string{
 	"auth.password.username":        "Username / email",
 	"auth.password.password":        "Password",
 	"auth.password.failed":          "Login failed: %v\nCheck your username/password and try again.",
+	"auth.password.disabled":        "ID login is disabled on this bot. Run `/auth` and use **Riot Mobile QR**.",
 	"auth.captcha.prompt":           "Tap below to open Riot's official Chrome captcha window on the bot macOS/Linux machine.\nComplete the **I'm not a robot** challenge shown there.",
 	"auth.captcha.button":           "Open captcha window",
 	"auth.captcha.launched":         "Opened the Chrome captcha window on the bot machine.",

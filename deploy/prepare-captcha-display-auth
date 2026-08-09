@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Create the X11 cookie used only by the deployment-owned :99 display.
+set -euo pipefail
+
+AUTH_DIR=/run/valorant-captcha-display
+AUTH_FILE="${AUTH_DIR}/Xauthority"
+
+umask 077
+auth_tmp="$(mktemp "${AUTH_DIR}/.Xauthority.XXXXXX")"
+trap 'rm -f "$auth_tmp"' EXIT
+
+cookie="$(/usr/bin/mcookie)"
+if [[ ! "$cookie" =~ ^[[:xdigit:]]{32}$ ]]; then
+  echo "mcookie returned an invalid X11 cookie" >&2
+  exit 1
+fi
+printf 'add :99 MIT-MAGIC-COOKIE-1 %s\n' "$cookie" | /usr/bin/xauth -f "$auth_tmp" source -
+unset cookie
+chmod 0600 "$auth_tmp"
+mv -f "$auth_tmp" "$AUTH_FILE"
+trap - EXIT

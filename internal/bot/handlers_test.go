@@ -20,38 +20,41 @@ import (
 )
 
 type fakeAuth struct {
-	url          string
-	state        string
-	err          error
-	display      string
-	waitErr      error
-	captchaURL   string
-	pwState      string
-	pwErr        error
-	waitDisp     string
-	waitMFA      string
-	waitHint     string
-	waitPWErr    error
-	mfaDisplay   string
-	mfaErr       error
-	mfaState     string
-	mfaUser      string
-	mfaCode      string
-	validateMFA  string
-	validateUID  string
-	validateHint string
-	validateErr  error
-	launchErr    error
-	cancelErr    error
-	launchState  string
-	launchUser   string
-	cancelState  string
-	cancelUser   string
-	pwBegins     int
-	launches     int
-	cancels      int
-	browserRuns  int
+	url                   string
+	state                 string
+	err                   error
+	display               string
+	waitErr               error
+	captchaURL            string
+	pwState               string
+	pwErr                 error
+	waitDisp              string
+	waitMFA               string
+	waitHint              string
+	waitPWErr             error
+	mfaDisplay            string
+	mfaErr                error
+	mfaState              string
+	mfaUser               string
+	mfaCode               string
+	validateMFA           string
+	validateUID           string
+	validateHint          string
+	validateErr           error
+	launchErr             error
+	cancelErr             error
+	launchState           string
+	launchUser            string
+	cancelState           string
+	cancelUser            string
+	pwBegins              int
+	launches              int
+	cancels               int
+	browserRuns           int
+	passwordLoginDisabled bool
 }
+
+func (f *fakeAuth) PasswordLoginEnabled() bool { return !f.passwordLoginDisabled }
 
 func (f *fakeAuth) BeginQRAuth(ctx context.Context, discordUserID string) (string, string, error) {
 	if f.err != nil {
@@ -187,6 +190,28 @@ func TestHandleAuth_Chooser(t *testing.T) {
 	row := resp.Components[0].(discordgo.ActionsRow)
 	if len(row.Components) != 2 {
 		t.Fatalf("buttons %#v", row.Components)
+	}
+}
+
+func TestHandleAuth_DisabledModeOffersOnlyRiotMobileQR(t *testing.T) {
+	h := &bot.Handlers{Auth: &fakeAuth{passwordLoginDisabled: true}}
+	resp, err := h.HandleAuth(context.Background(), "u1", i18n.EN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Content != "This bot supports Riot account linking through **Riot Mobile QR** only." {
+		t.Fatalf("content = %q", resp.Content)
+	}
+	if len(resp.Components) != 1 {
+		t.Fatalf("component rows = %#v", resp.Components)
+	}
+	row, ok := resp.Components[0].(discordgo.ActionsRow)
+	if !ok || len(row.Components) != 1 {
+		t.Fatalf("QR-only row = %#v", resp.Components[0])
+	}
+	button, ok := row.Components[0].(discordgo.Button)
+	if !ok || button.CustomID != "auth:qr" || button.Label != "Riot Mobile QR" {
+		t.Fatalf("QR-only button = %#v", row.Components[0])
 	}
 }
 
@@ -329,6 +354,29 @@ func TestHandlePasswordLogin_RemoteRelayLinkAndOwnerCancelContainNoBearerCustomI
 	}
 	if auth.pwBegins != 1 || auth.launches != 0 || auth.browserRuns != 0 {
 		t.Fatalf("remote submit begins=%d launches=%d browserRuns=%d", auth.pwBegins, auth.launches, auth.browserRuns)
+	}
+}
+
+func TestHandlePasswordLogin_DisabledErrorIsLocalizedWithoutStateOrControls(t *testing.T) {
+	auth := &fakeAuth{pwErr: authweb.ErrPasswordLoginDisabled}
+	h := &bot.Handlers{Auth: auth}
+	resp, state, err := h.HandlePasswordLogin(context.Background(), "u1", "sensitive-user", "sensitive-password", i18n.EN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state != "" {
+		t.Fatalf("state=%q, want empty", state)
+	}
+	if resp.Content != "ID login is disabled on this bot. Run `/auth` and use **Riot Mobile QR**." {
+		t.Fatalf("disabled response=%q", resp.Content)
+	}
+	if resp.Components == nil || len(resp.Components) != 0 {
+		t.Fatalf("disabled response retained controls: %#v", resp.Components)
+	}
+	for _, secret := range []string{"sensitive-user", "sensitive-password"} {
+		if strings.Contains(resp.Content, secret) {
+			t.Fatalf("disabled response disclosed %q: %q", secret, resp.Content)
+		}
 	}
 }
 

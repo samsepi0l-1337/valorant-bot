@@ -35,28 +35,33 @@ type acknowledgementCheckingAuth struct {
 	waitDone        chan<- struct{}
 }
 
+func (*acknowledgementCheckingAuth) PasswordLoginEnabled() bool { return true }
+
 type passwordButtonAuth struct {
-	captchaURL           string
-	captchaState         string
-	launchErr            error
-	cancelErr            error
-	cancelNotClaimed     bool
-	cancelHook           func()
-	launches             atomic.Int32
-	waits                atomic.Int32
-	waitStarted          chan<- struct{}
-	waitRelease          <-chan struct{}
-	waitDone             chan<- struct{}
-	waitDisplay          string
-	waitMFAState         string
-	waitMFAHint          string
-	waitErr              error
-	launchEditResponded  *atomic.Bool
-	waitBeforeLaunchEdit atomic.Bool
-	cancelCalls          atomic.Int32
-	cancelState          string
-	cancelUser           string
+	captchaURL            string
+	captchaState          string
+	launchErr             error
+	cancelErr             error
+	cancelNotClaimed      bool
+	cancelHook            func()
+	launches              atomic.Int32
+	waits                 atomic.Int32
+	waitStarted           chan<- struct{}
+	waitRelease           <-chan struct{}
+	waitDone              chan<- struct{}
+	waitDisplay           string
+	waitMFAState          string
+	waitMFAHint           string
+	waitErr               error
+	launchEditResponded   *atomic.Bool
+	waitBeforeLaunchEdit  atomic.Bool
+	cancelCalls           atomic.Int32
+	cancelState           string
+	cancelUser            string
+	passwordLoginDisabled bool
 }
+
+func (a *passwordButtonAuth) PasswordLoginEnabled() bool { return !a.passwordLoginDisabled }
 
 type mfaInteractionAuth struct {
 	mu                   sync.Mutex
@@ -77,6 +82,8 @@ type mfaInteractionAuth struct {
 	completeDisplay      string
 	completeErr          error
 }
+
+func (*mfaInteractionAuth) PasswordLoginEnabled() bool { return true }
 
 type mfaCompletionResult struct {
 	display string
@@ -909,7 +916,7 @@ func TestPasswordModalOpenUsesCachedLanguageWithoutDatabaseRead(t *testing.T) {
 	session, responses := newInteractionResponseCapture(t)
 	release := make(chan struct{})
 	lang := &blockingLanguageStore{started: make(chan struct{}), release: release}
-	h := &Handlers{Lang: lang}
+	h := &Handlers{Auth: &passwordButtonAuth{}, Lang: lang}
 	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
 		ID:    "interaction-password-open",
 		AppID: "application-1",
@@ -939,6 +946,41 @@ func TestPasswordModalOpenUsesCachedLanguageWithoutDatabaseRead(t *testing.T) {
 	}
 	close(release)
 	<-done
+}
+
+func TestDisabledPasswordComponentReturnsEphemeralQRRecommendationWithoutModal(t *testing.T) {
+	session, responses := newInteractionResponseCapture(t)
+	auth := &passwordButtonAuth{passwordLoginDisabled: true}
+	h := &Handlers{Auth: auth}
+	interaction := &discordgo.InteractionCreate{Interaction: &discordgo.Interaction{
+		ID:    "interaction-disabled-password-open",
+		AppID: "application-1",
+		Token: "token-disabled-password-open",
+		Type:  discordgo.InteractionMessageComponent,
+		Data:  discordgo.MessageComponentInteractionData{CustomID: customIDAuthPassword},
+		User:  &discordgo.User{ID: "owner-1"},
+	}}
+
+	h.onComponent(session, interaction)
+
+	select {
+	case response := <-responses:
+		if response.Type != discordgo.InteractionResponseChannelMessageWithSource ||
+			response.Data.Flags != discordgo.MessageFlagsEphemeral {
+			t.Fatalf("disabled password response type=%d flags=%d", response.Type, response.Data.Flags)
+		}
+		if response.Data.Content != "이 봇에서는 아이디 로그인을 사용할 수 없습니다. `/auth`에서 **Riot Mobile QR**을 사용하세요." {
+			t.Fatalf("disabled password response = %q", response.Data.Content)
+		}
+		if response.Data.CustomID != "" {
+			t.Fatalf("disabled password response opened modal %q", response.Data.CustomID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("disabled password component was not acknowledged")
+	}
+	if auth.launches.Load() != 0 || auth.waits.Load() != 0 {
+		t.Fatalf("disabled password component launched=%d waited=%d", auth.launches.Load(), auth.waits.Load())
+	}
 }
 
 func TestPasswordModalSubmitAcknowledgesBeforeLanguageDatabaseAndAuthWork(t *testing.T) {

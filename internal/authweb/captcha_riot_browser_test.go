@@ -13,6 +13,125 @@ import (
 	"time"
 )
 
+func TestRiotBrowserAttachWaitsForAuthenticateOrigin(t *testing.T) {
+	var targetCalls atomic.Int32
+	attachedTarget := make(chan string, 1)
+	host, browser := newTestChromeDevToolsPipes()
+	t.Cleanup(func() {
+		_ = host.Close()
+		_ = browser.Close()
+	})
+	go func() {
+		for {
+			var command struct {
+				ID     int64          `json:"id"`
+				Method string         `json:"method"`
+				Params map[string]any `json:"params"`
+			}
+			if browser.ReadJSON(&command) != nil {
+				return
+			}
+			switch command.Method {
+			case "Target.getTargets":
+				call := targetCalls.Add(1)
+				targetID := "authorize-page"
+				targetURL := "https://auth.riotgames.com/authorize?nonce=test"
+				if call > 1 {
+					targetID = "authenticate-page"
+					targetURL = "https://authenticate.riotgames.com/"
+				}
+				_ = browser.WriteJSON(map[string]any{"id": command.ID, "result": map[string]any{"targetInfos": []map[string]any{{
+					"targetId": targetID, "type": "page", "url": targetURL,
+				}}}})
+			case "Target.attachToTarget":
+				targetID, _ := command.Params["targetId"].(string)
+				attachedTarget <- targetID
+				_ = browser.WriteJSON(map[string]any{"id": command.ID, "result": map[string]any{"sessionId": "riot-session"}})
+			}
+		}
+	}()
+
+	client := newChromeDevToolsClient(host)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := client.attachRiotPage(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-attachedTarget; got != "authenticate-page" {
+		t.Fatalf("attached target=%q, want authenticate origin after authorize redirect", got)
+	}
+	if got := targetCalls.Load(); got != 2 {
+		t.Fatalf("Target.getTargets calls=%d, want authorize wait then authenticate attach", got)
+	}
+}
+
+func TestRiotBrowserPublishesCaptchaFromDiscoveryResponse(t *testing.T) {
+	host, browser := newTestChromeDevToolsPipes()
+	t.Cleanup(func() {
+		_ = host.Close()
+		_ = browser.Close()
+	})
+	client := newChromeDevToolsClient(host)
+	t.Cleanup(func() { _ = client.Close(context.Background()) })
+	client.setSessionID("riot-session")
+	events, err := client.SubscribeEvents("riot-session",
+		"Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer events.Close()
+
+	go func() {
+		for {
+			var command struct {
+				ID        int64          `json:"id"`
+				Method    string         `json:"method"`
+				Params    map[string]any `json:"params"`
+				SessionID string         `json:"sessionId"`
+			}
+			if browser.ReadJSON(&command) != nil {
+				return
+			}
+			switch command.Method {
+			case "Network.getResponseBody":
+				_ = browser.WriteJSON(map[string]any{"id": command.ID, "sessionId": command.SessionID, "result": map[string]any{
+					"body": `{"type":"auth","captcha":{"type":"hcaptcha"}}`, "base64Encoded": false,
+				}})
+			case "Runtime.evaluate":
+				_ = browser.WriteJSON(map[string]any{"id": command.ID, "sessionId": command.SessionID, "result": map[string]any{
+					"result": map[string]any{"type": "object", "value": map[string]any{
+						"originOK": true, "ready": true, "x": 10, "y": 20, "width": 300, "height": 200,
+					}},
+				}})
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	published := make(chan riotCaptchaSurface, 1)
+	done := make(chan error, 1)
+	go func() {
+		_, waitErr := client.waitForRiotLogin(ctx, events, func(surface riotCaptchaSurface) { published <- surface })
+		done <- waitErr
+	}()
+	writeRiotLoginEvents(t, browser, "riot-session", "get-login", http.MethodGet)
+	select {
+	case surface := <-published:
+		if surface != (riotCaptchaSurface{X: 10, Y: 20, Width: 300, Height: 200}) {
+			t.Fatalf("published surface=%+v", surface)
+		}
+		cancel()
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("GET discovery CAPTCHA was not published to the remote viewer")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Riot login watcher did not stop after cancellation")
+	}
+}
+
 func TestRiotBrowserRunsOfficialLoginInOneBrowserSession(t *testing.T) {
 	var (
 		mu                        sync.Mutex
@@ -23,11 +142,15 @@ func TestRiotBrowserRunsOfficialLoginInOneBrowserSession(t *testing.T) {
 		unsafeDOMClick            bool
 		unsafeBeforeHydration     bool
 		unsafeFillBeforeHydration bool
+		unsafeTrustedSubmitBypass bool
+		unsafeCaptchaInitWait     bool
 		duplicatePasswordBinding  bool
 		credentialEvaluations     int
 		submitEvaluations         int
-		mousePressed              bool
-		mouseReleased             bool
+		unexpectedTrustedInput    bool
+		curtainInstalled          bool
+		unsafeCurtain             bool
+		credentialsBeforeCurtain  bool
 	)
 	host, browser := newTestChromeDevToolsPipes()
 	t.Cleanup(func() {
@@ -54,6 +177,17 @@ func TestRiotBrowserRunsOfficialLoginInOneBrowserSession(t *testing.T) {
 				_ = browser.WriteJSON(map[string]any{"id": command.ID, "result": map[string]any{"sessionId": "riot-session"}})
 			case "Network.enable", "Runtime.enable", "Page.enable":
 				_ = browser.WriteJSON(map[string]any{"id": command.ID, "sessionId": command.SessionID, "result": map[string]any{}})
+			case "Page.addScriptToEvaluateOnNewDocument":
+				source, _ := command.Params["source"].(string)
+				runImmediately, _ := command.Params["runImmediately"].(bool)
+				mu.Lock()
+				curtainInstalled = true
+				unsafeCurtain = !runImmediately || !strings.Contains(source, "window.top!==window") ||
+					!strings.Contains(source, "preventDefault") || !strings.Contains(source, "stopImmediatePropagation") ||
+					!strings.Contains(source, "pointer-events:none") || !strings.Contains(source, "remote-captcha-curtain") ||
+					!strings.Contains(source, "!state.trustedSubmit")
+				mu.Unlock()
+				_ = browser.WriteJSON(map[string]any{"id": command.ID, "sessionId": command.SessionID, "result": map[string]any{"identifier": "curtain-script"}})
 			case "Runtime.evaluate":
 				expression, _ := command.Params["expression"].(string)
 				if strings.Contains(expression, "navigator.userAgent") {
@@ -67,6 +201,7 @@ func TestRiotBrowserRunsOfficialLoginInOneBrowserSession(t *testing.T) {
 				locatesSubmit := strings.Contains(expression, `form.querySelector('button[data-testid="btn-signin-submit"]')`)
 				mu.Lock()
 				if injectsCredentials {
+					credentialsBeforeCurtain = credentialsBeforeCurtain || !curtainInstalled
 					injectedCredentials = true
 					credentialEvaluations++
 					unsafeFillBeforeHydration = unsafeFillBeforeHydration ||
@@ -78,26 +213,28 @@ func TestRiotBrowserRunsOfficialLoginInOneBrowserSession(t *testing.T) {
 					unsafeNativeSubmit = strings.Contains(expression, "requestSubmit")
 					unsafeSubmitLookup = !locatesSubmit ||
 						strings.Contains(expression, `find(['button[type="submit"]'`)
-					unsafeDOMClick = unsafeDOMClick || clicksSubmit
+					unsafeDOMClick = unsafeDOMClick || !clicksSubmit
 					unsafeBeforeHydration = unsafeBeforeHydration ||
 						!strings.Contains(expression, `document.readyState !== 'complete'`)
+					unsafeTrustedSubmitBypass = unsafeTrustedSubmitBypass ||
+						!strings.Contains(expression, "curtain.trustedSubmit=true") ||
+						!strings.Contains(expression, "finally{curtain.trustedSubmit=false}") ||
+						!strings.Contains(expression, "Symbol.for('valorant.remote-captcha-curtain')")
+					unsafeCaptchaInitWait = unsafeCaptchaInitWait ||
+						!strings.Contains(expression, ".h-captcha,[data-hcaptcha-widget-id]") ||
+						!strings.Contains(expression, "performance.now()") ||
+						!strings.Contains(expression, "<2000")
 				}
 				unsafeSameEvaluation = unsafeSameEvaluation || (injectsCredentials && clicksSubmit)
 				mu.Unlock()
 				if injectsCredentials && !clicksSubmit {
 					_ = browser.WriteJSON(map[string]any{"id": command.ID, "sessionId": command.SessionID, "result": map[string]any{
-						"result": map[string]any{"type": "object", "value": map[string]any{"filled": true}},
-					}})
-					continue
-				}
-				if locatesSubmit && !clicksSubmit {
-					_ = browser.WriteJSON(map[string]any{"id": command.ID, "sessionId": command.SessionID, "result": map[string]any{
-						"result": map[string]any{"type": "object", "value": map[string]any{"ready": true, "x": 410.5, "y": 722.5}},
+						"result": map[string]any{"type": "object", "value": map[string]any{"originOK": true, "filled": true}},
 					}})
 					continue
 				}
 				_ = browser.WriteJSON(map[string]any{"id": command.ID, "sessionId": command.SessionID, "result": map[string]any{
-					"result": map[string]any{"type": "object", "value": map[string]any{"submitted": true}},
+					"result": map[string]any{"type": "object", "value": map[string]any{"originOK": true, "submitted": true}},
 				}})
 				writeRiotLoginEvents(t, browser, command.SessionID, "get-login", "GET")
 				writeRiotLoginEventsURL(t, browser, command.SessionID, "put-query-leak", "PUT", "https://authenticate.riotgames.com/?username=browser-user&password=browser-password")
@@ -105,13 +242,8 @@ func TestRiotBrowserRunsOfficialLoginInOneBrowserSession(t *testing.T) {
 				writeRiotLoginEvents(t, browser, command.SessionID, "put-login", "PUT")
 			case "Input.dispatchMouseEvent":
 				eventType, _ := command.Params["type"].(string)
-				x, xOK := command.Params["x"].(float64)
-				y, yOK := command.Params["y"].(float64)
 				mu.Lock()
-				if xOK && yOK && x == 410.5 && y == 722.5 {
-					mousePressed = mousePressed || eventType == "mousePressed"
-					mouseReleased = mouseReleased || eventType == "mouseReleased"
-				}
+				unexpectedTrustedInput = true
 				mu.Unlock()
 				_ = browser.WriteJSON(map[string]any{"id": command.ID, "sessionId": command.SessionID, "result": map[string]any{}})
 				if eventType == "mouseReleased" {
@@ -158,14 +290,21 @@ func TestRiotBrowserRunsOfficialLoginInOneBrowserSession(t *testing.T) {
 	gotUnsafeDOMClick := unsafeDOMClick
 	gotUnsafeBeforeHydration := unsafeBeforeHydration
 	gotUnsafeFillBeforeHydration := unsafeFillBeforeHydration
+	gotUnsafeTrustedSubmitBypass := unsafeTrustedSubmitBypass
+	gotUnsafeCaptchaInitWait := unsafeCaptchaInitWait
 	gotDuplicatePasswordBinding := duplicatePasswordBinding
 	gotCredentialEvaluations := credentialEvaluations
 	gotSubmitEvaluations := submitEvaluations
-	gotMousePressed := mousePressed
-	gotMouseReleased := mouseReleased
+	gotUnexpectedTrustedInput := unexpectedTrustedInput
+	gotCurtainInstalled := curtainInstalled
+	gotUnsafeCurtain := unsafeCurtain
+	gotCredentialsBeforeCurtain := credentialsBeforeCurtain
 	mu.Unlock()
 	if !gotInjected {
 		t.Fatal("official Riot form did not receive both credentials")
+	}
+	if !gotCurtainInstalled || gotUnsafeCurtain || gotCredentialsBeforeCurtain {
+		t.Fatalf("document-start curtain installed=%t unsafe=%t credentials-before-curtain=%t", gotCurtainInstalled, gotUnsafeCurtain, gotCredentialsBeforeCurtain)
 	}
 	if gotUnsafeNativeSubmit {
 		t.Fatal("credential injection may not invoke native form submission")
@@ -177,7 +316,7 @@ func TestRiotBrowserRunsOfficialLoginInOneBrowserSession(t *testing.T) {
 		t.Fatal("Riot credentials and submit click must use separate evaluations so React can commit input state")
 	}
 	if gotUnsafeDOMClick {
-		t.Fatal("Riot submit must use a trusted Chrome input event, not HTMLElement.click")
+		t.Fatal("Riot submit click must execute inside the guarded Runtime evaluation")
 	}
 	if gotUnsafeBeforeHydration {
 		t.Fatal("Riot submit must wait for document load and React hydration before dispatching input")
@@ -185,14 +324,20 @@ func TestRiotBrowserRunsOfficialLoginInOneBrowserSession(t *testing.T) {
 	if gotUnsafeFillBeforeHydration {
 		t.Fatal("Riot credential fill must wait for document load and React hydration")
 	}
+	if gotUnsafeTrustedSubmitBypass {
+		t.Fatal("Riot submit must open and close only the document curtain's one-shot trusted submit gate")
+	}
+	if gotUnsafeCaptchaInitWait {
+		t.Fatal("Riot submit must wait for hCaptcha initialization before using its bounded no-captcha fallback")
+	}
 	if gotDuplicatePasswordBinding {
 		t.Fatal("Riot submit expression must declare its password field exactly once")
 	}
 	if gotCredentialEvaluations != 1 || gotSubmitEvaluations != 1 {
 		t.Fatalf("credential/submit evaluations = %d/%d, want 1/1", gotCredentialEvaluations, gotSubmitEvaluations)
 	}
-	if !gotMousePressed || !gotMouseReleased {
-		t.Fatalf("trusted submit mouse events pressed/released = %t/%t, want true/true", gotMousePressed, gotMouseReleased)
+	if gotUnexpectedTrustedInput {
+		t.Fatal("guarded submit unexpectedly used separate trusted input commands")
 	}
 	if !strings.Contains(string(result.ResponseBody), `"type":"multifactor"`) {
 		t.Fatalf("response body = %s; GET response must not win", result.ResponseBody)
@@ -232,6 +377,8 @@ func TestRiotBrowserStopsOnCredentialInjectionProtocolError(t *testing.T) {
 				}}}})
 			case "Target.attachToTarget":
 				_ = browser.WriteJSON(map[string]any{"id": command.ID, "result": map[string]any{"sessionId": "riot-session"}})
+			case "Page.addScriptToEvaluateOnNewDocument":
+				_ = browser.WriteJSON(map[string]any{"id": command.ID, "sessionId": command.SessionID, "result": map[string]any{"identifier": "curtain-script"}})
 			case "Runtime.evaluate":
 				evaluateCalls.Add(1)
 				_ = browser.WriteJSON(map[string]any{"id": command.ID, "sessionId": command.SessionID, "error": map[string]any{"message": "credential fields unavailable"}})
@@ -284,9 +431,9 @@ func TestRiotBrowserRetriesCredentialInjectionAcrossOneNavigationContext(t *test
 					continue
 				}
 				expression, _ := command.Params["expression"].(string)
-				value := map[string]any{"filled": true}
+				value := map[string]any{"originOK": true, "filled": true}
 				if strings.Contains(expression, "btn-signin-submit") {
-					value = map[string]any{"ready": true, "x": 10.0, "y": 20.0}
+					value = map[string]any{"originOK": true, "submitted": true}
 				}
 				_ = browser.WriteJSON(map[string]any{"id": command.ID, "result": map[string]any{
 					"result": map[string]any{"type": "object", "value": value},
@@ -460,7 +607,7 @@ func TestRiotBrowserStopsNavigationRetryWhenCanceled(t *testing.T) {
 						return
 					}
 					_ = browser.WriteJSON(map[string]any{"id": command.ID, "result": map[string]any{
-						"result": map[string]any{"type": "object", "value": map[string]any{"filled": true}},
+						"result": map[string]any{"type": "object", "value": map[string]any{"originOK": true, "filled": true}},
 					}})
 				}
 			}()
@@ -547,9 +694,9 @@ func serveCredentialSubmission(t *testing.T, browser chromeDevToolsTransport, ev
 				_ = browser.WriteJSON(map[string]any{"id": command.ID, "error": map[string]any{"message": message}})
 				continue
 			}
-			value := map[string]any{"filled": true}
+			value := map[string]any{"originOK": true, "filled": true}
 			if strings.Contains(expression, "btn-signin-submit") {
-				value = map[string]any{"ready": true, "x": 10.0, "y": 20.0}
+				value = map[string]any{"originOK": true, "submitted": true}
 			}
 			_ = browser.WriteJSON(map[string]any{"id": command.ID, "result": map[string]any{
 				"result": map[string]any{"type": "object", "value": value},

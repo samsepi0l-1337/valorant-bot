@@ -14,9 +14,13 @@ import (
 type AuthStarter interface {
 	BeginQRAuth(ctx context.Context, discordUserID string) (loginURL string, state string, err error)
 	WaitQRLogin(ctx context.Context, state string) (displayName string, err error)
+	// PasswordLoginEnabled is an explicit, immutable capability used to render
+	// the chooser and reject stale password components without runtime type
+	// assertions. Alternate implementations must deliberately select a value.
+	PasswordLoginEnabled() bool
 	// BeginPasswordLogin prepares an owner-bound password flow. A non-empty URL
-	// selects the bot-host remote relay; an empty URL selects the local/disabled
-	// button flow.
+	// selects the bot-host remote relay; an empty URL selects the local button
+	// flow. Disabled implementations return authweb.ErrPasswordLoginDisabled.
 	BeginPasswordLogin(ctx context.Context, discordUserID, username, password string) (captchaURL, state string, err error)
 	LaunchPasswordCaptcha(ctx context.Context, state, discordUserID string) error
 	CancelPasswordLogin(state, discordUserID string) (canceled bool, err error)

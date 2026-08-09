@@ -83,6 +83,35 @@ func TestRemoteCaptchaRelayCopyIsLocalizedAndExplicit(t *testing.T) {
 	}
 }
 
+func TestDisabledPasswordLoginCopyRecommendsRiotMobileQRExactly(t *testing.T) {
+	tests := []struct {
+		lang     Lang
+		chooser  string
+		disabled string
+	}{
+		{
+			lang:     KO,
+			chooser:  "이 봇에서는 **Riot Mobile QR**로만 Riot 계정을 연동할 수 있습니다.",
+			disabled: "이 봇에서는 아이디 로그인을 사용할 수 없습니다. `/auth`에서 **Riot Mobile QR**을 사용하세요.",
+		},
+		{
+			lang:     EN,
+			chooser:  "This bot supports Riot account linking through **Riot Mobile QR** only.",
+			disabled: "ID login is disabled on this bot. Run `/auth` and use **Riot Mobile QR**.",
+		},
+	}
+	for _, test := range tests {
+		t.Run(string(test.lang), func(t *testing.T) {
+			if got := T(test.lang, "auth.choose.qr_only"); got != test.chooser {
+				t.Fatalf("auth.choose.qr_only=%q, want %q", got, test.chooser)
+			}
+			if got := T(test.lang, "auth.password.disabled"); got != test.disabled {
+				t.Fatalf("auth.password.disabled=%q, want %q", got, test.disabled)
+			}
+		})
+	}
+}
+
 func TestMFAOwnerAndTerminalCopy(t *testing.T) {
 	tests := []struct {
 		lang     Lang

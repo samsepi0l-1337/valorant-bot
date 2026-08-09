@@ -169,6 +169,12 @@ func (h *Handlers) onComponentContext(ctx context.Context, s *discordgo.Session,
 	log.Printf("interaction: component %s user=%s", interactionLogCustomID(data.CustomID), userID)
 
 	if data.CustomID == customIDAuthPassword {
+		if h.Auth == nil || !h.Auth.PasswordLoginEnabled() {
+			if err := respondEphemeral(ctx, s, i, i18n.T(lang, "auth.password.disabled")); err != nil {
+				log.Printf("interaction: disabled password component: %s", discordRESTErrorLog(err))
+			}
+			return
+		}
 		if err := interactionRespond(ctx, s, i.Interaction, &discordgo.InteractionResponse{
 			Type: discordgo.InteractionResponseModal,
 			Data: PasswordLoginModal(lang),

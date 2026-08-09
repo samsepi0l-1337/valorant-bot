@@ -3,11 +3,15 @@ package authweb
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,14 +24,19 @@ import (
 )
 
 type testRemoteCaptchaStream struct {
-	frames       chan []byte
+	frames       chan remoteCaptchaOutputFrame
+	replay       remoteCaptchaOutputFrame
 	done         chan struct{}
 	closeOnce    sync.Once
 	inputs       chan []byte
 	dispatches   chan []byte
 	dispatchErr  error
+	releaseCalls chan struct{}
+	releaseErr   error
 	closeStarted chan struct{}
 	closeRelease <-chan struct{}
+	errMu        sync.Mutex
+	terminal     error
 }
 
 type blockingRemoteCaptchaWebSocketWriter struct {
@@ -51,6 +60,34 @@ type observedRemoteCaptchaWebSocketConnection struct {
 	controls       []int
 	closed         chan struct{}
 	closeOnce      sync.Once
+}
+
+type remoteCaptchaAcknowledgementRaceWriter struct {
+	beforeBinaryReturn func()
+}
+
+type replayQueueRaceRemoteCaptchaStream struct {
+	*testRemoteCaptchaStream
+	replayFrame remoteCaptchaOutputFrame
+	replayRead  chan struct{}
+}
+
+func (s *replayQueueRaceRemoteCaptchaStream) ReplayFrame() (remoteCaptchaOutputFrame, bool) {
+	close(s.replayRead)
+	return s.replayFrame, true
+}
+
+func (*remoteCaptchaAcknowledgementRaceWriter) SetWriteDeadline(time.Time) error { return nil }
+
+func (w *remoteCaptchaAcknowledgementRaceWriter) WriteMessage(messageType int, _ []byte) error {
+	if messageType == websocket.BinaryMessage && w.beforeBinaryReturn != nil {
+		w.beforeBinaryReturn()
+	}
+	return nil
+}
+
+func (*remoteCaptchaAcknowledgementRaceWriter) WriteControl(int, []byte, time.Time) error {
+	return nil
 }
 
 type testRemoteCaptchaDisconnectTimer struct {
@@ -167,14 +204,21 @@ func (w *blockingRemoteCaptchaWebSocketWriter) WriteControl(messageType int, _ [
 
 func newTestRemoteCaptchaStream() *testRemoteCaptchaStream {
 	return &testRemoteCaptchaStream{
-		frames:     make(chan []byte, 1),
-		done:       make(chan struct{}),
-		inputs:     make(chan []byte, 8),
-		dispatches: make(chan []byte, 8),
+		frames:       make(chan remoteCaptchaOutputFrame, 1),
+		done:         make(chan struct{}),
+		inputs:       make(chan []byte, 8),
+		dispatches:   make(chan []byte, 8),
+		releaseCalls: make(chan struct{}, 8),
 	}
 }
 
-func (s *testRemoteCaptchaStream) Frames() <-chan []byte { return s.frames }
+func (s *testRemoteCaptchaStream) Frames() <-chan remoteCaptchaOutputFrame { return s.frames }
+
+func (s *testRemoteCaptchaStream) ReplayFrame() (remoteCaptchaOutputFrame, bool) {
+	return s.replay, s.replay.Generation != 0
+}
+
+func (s *testRemoteCaptchaStream) AcknowledgeFrame(remoteCaptchaOutputFrame) error { return nil }
 
 func (s *testRemoteCaptchaStream) DispatchInput(_ context.Context, payload []byte) error {
 	s.dispatches <- append([]byte(nil), payload...)
@@ -185,9 +229,25 @@ func (s *testRemoteCaptchaStream) DispatchInput(_ context.Context, payload []byt
 	return nil
 }
 
+func (s *testRemoteCaptchaStream) ReleasePointer(context.Context) error {
+	s.releaseCalls <- struct{}{}
+	return s.releaseErr
+}
+
 func (s *testRemoteCaptchaStream) Done() <-chan struct{} { return s.done }
 
-func (s *testRemoteCaptchaStream) Err() error { return nil }
+func (s *testRemoteCaptchaStream) Err() error {
+	s.errMu.Lock()
+	defer s.errMu.Unlock()
+	return s.terminal
+}
+
+func (s *testRemoteCaptchaStream) finish(err error) {
+	s.errMu.Lock()
+	s.terminal = err
+	s.errMu.Unlock()
+	s.closeOnce.Do(func() { close(s.done) })
+}
 
 func (s *testRemoteCaptchaStream) Close(context.Context) error {
 	s.closeOnce.Do(func() {
@@ -597,9 +657,20 @@ func TestRemoteCaptchaWebSocketRelaysBinaryFramesAndTypedInput(t *testing.T) {
 		t.Fatal("remote stream did not start")
 	}
 
-	wantFrame := []byte{0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0xff, 0xd9}
-	fixture.stream.frames <- wantFrame
+	wantOutput := remoteCaptchaTestOutput(t, 1, 40, 35)
+	wantFrame := wantOutput.JPEG
+	fixture.stream.frames <- wantOutput
 	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+	messageType, metadataPayload, err := connection.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata remoteCaptchaFrameDescriptor
+	if messageType != websocket.TextMessage || json.Unmarshal(metadataPayload, &metadata) != nil ||
+		metadata.Type != "frame" || metadata.Generation == 0 || metadata.Width != 40 || metadata.Height != 35 {
+		t.Fatalf("frame metadata type=%d payload=%q decoded=%+v", messageType, metadataPayload, metadata)
+	}
+
 	messageType, frame, err := connection.ReadMessage()
 	if err != nil {
 		t.Fatal(err)
@@ -607,10 +678,14 @@ func TestRemoteCaptchaWebSocketRelaysBinaryFramesAndTypedInput(t *testing.T) {
 	if messageType != websocket.BinaryMessage || !bytes.Equal(frame, wantFrame) {
 		t.Fatalf("frame type=%d bytes=%x, want binary %x", messageType, frame, wantFrame)
 	}
+	ack := []byte(fmt.Sprintf(`{"type":"frameAck","generation":%d,"width":40,"height":35}`, metadata.Generation))
+	if err := connection.WriteMessage(websocket.TextMessage, ack); err != nil {
+		t.Fatal(err)
+	}
 
 	inputs := [][]byte{
-		[]byte(`{"type":"pointer","phase":"down","x":320,"y":225,"width":640,"height":450,"button":0}`),
-		[]byte(`{"type":"wheel","x":320,"y":225,"width":640,"height":450,"deltaY":120}`),
+		[]byte(fmt.Sprintf(`{"type":"pointer","phase":"down","x":20,"y":17,"width":40,"height":35,"generation":%d,"button":0}`, metadata.Generation)),
+		[]byte(fmt.Sprintf(`{"type":"wheel","x":20,"y":17,"width":40,"height":35,"generation":%d,"deltaY":120}`, metadata.Generation)),
 	}
 	for _, input := range inputs {
 		if err := connection.WriteMessage(websocket.TextMessage, input); err != nil {
@@ -624,6 +699,264 @@ func TestRemoteCaptchaWebSocketRelaysBinaryFramesAndTypedInput(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("typed input was not dispatched")
 		}
+	}
+}
+
+func TestRemoteCaptchaFrameGenerationRequiresNewestDrawAcknowledgement(t *testing.T) {
+	bindings := newRemoteCaptchaFrameAcknowledgements()
+	frameOne := remoteCaptchaTestOutput(t, 1, 40, 35)
+	first, err := bindings.prepareFrame(frameOne)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bindings.writeBinaryFrame(&remoteCaptchaAcknowledgementRaceWriter{}, frameOne); err != nil {
+		t.Fatal(err)
+	}
+	firstInput := remoteCaptchaInputMessage{
+		Type: "pointer", Phase: "move", X: float64Pointer(10), Y: float64Pointer(10),
+		Width: float64Pointer(40), Height: float64Pointer(35), Button: intPointer(0), Generation: uint64Pointer(first.Generation),
+	}
+	if err := bindings.authorizeInput(firstInput); !errors.Is(err, errRemoteCaptchaInputInvalid) {
+		t.Fatalf("pre-draw input error=%v, want rejection", err)
+	}
+	if _, _, err := bindings.acknowledge(remoteCaptchaInputMessage{
+		Type: "frameAck", Generation: uint64Pointer(first.Generation), Width: float64Pointer(40), Height: float64Pointer(35),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bindings.authorizeInput(firstInput); err != nil {
+		t.Fatalf("draw-acknowledged input rejected: %v", err)
+	}
+
+	frameTwo := remoteCaptchaTestOutput(t, 2, 40, 35)
+	second, err := bindings.prepareFrame(frameTwo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bindings.writeBinaryFrame(&remoteCaptchaAcknowledgementRaceWriter{}, frameTwo); err != nil {
+		t.Fatal(err)
+	}
+	if err := bindings.authorizeInput(firstInput); err != nil {
+		t.Fatalf("active generation was invalidated before replacement draw ACK: %v", err)
+	}
+	if _, _, err := bindings.acknowledge(remoteCaptchaInputMessage{
+		Type: "frameAck", Generation: uint64Pointer(first.Generation), Width: float64Pointer(40), Height: float64Pointer(35),
+	}); err != nil {
+		t.Fatalf("stale natural draw ACK should be ignored, got %v", err)
+	}
+	if err := bindings.authorizeInput(firstInput); err != nil {
+		t.Fatalf("stale ACK invalidated active generation: %v", err)
+	}
+	secondInput := remoteCaptchaInputMessage{
+		Type: "pointer", Phase: "move", X: float64Pointer(10), Y: float64Pointer(10),
+		Width: float64Pointer(40), Height: float64Pointer(35), Button: intPointer(0), Generation: uint64Pointer(second.Generation),
+	}
+	if _, _, err := bindings.acknowledge(remoteCaptchaInputMessage{
+		Type: "frameAck", Generation: uint64Pointer(second.Generation), Width: float64Pointer(39), Height: float64Pointer(35),
+	}); !errors.Is(err, errRemoteCaptchaInputInvalid) {
+		t.Fatalf("mismatched-dimension ACK error=%v, want rejection", err)
+	}
+	if _, _, err := bindings.acknowledge(remoteCaptchaInputMessage{
+		Type: "frameAck", Generation: uint64Pointer(second.Generation), Width: float64Pointer(40), Height: float64Pointer(35),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := bindings.authorizeInput(firstInput); !errors.Is(err, errRemoteCaptchaInputInvalid) {
+		t.Fatalf("old generation after replacement draw ACK error=%v, want rejection", err)
+	}
+	if err := bindings.authorizeInput(secondInput); err != nil {
+		t.Fatalf("new draw-acknowledged generation rejected: %v", err)
+	}
+}
+
+func TestRemoteCaptchaFrameAcknowledgementWaitsForBinaryPublishCommit(t *testing.T) {
+	bindings := newRemoteCaptchaFrameAcknowledgements()
+	frame := remoteCaptchaTestOutput(t, 1, 40, 35)
+	descriptor, err := bindings.prepareFrame(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ackAtLock := make(chan struct{})
+	bindings.beforeAcknowledgeLockForTest = func() { close(ackAtLock) }
+	type result struct {
+		frame    remoteCaptchaOutputFrame
+		activate bool
+		err      error
+	}
+	ackResult := make(chan result, 1)
+	writer := &remoteCaptchaAcknowledgementRaceWriter{}
+	writer.beforeBinaryReturn = func() {
+		go func() {
+			acknowledged, activate, ackErr := bindings.acknowledge(remoteCaptchaInputMessage{
+				Type: "frameAck", Generation: uint64Pointer(descriptor.Generation),
+				Width: float64Pointer(40), Height: float64Pointer(35),
+			})
+			ackResult <- result{frame: acknowledged, activate: activate, err: ackErr}
+		}()
+		runtime.Gosched()
+		select {
+		case premature := <-ackResult:
+			t.Fatalf("ACK decided before binary publish committed: %+v", premature)
+		default:
+		}
+	}
+	if err := bindings.writeBinaryFrame(writer, frame); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-ackResult:
+		if got.err != nil || !got.activate || got.frame.Generation != frame.Generation {
+			t.Fatalf("post-commit ACK=%+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ACK did not complete after binary publish committed")
+	}
+}
+
+func TestRemoteCaptchaWebSocketReconnectReplaysLastSanitizedFrame(t *testing.T) {
+	stream := newTestRemoteCaptchaStream()
+	stream.replay = remoteCaptchaTestOutput(t, 7, 40, 35)
+	writer := &credentialSurfaceWebSocketWriter{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	neverPing := make(chan time.Time)
+	go func() {
+		done <- writeRemoteCaptchaWebSocket(ctx, writer, stream, remoteCaptchaWebSocketTiming{
+			now: time.Now, after: func(time.Duration) <-chan time.Time { return neverPing },
+		})
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		writer.mu.Lock()
+		messages := append([]credentialSurfaceWebSocketMessage(nil), writer.messages...)
+		writer.mu.Unlock()
+		if len(messages) >= 2 {
+			if messages[0].messageType != websocket.TextMessage || messages[1].messageType != websocket.BinaryMessage ||
+				!bytes.Equal(messages[1].payload, stream.replay.JPEG) {
+				t.Fatalf("replayed WebSocket messages=%+v", messages)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reconnected writer did not replay the last sanitized frame")
+		}
+		runtime.Gosched()
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replay writer did not stop")
+	}
+}
+
+func TestRemoteCaptchaWebSocketExpectedStreamClosePublishesNormalClosure(t *testing.T) {
+	stream := newTestRemoteCaptchaStream()
+	stream.terminal = errRemoteCaptchaChallengeTeardown
+	close(stream.frames)
+	writer := &credentialSurfaceWebSocketWriter{}
+	if err := writeRemoteCaptchaWebSocket(context.Background(), writer, stream, remoteCaptchaWebSocketTiming{
+		now: time.Now, after: func(time.Duration) <-chan time.Time { return make(chan time.Time) },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writer.mu.Lock()
+	controls := append([]credentialSurfaceWebSocketMessage(nil), writer.controlMessages...)
+	writer.mu.Unlock()
+	if len(controls) != 1 || controls[0].messageType != websocket.CloseMessage || len(controls[0].payload) < 2 ||
+		binary.BigEndian.Uint16(controls[0].payload[:2]) != websocket.CloseNormalClosure {
+		t.Fatalf("expected stream close controls=%+v, want one close code 1000", controls)
+	}
+}
+
+func TestRemoteCaptchaWebSocketUnexpectedStreamFailureRemainsAbnormal(t *testing.T) {
+	stream := newTestRemoteCaptchaStream()
+	wantErr := errors.New("private DevTools pipe failed")
+	stream.terminal = wantErr
+	close(stream.frames)
+	writer := &credentialSurfaceWebSocketWriter{}
+	err := writeRemoteCaptchaWebSocket(context.Background(), writer, stream, remoteCaptchaWebSocketTiming{
+		now: time.Now, after: func(time.Duration) <-chan time.Time { return make(chan time.Time) },
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("unexpected stream failure=%v, want %v", err, wantErr)
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if len(writer.controlMessages) != 0 {
+		t.Fatalf("unexpected stream failure sent a normal close: %+v", writer.controlMessages)
+	}
+}
+
+func TestRemoteCaptchaWebSocketSkipsReplayQueueDuplicateGeneration(t *testing.T) {
+	frame := remoteCaptchaTestOutput(t, 19, 40, 35)
+	stream := &replayQueueRaceRemoteCaptchaStream{
+		testRemoteCaptchaStream: newTestRemoteCaptchaStream(), replayFrame: frame, replayRead: make(chan struct{}),
+	}
+	writer := &credentialSurfaceWebSocketWriter{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	neverPing := make(chan time.Time)
+	go func() {
+		done <- writeRemoteCaptchaWebSocket(ctx, writer, stream, remoteCaptchaWebSocketTiming{
+			now: time.Now, after: func(time.Duration) <-chan time.Time { return neverPing },
+		})
+	}()
+	select {
+	case <-stream.replayRead:
+	case <-time.After(time.Second):
+		t.Fatal("writer did not read reconnect replay")
+	}
+	stream.frames <- frame
+	next := remoteCaptchaTestOutput(t, 20, 40, 35)
+	go func() { stream.frames <- next }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		writer.mu.Lock()
+		messages := append([]credentialSurfaceWebSocketMessage(nil), writer.messages...)
+		writer.mu.Unlock()
+		if len(messages) == 4 {
+			var descriptor remoteCaptchaFrameDescriptor
+			if err := json.Unmarshal(messages[2].payload, &descriptor); err != nil || descriptor.Generation != next.Generation {
+				t.Fatalf("post-duplicate descriptor=%+v err=%v", descriptor, err)
+			}
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("duplicate replay/queue generation terminated writer before newer frame: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("writer did not skip duplicate and publish the next generation")
+		}
+		runtime.Gosched()
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("duplicate replay/queue generation terminated writer: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("writer did not stop")
+	}
+}
+
+func uint64Pointer(value uint64) *uint64 { return &value }
+
+func remoteCaptchaTestOutput(t *testing.T, generation uint64, width, height int) remoteCaptchaOutputFrame {
+	t.Helper()
+	return remoteCaptchaOutputFrame{
+		JPEG: credentialSurfaceJPEG(t, width, height, image.Rect(0, 0, width, height)), Generation: generation,
+		Binding: remoteCaptchaFrameBinding{
+			SourceWidth: width, SourceHeight: height, FrameWidth: width, FrameHeight: height,
+			Crop: image.Rect(0, 0, width, height), Surface: riotCaptchaSurface{Width: float64(width), Height: float64(height)},
+			Metadata: remoteCaptchaScreencastMetadata{PageScaleFactor: 1, DeviceWidth: float64(width), DeviceHeight: float64(height)},
+		},
 	}
 }
 
@@ -1035,7 +1368,25 @@ func TestRemoteCaptchaWebSocketInputRateAndBackpressureAreNonTerminal(t *testing
 			case <-time.After(time.Second):
 				t.Fatal("remote stream did not start")
 			}
-			input := []byte(`{"type":"pointer","phase":"move","x":320,"y":225,"width":640,"height":450,"button":0}`)
+			fixture.stream.frames <- remoteCaptchaTestOutput(t, 1, 40, 35)
+			_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+			messageType, metadataPayload, err := connection.ReadMessage()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var metadata remoteCaptchaFrameDescriptor
+			if messageType != websocket.TextMessage || json.Unmarshal(metadataPayload, &metadata) != nil {
+				t.Fatalf("frame metadata type=%d payload=%q", messageType, metadataPayload)
+			}
+			messageType, _, err = connection.ReadMessage()
+			if err != nil || messageType != websocket.BinaryMessage {
+				t.Fatalf("frame binary type=%d err=%v", messageType, err)
+			}
+			ack := []byte(fmt.Sprintf(`{"type":"frameAck","generation":%d,"width":40,"height":35}`, metadata.Generation))
+			if err := connection.WriteMessage(websocket.TextMessage, ack); err != nil {
+				t.Fatal(err)
+			}
+			input := []byte(fmt.Sprintf(`{"type":"pointer","phase":"move","x":20,"y":17,"width":40,"height":35,"generation":%d,"button":0}`, metadata.Generation))
 			if err := connection.WriteMessage(websocket.TextMessage, input); err != nil {
 				t.Fatal(err)
 			}
@@ -1160,15 +1511,15 @@ func TestRemoteCaptchaWebSocketWriterUsesBoundedUpstreamAndOneWriter(t *testing.
 	done := make(chan error, 1)
 	go func() { done <- writeRemoteCaptchaWebSocket(ctx, writer, stream, hooks) }()
 
-	stream.frames <- []byte("frame-1")
+	stream.frames <- remoteCaptchaTestOutput(t, 1, 40, 35)
 	select {
 	case <-writer.firstWriteStarted:
 	case <-time.After(time.Second):
 		t.Fatal("writer did not start first frame")
 	}
-	stream.frames <- []byte("frame-2")
+	stream.frames <- remoteCaptchaTestOutput(t, 2, 50, 45)
 	select {
-	case stream.frames <- []byte("frame-3"):
+	case stream.frames <- remoteCaptchaTestOutput(t, 3, 60, 55):
 		t.Fatal("WebSocket writer prefetched beyond the upstream size-one frame queue")
 	default:
 	}
@@ -1323,6 +1674,11 @@ func TestRemoteCaptchaWebSocketReadLimitAndPongRefreshAreBounded(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("connection did not stop after viewer cancellation")
 	}
+	select {
+	case <-stream.releaseCalls:
+	default:
+		t.Fatal("WebSocket teardown did not release the remote pointer state")
+	}
 }
 
 func TestRemoteCaptchaWebSocketBrowserExitClosesViewerAndPublishesFailure(t *testing.T) {
@@ -1409,12 +1765,13 @@ func TestRemoteCaptchaWebSocketRiotCompletionClosesViewerAndContinuesMFAOrPersis
 			case <-time.After(time.Second):
 				t.Fatal("remote stream did not start")
 			}
-			close(releaseResult)
+			fixture.stream.finish(errRemoteCaptchaChallengeTeardown)
 			_ = connection.SetReadDeadline(time.Now().Add(time.Second))
 			if _, _, err := connection.ReadMessage(); err == nil {
-				t.Fatal("Riot completion left WebSocket open")
+				t.Fatal("challenge teardown left WebSocket open")
 			}
 			_ = connection.Close()
+			close(releaseResult)
 			select {
 			case <-fixture.stream.done:
 			case <-time.After(time.Second):

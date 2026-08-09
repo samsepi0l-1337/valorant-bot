@@ -22,6 +22,10 @@ rmdir /etc/systemd/system/valorant-bot.service.d 2>/dev/null || true
 rm -f /etc/systemd/system/valorant-captcha-display.service
 rm -f /etc/valorant-bot/remote-captcha.conf
 rm -f /etc/tmpfiles.d/valorant-captcha-display.conf
+rm -f /usr/local/libexec/valorant-bot/prepare-captcha-display-auth
+rmdir /usr/local/libexec/valorant-bot 2>/dev/null || true
+rm -f /run/valorant-captcha-display/Xauthority
+rmdir /run/valorant-captcha-display/X11-unix 2>/dev/null || true
 rmdir /run/valorant-captcha-display 2>/dev/null || true
 rm -f /usr/local/bin/valorant-bot
 systemctl daemon-reload

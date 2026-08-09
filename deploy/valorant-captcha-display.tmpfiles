@@ -1,1 +1,2 @@
-d /run/valorant-captcha-display 1777 root root -
+d /run/valorant-captcha-display 0700 valorant valorant -
+d /run/valorant-captcha-display/X11-unix 01777 root root -

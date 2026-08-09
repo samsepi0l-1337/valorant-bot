@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -17,20 +18,33 @@ type remoteCaptchaTestCommand struct {
 	Method    string `json:"method"`
 	SessionID string `json:"sessionId"`
 	Params    struct {
-		Format         string  `json:"format"`
-		Quality        int     `json:"quality"`
-		MaxWidth       int     `json:"maxWidth"`
-		MaxHeight      int     `json:"maxHeight"`
-		FrameSessionID int64   `json:"sessionId"`
-		MouseType      string  `json:"type"`
-		X              float64 `json:"x"`
-		Y              float64 `json:"y"`
-		Button         string  `json:"button"`
-		Buttons        int     `json:"buttons"`
-		ClickCount     int     `json:"clickCount"`
-		DeltaX         float64 `json:"deltaX"`
-		DeltaY         float64 `json:"deltaY"`
-		PointerType    string  `json:"pointerType"`
+		Format                string  `json:"format"`
+		Quality               int     `json:"quality"`
+		MaxWidth              int     `json:"maxWidth"`
+		MaxHeight             int     `json:"maxHeight"`
+		FrameSessionID        int64   `json:"sessionId"`
+		MouseType             string  `json:"type"`
+		X                     float64 `json:"x"`
+		Y                     float64 `json:"y"`
+		Button                string  `json:"button"`
+		Buttons               int     `json:"buttons"`
+		ClickCount            int     `json:"clickCount"`
+		DeltaX                float64 `json:"deltaX"`
+		DeltaY                float64 `json:"deltaY"`
+		PointerType           string  `json:"pointerType"`
+		Expression            string  `json:"expression"`
+		Source                string  `json:"source"`
+		RunImmediately        bool    `json:"runImmediately"`
+		Ignore                bool    `json:"ignore"`
+		FromSurface           bool    `json:"fromSurface"`
+		CaptureBeyondViewport bool    `json:"captureBeyondViewport"`
+		Clip                  struct {
+			X      float64 `json:"x"`
+			Y      float64 `json:"y"`
+			Width  float64 `json:"width"`
+			Height float64 `json:"height"`
+			Scale  float64 `json:"scale"`
+		} `json:"clip"`
 	} `json:"params"`
 }
 
@@ -97,6 +111,7 @@ func startRemoteCaptchaTestStream(t *testing.T, client *chromeDevToolsClient, br
 
 func startRemoteCaptchaControllerTestStream(t *testing.T, controller *chromeBrowserController, browser *chromeDevToolsPipe, owners [4]context.Context) *remoteCaptchaStream {
 	t.Helper()
+	controller.publishRiotCaptchaSurface(riotCaptchaSurface{Width: remoteCaptchaViewportWidth, Height: remoteCaptchaViewportHeight}, nil)
 	type result struct {
 		stream *remoteCaptchaStream
 		err    error
@@ -106,11 +121,12 @@ func startRemoteCaptchaControllerTestStream(t *testing.T, controller *chromeBrow
 		stream, err := controller.StartRemoteCaptchaStream(owners[0], owners[1], owners[2], owners[3])
 		done <- result{stream: stream, err: err}
 	}()
-	start := nextRemoteCaptchaTestCommand(t, browser)
-	if start.Method != "Page.startScreencast" {
-		t.Fatalf("first controller stream command=%q, want Page.startScreencast", start.Method)
+	replyRemoteCaptchaCurtainInstall(t, browser)
+	gate := nextRemoteCaptchaTestCommand(t, browser)
+	if gate.Method != "Input.setIgnoreInputEvents" || !gate.Params.Ignore {
+		t.Fatalf("controller initial input gate=%+v", gate)
 	}
-	replyRemoteCaptchaTestCommand(t, browser, start.ID)
+	replyRemoteCaptchaTestCommand(t, browser, gate.ID)
 	select {
 	case result := <-done:
 		if result.err != nil {
@@ -204,6 +220,7 @@ func TestRemoteCaptchaStreamControllerOwnsSharedClientAndRequiresFourLifetimes(t
 			t.Fatal(err)
 		}
 		ownedClient.setSessionID("riot-session")
+		controller.publishRiotCaptchaSurface(riotCaptchaSurface{Width: remoteCaptchaViewportWidth, Height: remoteCaptchaViewportHeight}, nil)
 		type startResult struct {
 			stream *remoteCaptchaStream
 			err    error
@@ -215,11 +232,12 @@ func TestRemoteCaptchaStreamControllerOwnsSharedClientAndRequiresFourLifetimes(t
 			)
 			started <- startResult{stream: stream, err: startErr}
 		}()
-		start := nextRemoteCaptchaTestCommand(t, browser)
-		if start.Method != "Page.startScreencast" {
-			t.Fatalf("controller start method=%q", start.Method)
+		replyRemoteCaptchaCurtainInstall(t, browser)
+		gate := nextRemoteCaptchaTestCommand(t, browser)
+		if gate.Method != "Input.setIgnoreInputEvents" || !gate.Params.Ignore {
+			t.Fatalf("initial input gate=%+v", gate)
 		}
-		replyRemoteCaptchaTestCommand(t, browser, start.ID)
+		replyRemoteCaptchaTestCommand(t, browser, gate.ID)
 		startedResult := <-started
 		if startedResult.err != nil {
 			t.Fatal(startedResult.err)
@@ -227,7 +245,11 @@ func TestRemoteCaptchaStreamControllerOwnsSharedClientAndRequiresFourLifetimes(t
 		if startedResult.stream.client != ownedClient || controller.devToolsClient != ownedClient {
 			t.Fatal("controller and remote stream did not reuse one owned DevTools client")
 		}
-		closeRemoteCaptchaTestStream(t, startedResult.stream, browser)
+		closeCtx, cancelClose := context.WithTimeout(context.Background(), time.Second)
+		defer cancelClose()
+		if err := startedResult.stream.Close(closeCtx); err != nil {
+			t.Fatal(err)
+		}
 	})
 
 	for missing, name := range []string{"password flow", "Chrome process", "viewer session", "server shutdown"} {
@@ -297,8 +319,8 @@ func TestRemoteCaptchaStreamSubscribesBeforeStartAndAcknowledgesFirstFrame(t *te
 	replyRemoteCaptchaTestCommand(t, browser, ack.ID)
 	select {
 	case frame := <-result.stream.Frames():
-		if !bytes.Equal(frame, wantFrame) {
-			t.Fatalf("frame=%q, want %q", frame, wantFrame)
+		if !bytes.Equal(frame.JPEG, wantFrame) {
+			t.Fatalf("frame=%q, want %q", frame.JPEG, wantFrame)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("first screencast frame was not retained")
@@ -345,8 +367,8 @@ func TestRemoteCaptchaStreamDropsOldFrameAndRetainsNewest(t *testing.T) {
 	}
 	select {
 	case frame := <-stream.Frames():
-		if string(frame) != "new-frame" {
-			t.Fatalf("queued frame=%q, want newest", frame)
+		if string(frame.JPEG) != "new-frame" {
+			t.Fatalf("queued frame=%q, want newest", frame.JPEG)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("newest frame was not queued")
@@ -354,8 +376,8 @@ func TestRemoteCaptchaStreamDropsOldFrameAndRetainsNewest(t *testing.T) {
 	replyRemoteCaptchaTestCommand(t, browser, barrierAck.ID)
 	select {
 	case frame := <-stream.Frames():
-		if string(frame) != "ack-barrier-frame" {
-			t.Fatalf("barrier frame=%q", frame)
+		if string(frame.JPEG) != "ack-barrier-frame" {
+			t.Fatalf("barrier frame=%q", frame.JPEG)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("frame handler did not finish after barrier ACK")
@@ -396,20 +418,20 @@ func TestRemoteCaptchaStreamDispatchesValidatedPointerAndWheelInput(t *testing.T
 		deltaY     float64
 	}{
 		{
-			name: "move clamps to fixed viewport", payload: `{"type":"pointer","phase":"move","x":-12,"y":999,"width":640,"height":450,"button":0}`,
-			mouseType: "mouseMoved", x: 0, y: 900, button: "none",
+			name: "move inside acknowledged viewport", payload: `{"type":"pointer","phase":"move","x":12,"y":899,"width":1280,"height":900,"button":0}`,
+			mouseType: "mouseMoved", x: 12, y: 899, button: "none",
 		},
 		{
-			name: "primary press", payload: `{"type":"pointer","phase":"down","x":120.5,"y":44.25,"width":640,"height":450,"button":0}`,
+			name: "primary press", payload: `{"type":"pointer","phase":"down","x":120.5,"y":44.25,"width":1280,"height":900,"button":0}`,
 			mouseType: "mousePressed", x: 120.5, y: 44.25, button: "left", buttons: 1, clickCount: 1,
 		},
 		{
-			name: "primary release", payload: `{"type":"pointer","phase":"up","x":120.5,"y":44.25,"width":640,"height":450,"button":0}`,
+			name: "primary release", payload: `{"type":"pointer","phase":"up","x":120.5,"y":44.25,"width":1280,"height":900,"button":0}`,
 			mouseType: "mouseReleased", x: 120.5, y: 44.25, button: "left", clickCount: 1,
 		},
 		{
-			name: "vertical wheel clamps coordinates", payload: `{"type":"wheel","x":1300,"y":-4,"width":640,"height":450,"deltaY":64}`,
-			mouseType: "mouseWheel", x: 1280, y: 0, button: "none", deltaY: 64,
+			name: "vertical wheel inside acknowledged viewport", payload: `{"type":"wheel","x":1279,"y":4,"width":1280,"height":900,"deltaY":64}`,
+			mouseType: "mouseWheel", x: 1279, y: 4, button: "none", deltaY: 64,
 		},
 	}
 	for _, test := range tests {
@@ -435,6 +457,228 @@ func TestRemoteCaptchaStreamDispatchesValidatedPointerAndWheelInput(t *testing.T
 		})
 	}
 	closeRemoteCaptchaTestStream(t, stream, browser)
+}
+
+func TestRemoteCaptchaStreamKeepsPrimaryButtonPressedAcrossDragMove(t *testing.T) {
+	host, browser := newTestChromeDevToolsPipes()
+	t.Cleanup(func() {
+		_ = host.Close()
+		_ = browser.Close()
+	})
+	client := newChromeDevToolsClient(host)
+	client.setSessionID("riot-session")
+	stream := startRemoteCaptchaTestStream(t, client, browser, context.Background())
+
+	tests := []struct {
+		payload   string
+		mouseType string
+		buttons   int
+	}{
+		{`{"type":"pointer","phase":"down","x":120,"y":80,"width":1280,"height":900,"button":0}`, "mousePressed", 1},
+		{`{"type":"pointer","phase":"move","x":240,"y":160,"width":1280,"height":900,"button":0}`, "mouseMoved", 1},
+		{`{"type":"pointer","phase":"up","x":240,"y":160,"width":1280,"height":900,"button":0}`, "mouseReleased", 0},
+	}
+	for _, test := range tests {
+		dispatched := make(chan error, 1)
+		go func(payload string) {
+			dispatched <- stream.DispatchInput(context.Background(), []byte(payload))
+		}(test.payload)
+		command := nextRemoteCaptchaTestCommand(t, browser)
+		if command.Method != "Input.dispatchMouseEvent" || command.Params.MouseType != test.mouseType || command.Params.Buttons != test.buttons {
+			t.Fatalf("drag command=%+v, want type=%q buttons=%d", command, test.mouseType, test.buttons)
+		}
+		replyRemoteCaptchaTestCommand(t, browser, command.ID)
+		if err := <-dispatched; err != nil {
+			t.Fatal(err)
+		}
+	}
+	closeRemoteCaptchaTestStream(t, stream, browser)
+}
+
+func TestRemoteCaptchaStreamPrioritizesAndSynthesizesPrimaryRelease(t *testing.T) {
+	host, browser := newTestChromeDevToolsPipes()
+	t.Cleanup(func() {
+		_ = host.Close()
+		_ = browser.Close()
+	})
+	client := newChromeDevToolsClient(host)
+	client.setSessionID("riot-session")
+	stream := startRemoteCaptchaTestStream(t, client, browser, context.Background())
+
+	dispatch := func(payload, wantType string, wantX, wantY float64) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- stream.DispatchInput(context.Background(), []byte(payload)) }()
+		command := nextRemoteCaptchaTestCommand(t, browser)
+		if command.Method != "Input.dispatchMouseEvent" || command.Params.MouseType != wantType || command.Params.X != wantX || command.Params.Y != wantY {
+			t.Fatalf("pointer command=%+v, want type=%q at (%v,%v)", command, wantType, wantX, wantY)
+		}
+		replyRemoteCaptchaTestCommand(t, browser, command.ID)
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	dispatch(`{"type":"pointer","phase":"down","x":120,"y":80,"width":1280,"height":900,"button":0}`, "mousePressed", 120, 80)
+	stream.inputLimiter.mu.Lock()
+	stream.inputLimiter.tokens = 0
+	stream.inputLimiter.last = time.Now()
+	stream.inputLimiter.mu.Unlock()
+	dispatch(`{"type":"pointer","phase":"up","x":240,"y":160,"width":1280,"height":900,"button":0}`, "mouseReleased", 240, 160)
+
+	stream.inputLimiter.mu.Lock()
+	stream.inputLimiter.tokens = remoteCaptchaInputBurst
+	stream.inputLimiter.last = time.Now()
+	stream.inputLimiter.mu.Unlock()
+	dispatch(`{"type":"pointer","phase":"down","x":300,"y":200,"width":1280,"height":900,"button":0}`, "mousePressed", 300, 200)
+	released := make(chan error, 1)
+	go func() { released <- stream.ReleasePointer(context.Background()) }()
+	command := nextRemoteCaptchaTestCommand(t, browser)
+	if command.Method != "Input.dispatchMouseEvent" || command.Params.MouseType != "mouseReleased" || command.Params.X != 300 || command.Params.Y != 200 || command.Params.Buttons != 0 {
+		t.Fatalf("synthetic release command=%+v", command)
+	}
+	replyRemoteCaptchaTestCommand(t, browser, command.ID)
+	if err := <-released; err != nil {
+		t.Fatal(err)
+	}
+	if stream.pointerPressed {
+		t.Fatal("synthetic release retained pressed pointer state")
+	}
+	closeRemoteCaptchaTestStream(t, stream, browser)
+}
+
+func TestRemoteCaptchaStreamIgnoresUnpressedReleaseFlood(t *testing.T) {
+	host, browser := newTestChromeDevToolsPipes()
+	t.Cleanup(func() {
+		_ = host.Close()
+		_ = browser.Close()
+	})
+	client := newChromeDevToolsClient(host)
+	client.setSessionID("riot-session")
+	stream := startRemoteCaptchaTestStream(t, client, browser, context.Background())
+	client.mu.Lock()
+	before := client.nextID
+	client.mu.Unlock()
+	for index := 0; index < 100; index++ {
+		if err := stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"up","x":240,"y":160,"width":1280,"height":900,"button":0}`)); err != nil {
+			t.Fatalf("unpressed release %d error=%v", index, err)
+		}
+	}
+	client.mu.Lock()
+	after := client.nextID
+	client.mu.Unlock()
+	if after != before {
+		t.Fatalf("unpressed release flood issued %d Chrome commands", after-before)
+	}
+	closeRemoteCaptchaTestStream(t, stream, browser)
+}
+
+func TestRemoteCaptchaExpectedTeardownClearsPressedStateWithoutProtocolFailure(t *testing.T) {
+	host, browser := newTestChromeDevToolsPipes()
+	t.Cleanup(func() {
+		_ = host.Close()
+		_ = browser.Close()
+	})
+	client := newChromeDevToolsClient(host)
+	client.setSessionID("riot-session")
+	stream := startRemoteCaptchaTestStream(t, client, browser, context.Background())
+	dispatched := make(chan error, 1)
+	go func() {
+		dispatched <- stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"down","x":120,"y":80,"width":1280,"height":900,"button":0}`))
+	}()
+	command := nextRemoteCaptchaTestCommand(t, browser)
+	replyRemoteCaptchaTestCommand(t, browser, command.ID)
+	if err := <-dispatched; err != nil {
+		t.Fatal(err)
+	}
+	stream.finish(errRemoteCaptchaChallengeTeardown, nil)
+	if err := stream.ReleasePointer(context.Background()); err != nil {
+		t.Fatalf("expected teardown release error=%v", err)
+	}
+	if stream.pointerPressed {
+		t.Fatal("expected teardown retained pressed pointer state")
+	}
+}
+
+func TestRemoteCaptchaDispatchAfterExpectedTeardownReturnsTerminalCause(t *testing.T) {
+	host, browser := newTestChromeDevToolsPipes()
+	t.Cleanup(func() {
+		_ = host.Close()
+		_ = browser.Close()
+	})
+	client := newChromeDevToolsClient(host)
+	client.setSessionID("riot-session")
+	stream := startRemoteCaptchaTestStream(t, client, browser, context.Background())
+
+	stream.finish(errRemoteCaptchaChallengeTeardown, nil)
+	err := stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"move","x":120,"y":80,"width":1280,"height":900,"button":0}`))
+	if !errors.Is(err, errRemoteCaptchaChallengeTeardown) {
+		t.Fatalf("post-teardown input error=%v, want challenge teardown", err)
+	}
+}
+
+func TestRemoteCaptchaFinishPublishesExpectedTeardownBeforeCancelingInput(t *testing.T) {
+	streamCtx, cancelStream := context.WithCancel(context.Background())
+	cancelEntered := make(chan struct{})
+	releaseCancel := make(chan struct{})
+	stream := &remoteCaptchaStream{
+		ctx:    streamCtx,
+		done:   make(chan struct{}),
+		frames: make(chan remoteCaptchaOutputFrame),
+		cancel: func() {
+			cancelStream()
+			close(cancelEntered)
+			<-releaseCancel
+		},
+	}
+	finished := make(chan struct{})
+	go func() {
+		stream.finish(errRemoteCaptchaChallengeTeardown, nil)
+		close(finished)
+	}()
+	select {
+	case <-cancelEntered:
+	case <-time.After(time.Second):
+		t.Fatal("stream cancellation did not start")
+	}
+	err := stream.DispatchInput(context.Background(), []byte(`{"type":"pointer"}`))
+	if !errors.Is(err, errRemoteCaptchaChallengeTeardown) {
+		t.Fatalf("input during finish error=%v, want published challenge teardown", err)
+	}
+	close(releaseCancel)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("stream finish remained blocked after cancellation release")
+	}
+}
+
+func TestRemoteCaptchaDispatchInFlightAtExpectedTeardownReturnsTerminalCause(t *testing.T) {
+	host, browser := newTestChromeDevToolsPipes()
+	t.Cleanup(func() {
+		_ = host.Close()
+		_ = browser.Close()
+	})
+	client := newChromeDevToolsClient(host)
+	client.setSessionID("riot-session")
+	stream := startRemoteCaptchaTestStream(t, client, browser, context.Background())
+
+	dispatched := make(chan error, 1)
+	go func() {
+		dispatched <- stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"move","x":120,"y":80,"width":1280,"height":900,"button":0}`))
+	}()
+	command := nextRemoteCaptchaTestCommand(t, browser)
+	if command.Method != "Input.dispatchMouseEvent" {
+		t.Fatalf("in-flight command=%q, want Input.dispatchMouseEvent", command.Method)
+	}
+	stream.finish(errRemoteCaptchaChallengeTeardown, nil)
+	select {
+	case err := <-dispatched:
+		if !errors.Is(err, errRemoteCaptchaChallengeTeardown) {
+			t.Fatalf("in-flight teardown input error=%v, want challenge teardown", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("in-flight input did not observe challenge teardown")
+	}
 }
 
 func TestRemoteCaptchaStreamRejectsMalformedOrUnsupportedInput(t *testing.T) {
@@ -473,7 +717,7 @@ func TestRemoteCaptchaStreamRejectsMalformedOrUnsupportedInput(t *testing.T) {
 
 	dispatched := make(chan error, 1)
 	go func() {
-		dispatched <- stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"move","x":3,"y":4,"button":0}`))
+		dispatched <- stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"move","x":3,"y":4,"width":1280,"height":900,"button":0}`))
 	}()
 	command := nextRemoteCaptchaTestCommand(t, browser)
 	if command.Method != "Input.dispatchMouseEvent" || command.Params.MouseType != "mouseMoved" {
@@ -553,7 +797,7 @@ func TestRemoteCaptchaStreamAppliesInputRateLimit(t *testing.T) {
 	stream := startRemoteCaptchaTestStream(t, client, browser, context.Background())
 	now := time.Unix(200, 0)
 	stream.inputLimiter = newRemoteCaptchaInputLimiter(func() time.Time { return now })
-	payload := []byte(`{"type":"pointer","phase":"move","x":1,"y":2,"button":0}`)
+	payload := []byte(`{"type":"pointer","phase":"move","x":1,"y":2,"width":1280,"height":900,"button":0}`)
 	for index := 0; index < remoteCaptchaInputBurst; index++ {
 		result := make(chan error, 1)
 		go func() { result <- stream.DispatchInput(context.Background(), payload) }()
@@ -621,11 +865,6 @@ func TestRemoteCaptchaStreamStopsWhenAnyOwnedLifetimeEnds(t *testing.T) {
 			}
 			stream := startRemoteCaptchaControllerTestStream(t, controller, browser, lifetimes)
 			cancels[canceledIndex]()
-			stop := nextRemoteCaptchaTestCommand(t, browser)
-			if stop.Method != "Page.stopScreencast" {
-				t.Fatalf("lifetime cancellation command=%q, want Page.stopScreencast", stop.Method)
-			}
-			replyRemoteCaptchaTestCommand(t, browser, stop.ID)
 			select {
 			case <-stream.Done():
 			case <-time.After(time.Second):
@@ -927,24 +1166,32 @@ func TestRemoteCaptchaStreamBoundsOutstandingInput(t *testing.T) {
 	stream := startRemoteCaptchaTestStream(t, client, browser, context.Background())
 
 	results := make(chan error, remoteCaptchaMaxOutstandingInput)
-	commands := make([]remoteCaptchaTestCommand, 0, remoteCaptchaMaxOutstandingInput)
 	for index := 0; index < remoteCaptchaMaxOutstandingInput; index++ {
 		go func() {
-			results <- stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"move","x":1,"y":2,"button":0}`))
+			results <- stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"move","x":1,"y":2,"width":1280,"height":900,"button":0}`))
 		}()
 	}
-	for index := 0; index < remoteCaptchaMaxOutstandingInput; index++ {
-		command := nextRemoteCaptchaTestCommand(t, browser)
-		if command.Method != "Input.dispatchMouseEvent" {
-			t.Fatalf("outstanding command %d=%q", index, command.Method)
-		}
-		commands = append(commands, command)
+	first := nextRemoteCaptchaTestCommand(t, browser)
+	if first.Method != "Input.dispatchMouseEvent" {
+		t.Fatalf("first outstanding command=%q", first.Method)
 	}
-	if err := stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"move","x":9,"y":2,"button":0}`)); !errors.Is(err, errRemoteCaptchaInputBusy) {
+	deadline := time.Now().Add(time.Second)
+	for len(stream.inputSlots) != cap(stream.inputSlots) {
+		if time.Now().After(deadline) {
+			t.Fatalf("outstanding input slots=%d, want %d", len(stream.inputSlots), cap(stream.inputSlots))
+		}
+		runtime.Gosched()
+	}
+	if err := stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"move","x":9,"y":2,"width":1280,"height":900,"button":0}`)); !errors.Is(err, errRemoteCaptchaInputBusy) {
 		t.Fatalf("excess outstanding input error=%v, want bounded queue", err)
 	}
 
-	for _, command := range commands {
+	replyRemoteCaptchaTestCommand(t, browser, first.ID)
+	for index := 1; index < remoteCaptchaMaxOutstandingInput; index++ {
+		command := nextRemoteCaptchaTestCommand(t, browser)
+		if command.Method != "Input.dispatchMouseEvent" {
+			t.Fatalf("serialized outstanding command %d=%q", index, command.Method)
+		}
 		replyRemoteCaptchaTestCommand(t, browser, command.ID)
 	}
 	for index := 0; index < remoteCaptchaMaxOutstandingInput; index++ {
@@ -973,14 +1220,13 @@ func TestRemoteCaptchaStreamCancelsPendingInputWithoutPoisoningClient(t *testing
 	firstCtx, cancelFirst := context.WithCancel(context.Background())
 	firstResult := make(chan error, 1)
 	go func() {
-		firstResult <- stream.DispatchInput(firstCtx, []byte(`{"type":"pointer","phase":"move","x":1,"y":2,"button":0}`))
+		firstResult <- stream.DispatchInput(firstCtx, []byte(`{"type":"pointer","phase":"move","x":1,"y":2,"width":1280,"height":900,"button":0}`))
 	}()
 	first := nextRemoteCaptchaTestCommand(t, browser)
 	secondResult := make(chan error, 1)
 	go func() {
-		secondResult <- stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"move","x":3,"y":4,"button":0}`))
+		secondResult <- stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"move","x":3,"y":4,"width":1280,"height":900,"button":0}`))
 	}()
-	second := nextRemoteCaptchaTestCommand(t, browser)
 	cancelFirst()
 	select {
 	case err := <-firstResult:
@@ -990,6 +1236,7 @@ func TestRemoteCaptchaStreamCancelsPendingInputWithoutPoisoningClient(t *testing
 	case <-time.After(time.Second):
 		t.Fatal("pending input did not cancel")
 	}
+	second := nextRemoteCaptchaTestCommand(t, browser)
 	replyRemoteCaptchaTestCommand(t, browser, second.ID)
 	if err := <-secondResult; err != nil {
 		t.Fatalf("second input failed after first canceled: %v", err)
@@ -1014,7 +1261,7 @@ func TestRemoteCaptchaStreamRejectsViewportMetadataWithoutForwardingCDP(t *testi
 
 	dispatched := make(chan error, 1)
 	go func() {
-		dispatched <- stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"move","x":1,"y":2,"button":0}`))
+		dispatched <- stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"move","x":1,"y":2,"width":1280,"height":900,"button":0}`))
 	}()
 	command := nextRemoteCaptchaTestCommand(t, browser)
 	if command.Method != "Input.dispatchMouseEvent" {

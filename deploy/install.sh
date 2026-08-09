@@ -27,6 +27,10 @@ REMOTE_CAPTCHA_DROPIN_DIR=/etc/systemd/system/valorant-bot.service.d
 REMOTE_CAPTCHA_DROPIN_DST="${REMOTE_CAPTCHA_DROPIN_DIR}/remote-captcha.conf"
 REMOTE_CAPTCHA_TMPFILES_SRC="${ROOT}/deploy/valorant-captcha-display.tmpfiles"
 REMOTE_CAPTCHA_TMPFILES_DST=/etc/tmpfiles.d/valorant-captcha-display.conf
+REMOTE_CAPTCHA_AUTH_HELPER_SRC="${ROOT}/deploy/prepare-captcha-display-auth"
+REMOTE_CAPTCHA_AUTH_HELPER_DIR=/usr/local/libexec/valorant-bot
+REMOTE_CAPTCHA_AUTH_HELPER_DST="${REMOTE_CAPTCHA_AUTH_HELPER_DIR}/prepare-captcha-display-auth"
+REMOTE_CAPTCHA_ORIGIN_VALIDATOR="${ROOT}/deploy/validate-remote-captcha-origin.py"
 USER_NAME=valorant
 GROUP_NAME=valorant
 
@@ -76,14 +80,83 @@ validate_remote_captcha_dependencies() {
     echo "remote CAPTCHA dependency missing: Chromium" >&2
     missing=1
   fi
+  if [[ ! -x /usr/bin/xauth ]]; then
+    echo "remote CAPTCHA dependency missing: xauth" >&2
+    missing=1
+  fi
+  if [[ ! -x /usr/bin/mcookie ]]; then
+    echo "remote CAPTCHA dependency missing: mcookie (util-linux)" >&2
+    missing=1
+  fi
+  if [[ ! -x /usr/bin/python3 ]]; then
+    echo "remote CAPTCHA dependency missing: python3 (install-time origin validator)" >&2
+    missing=1
+  fi
   if [[ "$missing" -ne 0 ]]; then
-    echo "Install dependencies first: sudo apt-get update && sudo apt-get install -y xvfb chromium" >&2
+    echo "Install dependencies first: sudo apt-get update && sudo apt-get install -y xvfb chromium xauth util-linux python3" >&2
     return 1
   fi
 }
 
+resolve_env_source() {
+  if [[ -f "$ENV_DST" ]]; then
+    return 0
+  fi
+  if [[ -z "$ENV_SRC" ]]; then
+    local arch
+    arch="$(uname -m)"
+    case "$arch" in
+      aarch64|arm64|armv7l|armv6l) ENV_SRC="${ROOT}/deploy/env.pi.example" ;;
+      *) ENV_SRC="${ROOT}/deploy/env.server.example" ;;
+    esac
+  fi
+  if [[ ! -f "$ENV_SRC" ]]; then
+    echo "env template missing: $ENV_SRC" >&2
+    exit 1
+  fi
+}
+
+read_remote_captcha_origin() {
+  local env_file="$1" line value="" count=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    if [[ "$line" == AUTH_BASE_URL=* ]]; then
+      value="${line#AUTH_BASE_URL=}"
+      count=$((count + 1))
+    fi
+  done < "$env_file"
+  if [[ "$count" -ne 1 ]]; then
+    echo "remote CAPTCHA requires exactly one AUTH_BASE_URL entry in $env_file" >&2
+    return 1
+  fi
+  printf '%s' "$value"
+}
+
+validate_remote_captcha_origin() {
+  local auth_base="$1"
+  /usr/bin/python3 "$REMOTE_CAPTCHA_ORIGIN_VALIDATOR" "$auth_base"
+}
+
+# Finish every remote-mode preflight before building, creating users, copying
+# files, reloading systemd, or changing service state.
+resolve_env_source
 if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
   validate_remote_captcha_dependencies
+  for asset in "$DISPLAY_SERVICE_SRC" "$REMOTE_CAPTCHA_ENV_SRC" \
+    "$REMOTE_CAPTCHA_TMPFILES_SRC" "$REMOTE_CAPTCHA_AUTH_HELPER_SRC" \
+    "$REMOTE_CAPTCHA_ORIGIN_VALIDATOR"; do
+    if [[ ! -f "$asset" ]]; then
+      echo "remote CAPTCHA deployment asset missing: $asset" >&2
+      exit 1
+    fi
+  done
+  if [[ -f "$ENV_DST" ]]; then
+    remote_auth_base="$(read_remote_captcha_origin "$ENV_DST")"
+  else
+    remote_auth_base="$(read_remote_captcha_origin "$ENV_SRC")"
+  fi
+  validate_remote_captcha_origin "$remote_auth_base"
+  unset remote_auth_base
 fi
 
 detect_binary() {
@@ -143,26 +216,25 @@ install -m 0755 "$BINARY" "$BIN_DST"
 install -m 0644 "$SERVICE_SRC" "$SERVICE_DST"
 
 if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
-  if [[ ! -f "$DISPLAY_SERVICE_SRC" || ! -f "$REMOTE_CAPTCHA_ENV_SRC" || ! -f "$REMOTE_CAPTCHA_TMPFILES_SRC" ]]; then
-    echo "remote CAPTCHA deployment assets are missing" >&2
-    exit 1
-  fi
   install -m 0644 "$DISPLAY_SERVICE_SRC" "$DISPLAY_SERVICE_DST"
   install -m 0640 -o root -g "$GROUP_NAME" "$REMOTE_CAPTCHA_ENV_SRC" "$REMOTE_CAPTCHA_ENV_DST"
   install -m 0644 "$REMOTE_CAPTCHA_TMPFILES_SRC" "$REMOTE_CAPTCHA_TMPFILES_DST"
+  install -d -m 0755 "$REMOTE_CAPTCHA_AUTH_HELPER_DIR"
+  install -m 0755 "$REMOTE_CAPTCHA_AUTH_HELPER_SRC" "$REMOTE_CAPTCHA_AUTH_HELPER_DST"
   systemd-tmpfiles --create "$REMOTE_CAPTCHA_TMPFILES_DST"
   install -d -m 0755 "$REMOTE_CAPTCHA_DROPIN_DIR"
   REMOTE_CAPTCHA_DROPIN_TMP="$(mktemp)"
   trap 'rm -f "$REMOTE_CAPTCHA_DROPIN_TMP"' EXIT
   cat > "$REMOTE_CAPTCHA_DROPIN_TMP" <<'EOF'
 [Unit]
-Requires=valorant-captcha-display.service
+Wants=valorant-captcha-display.service
 After=valorant-captcha-display.service
 
 [Service]
-# Share only the private Xvfb Unix socket; Xvfb has no TCP listener.
+# A missing optional source must not stop the QR-capable bot. Xvfb has no TCP
+# listener; when present, share only its root-owned sticky socket directory.
 EnvironmentFile=/etc/valorant-bot/remote-captcha.conf
-BindPaths=/run/valorant-captcha-display:/tmp/.X11-unix
+BindPaths=-/run/valorant-captcha-display/X11-unix:/tmp/.X11-unix
 EOF
   install -m 0644 "$REMOTE_CAPTCHA_DROPIN_TMP" "$REMOTE_CAPTCHA_DROPIN_DST"
   rm -f "$REMOTE_CAPTCHA_DROPIN_TMP"
@@ -170,17 +242,6 @@ EOF
 fi
 
 if [[ ! -f "$ENV_DST" ]]; then
-  if [[ -z "$ENV_SRC" ]]; then
-    arch="$(uname -m)"
-    case "$arch" in
-      aarch64|arm64|armv7l|armv6l) ENV_SRC="${ROOT}/deploy/env.pi.example" ;;
-      *) ENV_SRC="${ROOT}/deploy/env.server.example" ;;
-    esac
-  fi
-  if [[ ! -f "$ENV_SRC" ]]; then
-    echo "env template missing: $ENV_SRC" >&2
-    exit 1
-  fi
   install -m 0640 -o root -g "$GROUP_NAME" "$ENV_SRC" "$ENV_DST"
   echo "wrote $ENV_DST from $ENV_SRC — edit secrets before start"
 else
@@ -191,9 +252,9 @@ systemctl daemon-reload
 
 if [[ "$SKIP_START" -eq 1 ]]; then
   if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
-    echo "installed remote CAPTCHA display. Edit $ENV_DST then: systemctl enable --now valorant-captcha-display valorant-bot"
+    echo "installed remote CAPTCHA display. Edit $ENV_DST, enable both units, then start valorant-captcha-display and valorant-bot separately"
   else
-    echo "installed. Edit $ENV_DST then: systemctl enable --now valorant-bot"
+    echo "installed. Edit $ENV_DST, then enable and restart valorant-bot"
   fi
   exit 0
 fi
@@ -205,13 +266,17 @@ fi
 if grep -Eq 'DISCORD_TOKEN=$|DISCORD_TOKEN=\s*$|BOT_SECRET=change-me' "$ENV_DST" 2>/dev/null; then
   echo "env still has placeholders — not starting."
   echo "  sudo nano $ENV_DST"
-  echo "  sudo systemctl enable --now valorant-bot"
+  echo "  sudo systemctl enable valorant-bot"
+  echo "  sudo systemctl restart valorant-bot"
   exit 0
 fi
 
 if [[ "$REMOTE_CAPTCHA" -eq 1 ]]; then
-  systemctl start valorant-captcha-display
+  if ! systemctl restart valorant-captcha-display; then
+    echo "warning: remote CAPTCHA display failed; starting the bot with Riot Mobile QR still available" >&2
+  fi
 fi
-systemctl enable --now valorant-bot
+systemctl enable valorant-bot
+systemctl restart valorant-bot
 systemctl --no-pager --full status valorant-bot || true
 echo "logs: journalctl -u valorant-bot -f"

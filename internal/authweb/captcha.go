@@ -17,8 +17,13 @@ import (
 	"github.com/dosfsociety/valorant-bot/internal/riot"
 )
 
-// ErrCaptchaOwner means a Discord user tried to control another user's login.
-var ErrCaptchaOwner = errors.New("only the login owner can open this captcha")
+var (
+	// ErrCaptchaOwner means a Discord user tried to control another user's login.
+	ErrCaptchaOwner = errors.New("only the login owner can open this captcha")
+	// ErrPasswordLoginDisabled is returned before a password flow retains any
+	// credentials or lifecycle state. Callers should localize the QR fallback.
+	ErrPasswordLoginDisabled = errors.New("password login is disabled")
+)
 
 const captchaSubmitBodyLimit = 64 << 10
 
@@ -85,11 +90,21 @@ var (
 	errPasswordStateExpired = errors.New("captcha session expired; run /auth again")
 )
 
+// PasswordLoginEnabled reports the configured password-auth capability. It is
+// immutable for the lifetime of the server and is safe to use when rendering
+// Discord controls.
+func (s *Server) PasswordLoginEnabled() bool {
+	return s != nil && s.captchaBrowserMode != netutil.CaptchaBrowserDisabled
+}
+
 // BeginPasswordLogin stores credentials and prepares the configured CAPTCHA
-// browser flow. Remote mode returns a one-time grant in the URL fragment;
-// local and disabled modes retain the existing button-launched behavior.
+// browser flow. Remote mode returns a one-time grant in the URL fragment and
+// local mode retains the existing button-launched behavior.
 func (s *Server) BeginPasswordLogin(ctx context.Context, discordUserID, username, password string) (captchaURL, state string, err error) {
 	_ = ctx
+	if !s.PasswordLoginEnabled() {
+		return "", "", ErrPasswordLoginDisabled
+	}
 	if s.passwordAuth == nil {
 		return "", "", fmt.Errorf("password auth not configured")
 	}

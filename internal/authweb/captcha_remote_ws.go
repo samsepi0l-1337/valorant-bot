@@ -1,10 +1,13 @@
 package authweb
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"image/jpeg"
 	"net/http"
 	"strings"
 	"sync"
@@ -29,8 +32,11 @@ const remoteCaptchaStreamSessionUnavailable = "remote CAPTCHA Chrome session is 
 var errRemoteCaptchaViewerConflict = errors.New("remote captcha viewer already connected")
 
 type remoteCaptchaStreamSession interface {
-	Frames() <-chan []byte
+	Frames() <-chan remoteCaptchaOutputFrame
+	ReplayFrame() (remoteCaptchaOutputFrame, bool)
+	AcknowledgeFrame(remoteCaptchaOutputFrame) error
 	DispatchInput(context.Context, []byte) error
+	ReleasePointer(context.Context) error
 	Done() <-chan struct{}
 	Err() error
 	Close(context.Context) error
@@ -72,6 +78,120 @@ type remoteCaptchaWebSocketConnection interface {
 type remoteCaptchaWebSocketTiming struct {
 	now   func() time.Time
 	after func(time.Duration) <-chan time.Time
+}
+
+type remoteCaptchaFrameDescriptor struct {
+	Type       string `json:"type"`
+	Generation uint64 `json:"generation"`
+	Width      int    `json:"width"`
+	Height     int    `json:"height"`
+}
+
+type remoteCaptchaFrameAcknowledgements struct {
+	mu                           sync.Mutex
+	pending                      remoteCaptchaFrameDescriptor
+	pendingFrame                 remoteCaptchaOutputFrame
+	pendingSent                  bool
+	active                       remoteCaptchaFrameDescriptor
+	activeFrame                  remoteCaptchaOutputFrame
+	activeAcknowledged           bool
+	beforeAcknowledgeLockForTest func()
+}
+
+func newRemoteCaptchaFrameAcknowledgements() *remoteCaptchaFrameAcknowledgements {
+	return &remoteCaptchaFrameAcknowledgements{}
+}
+
+func (a *remoteCaptchaFrameAcknowledgements) prepareFrame(frame remoteCaptchaOutputFrame) (remoteCaptchaFrameDescriptor, error) {
+	config, err := jpeg.DecodeConfig(bytes.NewReader(frame.JPEG))
+	if err != nil || config.Width <= 0 || config.Height <= 0 ||
+		config.Width > remoteCaptchaViewportWidth || config.Height > remoteCaptchaViewportHeight || frame.Generation == 0 ||
+		frame.Binding.FrameWidth != config.Width || frame.Binding.FrameHeight != config.Height {
+		return remoteCaptchaFrameDescriptor{}, errRemoteCaptchaFrameInvalid
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if frame.Generation <= a.pending.Generation || frame.Generation <= a.active.Generation {
+		return remoteCaptchaFrameDescriptor{}, errRemoteCaptchaFrameInvalid
+	}
+	a.pending = remoteCaptchaFrameDescriptor{
+		Type: "frame", Generation: frame.Generation, Width: config.Width, Height: config.Height,
+	}
+	a.pendingFrame = frame
+	a.pendingSent = false
+	return a.pending, nil
+}
+
+func (a *remoteCaptchaFrameAcknowledgements) writeBinaryFrame(connection remoteCaptchaWebSocketWriter, frame remoteCaptchaOutputFrame) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.pending.Generation != frame.Generation || a.pendingFrame.Generation != frame.Generation {
+		return errRemoteCaptchaFrameInvalid
+	}
+	if err := connection.WriteMessage(websocket.BinaryMessage, frame.JPEG); err != nil {
+		return err
+	}
+	a.pendingSent = true
+	return nil
+}
+
+func (a *remoteCaptchaFrameAcknowledgements) acknowledge(input remoteCaptchaInputMessage) (remoteCaptchaOutputFrame, bool, error) {
+	if input.Type != "frameAck" || input.Generation == nil || input.Width == nil || input.Height == nil ||
+		input.Phase != "" || input.X != nil || input.Y != nil || input.Button != nil || input.DeltaY != nil ||
+		!finiteRemoteCaptchaNumber(*input.Width) || !finiteRemoteCaptchaNumber(*input.Height) {
+		return remoteCaptchaOutputFrame{}, false, errRemoteCaptchaInputInvalid
+	}
+	if a.beforeAcknowledgeLockForTest != nil {
+		a.beforeAcknowledgeLockForTest()
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if *input.Generation < a.pending.Generation || (*input.Generation == a.active.Generation && a.activeAcknowledged) {
+		return remoteCaptchaOutputFrame{}, false, nil
+	}
+	if *input.Generation != a.pending.Generation || !a.pendingSent ||
+		*input.Width != float64(a.pending.Width) || *input.Height != float64(a.pending.Height) {
+		return remoteCaptchaOutputFrame{}, false, errRemoteCaptchaInputInvalid
+	}
+	a.active = a.pending
+	a.activeFrame = a.pendingFrame
+	a.activeAcknowledged = true
+	return a.activeFrame, true, nil
+}
+
+func (a *remoteCaptchaFrameAcknowledgements) authorizeInput(input remoteCaptchaInputMessage) error {
+	if input.Generation == nil || input.Width == nil || input.Height == nil {
+		return errRemoteCaptchaInputInvalid
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.activeAcknowledged || *input.Generation != a.active.Generation ||
+		!finiteRemoteCaptchaNumber(*input.Width) || !finiteRemoteCaptchaNumber(*input.Height) ||
+		*input.Width != float64(a.active.Width) || *input.Height != float64(a.active.Height) {
+		return errRemoteCaptchaInputInvalid
+	}
+	return nil
+}
+
+func (a *remoteCaptchaFrameAcknowledgements) exactPublishedDuplicate(frame remoteCaptchaOutputFrame) (bool, error) {
+	if frame.Generation == 0 {
+		return false, errRemoteCaptchaFrameInvalid
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var known remoteCaptchaOutputFrame
+	switch frame.Generation {
+	case a.pendingFrame.Generation:
+		known = a.pendingFrame
+	case a.activeFrame.Generation:
+		known = a.activeFrame
+	default:
+		return false, nil
+	}
+	if known.Generation != frame.Generation || known.Binding != frame.Binding || !bytes.Equal(known.JPEG, frame.JPEG) {
+		return false, errRemoteCaptchaFrameInvalid
+	}
+	return true, nil
 }
 
 func defaultRemoteCaptchaWebSocketTiming() remoteCaptchaWebSocketTiming {
@@ -202,8 +322,9 @@ func (s *Server) serveRemoteCaptchaWebSocket(connection remoteCaptchaWebSocketCo
 
 	writerCtx, stopWriter := context.WithCancel(relay.ctx)
 	writerDone := make(chan error, 1)
+	frameAcknowledgements := newRemoteCaptchaFrameAcknowledgements()
 	go func() {
-		writerDone <- writeRemoteCaptchaWebSocket(writerCtx, connection, relay.stream, timing)
+		writerDone <- writeRemoteCaptchaWebSocketWithAcknowledgements(writerCtx, connection, relay.stream, timing, frameAcknowledgements)
 		_ = connection.Close()
 	}()
 
@@ -217,16 +338,43 @@ func (s *Server) serveRemoteCaptchaWebSocket(connection remoteCaptchaWebSocketCo
 			protocolViolation = true
 			break
 		}
+		input, err := decodeRemoteCaptchaInput(payload)
+		if err != nil {
+			protocolViolation = true
+			break
+		}
+		if input.Type == "frameAck" {
+			frame, activate, ackErr := frameAcknowledgements.acknowledge(input)
+			if ackErr != nil || (activate && relay.stream.AcknowledgeFrame(frame) != nil) {
+				protocolViolation = true
+				break
+			}
+			continue
+		}
+		if err := frameAcknowledgements.authorizeInput(input); err != nil {
+			protocolViolation = true
+			break
+		}
 		inputCtx, cancel := context.WithTimeout(relay.ctx, remoteCaptchaCommandTimeout)
 		err = relay.stream.DispatchInput(inputCtx, payload)
 		cancel()
 		if err != nil {
+			if errors.Is(err, errRemoteCaptchaChallengeTeardown) {
+				protocolViolation = false
+				break
+			}
 			if errors.Is(err, errRemoteCaptchaInputRate) || errors.Is(err, errRemoteCaptchaInputBusy) {
 				continue
 			}
 			protocolViolation = true
 			break
 		}
+	}
+	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), remoteCaptchaCommandTimeout)
+	releaseErr := relay.stream.ReleasePointer(releaseCtx)
+	releaseCancel()
+	if releaseErr != nil && relay.ctx.Err() == nil && !errors.Is(releaseErr, errRemoteCaptchaChallengeTeardown) {
+		protocolViolation = true
 	}
 	stopWriter()
 	_ = connection.Close()
@@ -261,6 +409,10 @@ func remoteCaptchaProtocolReadViolation(err error) bool {
 }
 
 func writeRemoteCaptchaWebSocket(ctx context.Context, connection remoteCaptchaWebSocketWriter, stream remoteCaptchaStreamSession, timing remoteCaptchaWebSocketTiming) error {
+	return writeRemoteCaptchaWebSocketWithAcknowledgements(ctx, connection, stream, timing, newRemoteCaptchaFrameAcknowledgements())
+}
+
+func writeRemoteCaptchaWebSocketWithAcknowledgements(ctx context.Context, connection remoteCaptchaWebSocketWriter, stream remoteCaptchaStreamSession, timing remoteCaptchaWebSocketTiming, frameAcknowledgements *remoteCaptchaFrameAcknowledgements) error {
 	if timing.now == nil {
 		timing.now = time.Now
 	}
@@ -268,22 +420,30 @@ func writeRemoteCaptchaWebSocket(ctx context.Context, connection remoteCaptchaWe
 		timing.after = time.After
 	}
 	ping := timing.after(remoteCaptchaWebSocketPingPeriod)
+	select {
+	case frame, ok := <-stream.Frames():
+		if !ok {
+			return writeRemoteCaptchaStreamEnd(connection, stream, timing)
+		}
+		if err := writeRemoteCaptchaFrame(connection, timing, frameAcknowledgements, frame); err != nil {
+			return err
+		}
+	default:
+		if frame, ok := stream.ReplayFrame(); ok {
+			if err := writeRemoteCaptchaFrame(connection, timing, frameAcknowledgements, frame); err != nil {
+				return err
+			}
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
-			deadline := timing.now().Add(remoteCaptchaWebSocketWriteWait)
-			_ = connection.SetWriteDeadline(deadline)
-			return connection.WriteControl(websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
-				deadline)
+			return writeRemoteCaptchaNormalClose(connection, timing)
 		case frame, ok := <-stream.Frames():
 			if !ok {
-				return nil
+				return writeRemoteCaptchaStreamEnd(connection, stream, timing)
 			}
-			if err := connection.SetWriteDeadline(timing.now().Add(remoteCaptchaWebSocketWriteWait)); err != nil {
-				return err
-			}
-			if err := connection.WriteMessage(websocket.BinaryMessage, frame); err != nil {
+			if err := writeRemoteCaptchaFrame(connection, timing, frameAcknowledgements, frame); err != nil {
 				return err
 			}
 		case <-ping:
@@ -297,6 +457,48 @@ func writeRemoteCaptchaWebSocket(ctx context.Context, connection remoteCaptchaWe
 			ping = timing.after(remoteCaptchaWebSocketPingPeriod)
 		}
 	}
+}
+
+func writeRemoteCaptchaStreamEnd(connection remoteCaptchaWebSocketWriter, stream remoteCaptchaStreamSession, timing remoteCaptchaWebSocketTiming) error {
+	if err := stream.Err(); err != nil && !errors.Is(err, errRemoteCaptchaChallengeTeardown) && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	return writeRemoteCaptchaNormalClose(connection, timing)
+}
+
+func writeRemoteCaptchaNormalClose(connection remoteCaptchaWebSocketWriter, timing remoteCaptchaWebSocketTiming) error {
+	deadline := timing.now().Add(remoteCaptchaWebSocketWriteWait)
+	_ = connection.SetWriteDeadline(deadline)
+	return connection.WriteControl(websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), deadline)
+}
+
+func writeRemoteCaptchaFrame(connection remoteCaptchaWebSocketWriter, timing remoteCaptchaWebSocketTiming, acknowledgements *remoteCaptchaFrameAcknowledgements, frame remoteCaptchaOutputFrame) error {
+	duplicate, err := acknowledgements.exactPublishedDuplicate(frame)
+	if err != nil {
+		return err
+	}
+	if duplicate {
+		return nil
+	}
+	descriptor, err := acknowledgements.prepareFrame(frame)
+	if err != nil {
+		return err
+	}
+	metadata, err := json.Marshal(descriptor)
+	if err != nil {
+		return err
+	}
+	if err := connection.SetWriteDeadline(timing.now().Add(remoteCaptchaWebSocketWriteWait)); err != nil {
+		return err
+	}
+	if err := connection.WriteMessage(websocket.TextMessage, metadata); err != nil {
+		return err
+	}
+	if err := connection.SetWriteDeadline(timing.now().Add(remoteCaptchaWebSocketWriteWait)); err != nil {
+		return err
+	}
+	return acknowledgements.writeBinaryFrame(connection, frame)
 }
 
 func (s *Server) claimRemoteCaptchaWebSocket(rawSession string) (remoteCaptchaWebSocketClaim, error) {
@@ -513,6 +715,9 @@ func (s *Server) runRemoteCaptchaRelay(relay *remoteCaptchaRelay) {
 	stream, err := s.startRemoteCaptchaStreamWhenReady(controller, relay, processCtx)
 	if err != nil {
 		relay.publishReady(nil, err)
+		if errors.Is(err, errRemoteCaptchaChallengeTeardown) {
+			return
+		}
 		s.failRemoteCaptchaRelay(relay, fmt.Errorf("start remote CAPTCHA stream: %w", err))
 		return
 	}
@@ -534,6 +739,9 @@ func (s *Server) runRemoteCaptchaRelay(relay *remoteCaptchaRelay) {
 	case <-stream.Done():
 		if relay.ctx.Err() == nil && processCtx.Err() == nil && s.lifecycleCtx.Err() == nil {
 			err := stream.Err()
+			if errors.Is(err, errRemoteCaptchaChallengeTeardown) {
+				return
+			}
 			if err == nil {
 				err = errors.New("remote CAPTCHA stream ended unexpectedly")
 			}

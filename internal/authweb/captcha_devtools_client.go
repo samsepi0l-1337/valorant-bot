@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 )
 
 const chromeDevToolsEventBuffer = 256
+const chromeDevToolsWriteCancelGrace = 10 * time.Millisecond
 
 var (
 	errChromeDevToolsClientClosed            = errors.New("Riot Chrome DevTools client closed")
@@ -210,6 +212,15 @@ func (c *chromeDevToolsClient) removePending(id int64, response chan chromeDevTo
 }
 
 func (c *chromeDevToolsClient) abortWrite(request *chromeDevToolsWriteRequest) {
+	timer := time.NewTimer(chromeDevToolsWriteCancelGrace)
+	defer timer.Stop()
+	select {
+	case <-request.done:
+		return
+	case <-timer.C:
+	case <-c.closedSignal:
+		return
+	}
 	c.writesMu.Lock()
 	active := c.activeWrite == request
 	c.writesMu.Unlock()

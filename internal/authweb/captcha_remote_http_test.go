@@ -221,6 +221,15 @@ func TestRemoteCaptchaViewerScriptReconnectsAndCoalescesNewestPointerMove(t *tes
 		if (reconnect.delay !== 1000) throw new Error("reconnect delay must be the bounded nonzero 1000ms interval");
 		reconnect.callback();
 		if (__state.sockets.length !== 2) throw new Error("scheduled reconnect callback did not invoke connect");
+		`)
+
+	normallyClosed := newRemoteCaptchaViewerRuntime(t, "")
+	assertRemoteCaptchaViewerJS(t, normallyClosed, `
+		__state.sockets[0].listeners.close({code: 1000});
+		if (__state.timers.some(timer => !timer.cleared)) throw new Error("normal stream close scheduled reconnect");
+		if (__state.sockets.length !== 1) throw new Error("normal stream close opened another socket");
+		if (!__cancel.disabled) throw new Error("normal stream close left cancel enabled");
+		if (__status.textContent !== "CAPTCHA session finished.") throw new Error("normal stream close status was not terminal");
 	`)
 
 	retryExpired := newRemoteCaptchaViewerRuntime(t, "")
@@ -239,6 +248,12 @@ func TestRemoteCaptchaViewerScriptReconnectsAndCoalescesNewestPointerMove(t *tes
 
 	pointer := newRemoteCaptchaViewerRuntime(t, "")
 	assertRemoteCaptchaViewerJS(t, pointer, `
+		__state.message = __state.sockets[0].listeners.message;
+		__state.message({data:JSON.stringify({type:"frame",generation:7,width:1280,height:900})});
+		__state.message({data:{id:"pointer-frame",width:1280,height:900}});
+		__state.bitmapResolvers.shift()();
+	`)
+	assertRemoteCaptchaViewerJS(t, pointer, `
 		const move = __state.canvasListeners.pointermove;
 		if (typeof move !== "function") throw new Error("pointermove handler missing");
 		const event = clientX => ({clientX, clientY: 25, preventDefault() {}});
@@ -249,16 +264,133 @@ func TestRemoteCaptchaViewerScriptReconnectsAndCoalescesNewestPointerMove(t *tes
 		if (firstFlushes.length !== 1) throw new Error("pointer moves were not coalesced behind one timer");
 		if (firstFlushes[0].delay < 16) throw new Error("pointer move flush was scheduled below the 60Hz interval");
 		firstFlushes[0].callback();
-		if (__state.sockets[0].sent.length !== 1) throw new Error("coalesced pointer move did not send exactly once");
-		if (JSON.parse(__state.sockets[0].sent[0]).x !== 20) throw new Error("coalescing did not retain the newest pointer move");
+		if (__state.sockets[0].sent.length !== 2) throw new Error("coalesced pointer move did not send exactly once after frame ACK");
+		if (JSON.parse(__state.sockets[0].sent[1]).x !== 20) throw new Error("coalescing did not retain the newest pointer move");
 		move(event(30));
 		move(event(40));
 		const secondFlushes = __state.timers.filter(timer => !timer.cleared && timer !== firstFlushes[0]);
 		if (secondFlushes.length !== 1) throw new Error("second pointer burst did not schedule exactly one timer");
 		if (secondFlushes[0].delay < 16) throw new Error("subsequent pointer flush was scheduled below the 60Hz interval");
 		secondFlushes[0].callback();
-		if (__state.sockets[0].sent.length !== 2) throw new Error("second pointer burst did not send exactly once");
-		if (JSON.parse(__state.sockets[0].sent[1]).x !== 40) throw new Error("second burst did not retain newest pointer move");
+		if (__state.sockets[0].sent.length !== 3) throw new Error("second pointer burst did not send exactly once");
+		if (JSON.parse(__state.sockets[0].sent[2]).x !== 40) throw new Error("second burst did not retain newest pointer move");
+	`)
+}
+
+func TestRemoteCaptchaViewerFlushesFinalDragMoveBeforePointerUp(t *testing.T) {
+	runtime := newRemoteCaptchaViewerRuntime(t, "")
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		const message = __state.sockets[0].listeners.message;
+		message({data:JSON.stringify({type:"frame",generation:17,width:80,height:60})});
+		message({data:{id:"drag-frame",width:80,height:60}});
+		__state.bitmapResolvers.shift()();
+	`)
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		const event = (x, y) => ({button:0,clientX:x,clientY:y,pointerId:1,preventDefault(){}});
+		__state.canvasListeners.pointerdown(event(70, 30));
+		__state.canvasListeners.pointermove(event(40, 30));
+		__state.canvasListeners.pointerup(event(20, 30));
+		const phases = __state.sockets[0].sent.map(JSON.parse).filter(value => value.type === "pointer");
+		if (phases.length !== 3) throw new Error("quick drag did not emit down, final move, and up");
+		if (phases.map(value => value.phase).join(",") !== "down,move,up") throw new Error("quick drag pointer phases were reordered");
+		if (phases[1].x !== 2.5 || phases[2].x !== 1.25) throw new Error("quick drag did not preserve final move and release coordinates");
+		__state.canvasListeners.pointerdown(event(30, 30));
+		__state.canvasListeners.pointercancel({...event(25, 30),button:-1});
+		__state.canvasListeners.lostpointercapture({...event(25, 30),button:-1});
+		const cancelled = __state.sockets[0].sent.map(JSON.parse).filter(value => value.type === "pointer").slice(3);
+		if (cancelled.map(value => value.phase).join(",") !== "down,up") throw new Error("pointer cancellation did not emit exactly one release");
+	`)
+}
+
+func TestRemoteCaptchaViewerDecodesOneFrameAtATimeAndSendsIntrinsicDimensions(t *testing.T) {
+	runtime := newRemoteCaptchaViewerRuntime(t, "")
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		__state.message = __state.sockets[0].listeners.message;
+		__state.message({data:JSON.stringify({type:"frame",generation:1,width:40,height:35})});
+		__state.message({data:{id:"first",width:40,height:35}});
+		const downBeforeDraw = __state.canvasListeners.pointerdown;
+		downBeforeDraw({button:0,clientX:10,clientY:10,pointerId:1,preventDefault(){}});
+		if (__state.sockets[0].sent.length !== 0) throw new Error("viewer sent input before its first frame draw");
+		__state.message({data:JSON.stringify({type:"frame",generation:2,width:44,height:38})});
+		__state.message({data:{id:"stale",width:44,height:38}});
+		__state.message({data:JSON.stringify({type:"frame",generation:3,width:50,height:45})});
+		__state.message({data:{id:"newest",width:50,height:45}});
+		if (__state.bitmapCalls.length !== 1 || __state.bitmapCalls[0] !== "first") throw new Error("viewer started concurrent frame decodes");
+		__state.bitmapResolvers.shift()();
+	`)
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		if (__state.bitmapCalls.length !== 2 || __state.bitmapCalls[1] !== "newest") throw new Error("viewer did not retain only newest pending frame");
+		__state.bitmapResolvers.shift()();
+	`)
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		if (__state.draws.join(",") !== "newest") throw new Error("viewer rendered a stale pending frame");
+		if (__canvas.width !== 50 || __canvas.height !== 45) throw new Error("viewer canvas does not retain intrinsic frame dimensions");
+		const acknowledgements = __state.sockets[0].sent.map(JSON.parse).filter(message => message.type === "frameAck");
+		if (acknowledgements.length !== 1 || acknowledgements[0].generation !== 3) throw new Error("viewer did not ACK exactly the newest frame it drew");
+		const down = __state.canvasListeners.pointerdown;
+		down({button:0,clientX:640,clientY:450,pointerId:1,preventDefault(){}});
+		const sentMessages = __state.sockets[0].sent;
+		const sent = JSON.parse(sentMessages[sentMessages.length-1]);
+		if (sent.width !== 50 || sent.height !== 45) throw new Error("viewer did not send intrinsic frame dimensions");
+		if (sent.generation !== 3) throw new Error("viewer input was not bound to its latest drawn generation");
+	`)
+}
+
+func TestRemoteCaptchaViewerKeepsAcknowledgedFrameActiveWhileReplacementDecodes(t *testing.T) {
+	runtime := newRemoteCaptchaViewerRuntime(t, "")
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		const message = __state.sockets[0].listeners.message;
+		message({data:JSON.stringify({type:"frame",generation:11,width:40,height:35})});
+		message({data:{id:"active",width:40,height:35}});
+		__state.bitmapResolvers.shift()();
+	`)
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		message({data:JSON.stringify({type:"frame",generation:12,width:40,height:35})});
+		message({data:{id:"pending",width:40,height:35}});
+		__state.canvasListeners.pointerdown({button:0,clientX:20,clientY:17,pointerId:1,preventDefault(){}});
+		const input = JSON.parse(__state.sockets[0].sent[__state.sockets[0].sent.length-1]);
+		if (input.type !== "pointer" || input.generation !== 11) throw new Error("pending replacement invalidated active drawn generation");
+	`)
+}
+
+func TestRemoteCaptchaViewerDropsOldPendingMoveBeforeReplacementAcknowledgement(t *testing.T) {
+	runtime := newRemoteCaptchaViewerRuntime(t, "")
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		const message = __state.sockets[0].listeners.message;
+		message({data:JSON.stringify({type:"frame",generation:21,width:40,height:35})});
+		message({data:{id:"active-drag",width:40,height:35}});
+		__state.bitmapResolvers.shift()();
+	`)
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		const pointerEvent = (x, button=0) => ({button,clientX:x,clientY:17,pointerId:1,preventDefault(){}});
+		__state.canvasListeners.pointerdown(pointerEvent(20));
+		message({data:JSON.stringify({type:"frame",generation:22,width:40,height:35})});
+		message({data:{id:"replacement-drag",width:40,height:35}});
+		__state.canvasListeners.pointermove(pointerEvent(25));
+		if (!__state.timers.some(timer => !timer.cleared)) throw new Error("old-generation drag move was not pending");
+		__state.bitmapResolvers.shift()();
+	`)
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		__state.canvasListeners.pointerup(pointerEvent(30));
+		const pointerMessages = __state.sockets[0].sent.map(JSON.parse).filter(value => value.type === "pointer");
+		if (pointerMessages.map(value => value.phase).join(",") !== "down,up") throw new Error("replacement ACK flushed an old-generation move");
+		if (pointerMessages[0].generation !== 21 || pointerMessages[1].generation !== 22) throw new Error("drag endpoints were not bound to the displayed generations");
+	`)
+}
+
+func TestRemoteCaptchaViewerRejectsDecodedFrameDimensionMismatchBeforeDrawAck(t *testing.T) {
+	runtime := newRemoteCaptchaViewerRuntime(t, "")
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		const message = __state.sockets[0].listeners.message;
+		message({data:JSON.stringify({type:"frame",generation:9,width:40,height:35})});
+		message({data:{id:"mismatched",width:41,height:35}});
+		__state.bitmapResolvers.shift()();
+	`)
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		if (__state.draws.length !== 0) throw new Error("viewer drew a JPEG whose intrinsic dimensions mismatched metadata");
+		if (__state.sockets[0].sent.length !== 0) throw new Error("viewer ACKed a JPEG it did not validate and draw");
+		__state.canvasListeners.pointerdown({button:0,clientX:10,clientY:10,pointerId:1,preventDefault(){}});
+		if (__state.sockets[0].sent.length !== 0) throw new Error("viewer sent input without a validated drawn frame");
 	`)
 }
 
@@ -273,11 +405,12 @@ func newRemoteCaptchaViewerRuntime(t *testing.T, hash string) *goja.Runtime {
 		var __state = {
 			canvasListeners: Object.create(null), cancelListeners: Object.create(null),
 			fetchCalls: [], historyCalls: [], sockets: [], timers: [],
+			bitmapCalls: [], bitmapResolvers: [], draws: [],
 			performanceNow: 0, wallNow: 1000, nextTimer: 1
 		};
 		var __canvas = {
 			width: 1280, height: 900,
-			getContext: function() { return {drawImage: function() {}}; },
+			getContext: function() { return {drawImage: function(bitmap) { __state.draws.push(bitmap.id); }}; },
 			addEventListener: function(name, listener) { __state.canvasListeners[name] = listener; },
 			getBoundingClientRect: function() { return {left: 0, top: 0, width: 1280, height: 900}; },
 			setPointerCapture: function() {}
@@ -296,7 +429,12 @@ func newRemoteCaptchaViewerRuntime(t *testing.T, hash string) *goja.Runtime {
 		WebSocket.prototype.send = function(payload) { this.sent.push(payload); };
 		WebSocket.prototype.close = function() {};
 		async function fetch() { __state.fetchCalls.push(Array.from(arguments)); return {ok: true}; }
-		async function createImageBitmap() { return {width: 1280, height: 900, close: function() {}}; }
+		function createImageBitmap(blob) {
+			__state.bitmapCalls.push(blob.id);
+			return new Promise(function(resolve) {
+				__state.bitmapResolvers.push(function() { resolve({id:blob.id,width:blob.width,height:blob.height,close:function(){}}); });
+			});
+		}
 		var performance = {now: function() { return __state.performanceNow; }};
 		var Date = {now: function() { return __state.wallNow; }};
 		function setTimeout(callback, delay) {
