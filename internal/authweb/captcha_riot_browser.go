@@ -357,6 +357,52 @@ func (c *chromeDevToolsClient) attachRiotPage(ctx context.Context) error {
 	}
 }
 
+func (c *chromeDevToolsClient) recoverRiotPageSession(ctx context.Context) error {
+	if c == nil {
+		return errChromeDevToolsClientClosed
+	}
+	c.recoverMu.Lock()
+	defer c.recoverMu.Unlock()
+	targetID, err := c.discoverRiotAuthenticateTarget(ctx)
+	if err != nil {
+		return err
+	}
+	var attached struct {
+		SessionID string `json:"sessionId"`
+	}
+	if err := c.send(ctx, "Target.attachToTarget", map[string]any{
+		"targetId": targetID,
+		"flatten":  true,
+	}, &attached, false); err != nil {
+		return fmt.Errorf("reattach Riot Chrome page: %w", err)
+	}
+	if strings.TrimSpace(attached.SessionID) == "" {
+		return errors.New("reattach Riot Chrome page: empty session")
+	}
+	c.setSessionID(attached.SessionID)
+	return nil
+}
+
+func (c *chromeDevToolsClient) discoverRiotAuthenticateTarget(ctx context.Context) (string, error) {
+	var targets struct {
+		TargetInfos []struct {
+			TargetID string `json:"targetId"`
+			Type     string `json:"type"`
+			URL      string `json:"url"`
+		} `json:"targetInfos"`
+	}
+	if err := c.send(ctx, "Target.getTargets", map[string]any{}, &targets, false); err != nil {
+		return "", fmt.Errorf("discover Riot Chrome page: %w", err)
+	}
+	for _, target := range targets.TargetInfos {
+		if target.Type != "page" || target.TargetID == "" || !allowedRiotBrowserPage(target.URL) {
+			continue
+		}
+		return target.TargetID, nil
+	}
+	return "", errRiotCaptchaSurfaceUnavailable
+}
+
 func allowedRiotBrowserPage(rawURL string) bool {
 	parsed, err := url.Parse(rawURL)
 	if err != nil || !strings.EqualFold(parsed.Scheme, "https") {

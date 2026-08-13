@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -36,6 +37,18 @@ type chromeDevToolsProtocolError struct {
 
 func (e *chromeDevToolsProtocolError) Error() string {
 	return fmt.Sprintf("Riot Chrome %s: %s", e.Method, e.Message)
+}
+
+func lostChromeDevToolsSession(err error) bool {
+	var protocolErr *chromeDevToolsProtocolError
+	if !errors.As(err, &protocolErr) {
+		return false
+	}
+	return strings.Contains(strings.ToLower(protocolErr.Message), "session with given id not found")
+}
+
+func isBrowserLevelChromeDevToolsMethod(method string) bool {
+	return strings.HasPrefix(method, "Target.")
 }
 
 type chromeDevToolsResponse struct {
@@ -82,6 +95,8 @@ type chromeDevToolsClient struct {
 	done             chan struct{}
 	closedSignal     chan struct{}
 
+	recoverMu sync.Mutex
+
 	writesMu    sync.Mutex
 	activeWrite *chromeDevToolsWriteRequest
 	writeQueue  chan *chromeDevToolsWriteRequest
@@ -111,6 +126,21 @@ func (c *chromeDevToolsClient) start() {
 }
 
 func (c *chromeDevToolsClient) Call(ctx context.Context, method string, params any, result any) error {
+	useSession := !isBrowserLevelChromeDevToolsMethod(method)
+	err := c.send(ctx, method, params, result, useSession)
+	if err == nil || !useSession || !lostChromeDevToolsSession(err) {
+		return err
+	}
+	if recErr := c.recoverRiotPageSession(ctx); recErr != nil {
+		if errors.Is(recErr, errRiotCaptchaSurfaceUnavailable) || errors.Is(recErr, errRiotCaptchaDocumentChanged) {
+			return recErr
+		}
+		return err
+	}
+	return c.send(ctx, method, params, result, true)
+}
+
+func (c *chromeDevToolsClient) send(ctx context.Context, method string, params any, result any, useSession bool) error {
 	if c == nil || c.conn == nil {
 		return errChromeDevToolsClientClosed
 	}
@@ -128,7 +158,10 @@ func (c *chromeDevToolsClient) Call(ctx context.Context, method string, params a
 	}
 	c.nextID++
 	id := c.nextID
-	sessionID := c.sessionID
+	sessionID := ""
+	if useSession {
+		sessionID = c.sessionID
+	}
 	c.pending[id] = response
 	c.mu.Unlock()
 
