@@ -249,7 +249,7 @@ func (s *Server) handleRemoteCaptchaWebSocket(w http.ResponseWriter, r *http.Req
 		writeRemoteCaptchaError(w, http.StatusForbidden)
 		return
 	}
-	cookie, err := r.Cookie(remoteCaptchaViewerCookieName)
+	cookie, err := r.Cookie(s.remoteCaptchaViewerCookieName())
 	if err != nil {
 		writeRemoteCaptchaError(w, http.StatusUnauthorized)
 		return

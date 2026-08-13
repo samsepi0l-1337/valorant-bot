@@ -18,7 +18,7 @@ const (
 )
 
 // NormalizeCaptchaBrowserMode validates a CAPTCHA browser mode and its origin
-// requirements. Remote viewers are served only from a public HTTPS origin.
+// requirements. Remote viewers require an HTTPS origin or a private/local HTTP origin.
 func NormalizeCaptchaBrowserMode(rawMode, authBaseURL string) (CaptchaBrowserMode, error) {
 	mode := CaptchaBrowserMode(strings.ToLower(strings.TrimSpace(rawMode)))
 	if mode == "" {
@@ -38,9 +38,9 @@ func NormalizeCaptchaBrowserMode(rawMode, authBaseURL string) (CaptchaBrowserMod
 	}
 }
 
-// CanonicalRemoteCaptchaOrigin validates and serializes an HTTPS origin the
-// same way a browser supplies Host and Origin: lowercase DNS/scheme, canonical
-// IP spelling, no root slash, and no explicit default HTTPS port.
+// CanonicalRemoteCaptchaOrigin validates and serializes an origin the same way
+// a browser supplies Host and Origin: lowercase DNS/scheme, canonical IP
+// spelling, no root slash, and no explicit default port (443 for HTTPS, 80 for HTTP).
 func CanonicalRemoteCaptchaOrigin(authBaseURL string) (string, error) {
 	if err := validateRemoteCaptchaOrigin(authBaseURL); err != nil {
 		return "", err
@@ -49,6 +49,7 @@ func CanonicalRemoteCaptchaOrigin(authBaseURL string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("parse remote CAPTCHA origin: %w", err)
 	}
+	scheme := strings.ToLower(origin.Scheme)
 	hostname := origin.Hostname()
 	canonicalHost := strings.ToLower(hostname)
 	if address, parseErr := netip.ParseAddr(hostname); parseErr == nil {
@@ -59,11 +60,15 @@ func CanonicalRemoteCaptchaOrigin(authBaseURL string) (string, error) {
 	}
 	if port := origin.Port(); port != "" {
 		portNumber, _ := strconv.Atoi(port) // validated above
-		if portNumber != 443 {
+		defaultPort := 443
+		if scheme == "http" {
+			defaultPort = 80
+		}
+		if portNumber != defaultPort {
 			canonicalHost += ":" + strconv.Itoa(portNumber)
 		}
 	}
-	return "https://" + canonicalHost, nil
+	return scheme + "://" + canonicalHost, nil
 }
 
 func validateRemoteCaptchaOrigin(authBaseURL string) error {
@@ -72,9 +77,10 @@ func validateRemoteCaptchaOrigin(authBaseURL string) error {
 	}
 	origin, err := url.Parse(authBaseURL)
 	if err != nil {
-		return fmt.Errorf("CAPTCHA_BROWSER_MODE=remote requires AUTH_BASE_URL to be an HTTPS origin: %w", err)
+		return fmt.Errorf("CAPTCHA_BROWSER_MODE=remote requires AUTH_BASE_URL to be an HTTPS origin or a private/local HTTP origin: %w", err)
 	}
-	if !strings.EqualFold(origin.Scheme, "https") || origin.Host == "" || origin.Hostname() == "" || origin.Opaque != "" ||
+	scheme := strings.ToLower(origin.Scheme)
+	if (scheme != "https" && scheme != "http") || origin.Host == "" || origin.Hostname() == "" || origin.Opaque != "" ||
 		origin.User != nil || strings.Contains(authBaseURL, "?") || strings.Contains(authBaseURL, "#") ||
 		(origin.Path != "" && origin.Path != "/") || (origin.RawPath != "" && origin.RawPath != "/") {
 		return remoteCaptchaOriginError()
@@ -82,11 +88,76 @@ func validateRemoteCaptchaOrigin(authBaseURL string) error {
 	if err := validateRemoteCaptchaHost(origin.Host); err != nil {
 		return fmt.Errorf("%w: %v", remoteCaptchaOriginError(), err)
 	}
+	if scheme == "http" && !allowedRemoteCaptchaHTTPHost(origin.Hostname()) {
+		return remoteCaptchaOriginError()
+	}
 	return nil
 }
 
+func allowedRemoteCaptchaHTTPHost(hostname string) bool {
+	if strings.EqualFold(hostname, "localhost") {
+		return true
+	}
+	if address, err := netip.ParseAddr(hostname); err == nil {
+		return address.IsPrivate() || address.IsLoopback() || address.IsLinkLocalUnicast()
+	}
+	if !validRemoteCaptchaDNSName(hostname) {
+		return false
+	}
+	lower := strings.ToLower(hostname)
+	return strings.HasSuffix(lower, ".local") || strings.HasSuffix(lower, ".internal")
+}
+
 func remoteCaptchaOriginError() error {
-	return fmt.Errorf("CAPTCHA_BROWSER_MODE=remote requires AUTH_BASE_URL to be an absolute HTTPS origin without user-info, query, fragment, or path")
+	return fmt.Errorf("CAPTCHA_BROWSER_MODE=remote requires AUTH_BASE_URL to be an absolute HTTPS origin or a private/local HTTP origin without user-info, query, fragment, or path")
+}
+
+// ValidateRemoteCaptchaBind checks that AUTH_BIND_ADDRESS can serve a remote
+// CAPTCHA origin. LAN IP and .local/.internal origins must not bind loopback.
+func ValidateRemoteCaptchaBind(authBaseURL, bindAddress string) error {
+	origin, err := url.Parse(authBaseURL)
+	if err != nil || origin.Hostname() == "" {
+		return remoteCaptchaOriginError()
+	}
+	hostname := origin.Hostname()
+	if !remoteCaptchaOriginRequiresNonLoopbackBind(hostname) {
+		return nil
+	}
+	if isLoopbackAuthBind(bindAddress) {
+		return fmt.Errorf("CAPTCHA_BROWSER_MODE=remote with a LAN AUTH_BASE_URL requires AUTH_BIND_ADDRESS to be 0.0.0.0, ::, or the origin IP, not loopback")
+	}
+	if bindAddress == "0.0.0.0" || bindAddress == "::" {
+		return nil
+	}
+	originAddr, originErr := netip.ParseAddr(hostname)
+	bindAddr, bindErr := netip.ParseAddr(bindAddress)
+	if originErr == nil && bindErr == nil && originAddr == bindAddr {
+		return nil
+	}
+	return fmt.Errorf("CAPTCHA_BROWSER_MODE=remote with a LAN AUTH_BASE_URL requires AUTH_BIND_ADDRESS to be 0.0.0.0, ::, or the origin IP, not loopback")
+}
+
+func remoteCaptchaOriginRequiresNonLoopbackBind(hostname string) bool {
+	lower := strings.ToLower(hostname)
+	if strings.HasSuffix(lower, ".local") || strings.HasSuffix(lower, ".internal") {
+		return true
+	}
+	address, err := netip.ParseAddr(hostname)
+	if err != nil {
+		return false
+	}
+	if address.IsLoopback() {
+		return false
+	}
+	return address.IsPrivate() || address.IsLinkLocalUnicast()
+}
+
+func isLoopbackAuthBind(bindAddress string) bool {
+	if strings.EqualFold(bindAddress, "localhost") {
+		return true
+	}
+	address, err := netip.ParseAddr(bindAddress)
+	return err == nil && address.IsLoopback()
 }
 
 func validateRemoteCaptchaHost(host string) error {

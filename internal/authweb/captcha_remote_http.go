@@ -15,9 +15,36 @@ import (
 )
 
 const (
-	remoteCaptchaViewerCookieName = "__Secure-valorant-captcha-viewer"
-	remoteCaptchaViewerCookiePath = "/api/auth/captcha/remote"
+	remoteCaptchaViewerCookieName     = "__Secure-valorant-captcha-viewer"
+	remoteCaptchaViewerCookieNameHTTP = "valorant-captcha-viewer"
+	remoteCaptchaViewerCookiePath     = "/api/auth/captcha/remote"
 )
+
+func (s *Server) remoteCaptchaViewerCookieSettings() (name string, secure bool) {
+	if strings.HasPrefix(s.remoteCaptchaOrigin, "http://") {
+		return remoteCaptchaViewerCookieNameHTTP, false
+	}
+	return remoteCaptchaViewerCookieName, true
+}
+
+func (s *Server) remoteCaptchaViewerCookieName() string {
+	name, _ := s.remoteCaptchaViewerCookieSettings()
+	return name
+}
+
+func (s *Server) newRemoteCaptchaViewerCookie(value string, expires time.Time, maxAge int) *http.Cookie {
+	name, secure := s.remoteCaptchaViewerCookieSettings()
+	return &http.Cookie{
+		Name:     name,
+		Value:    value,
+		Path:     remoteCaptchaViewerCookiePath,
+		Expires:  expires,
+		MaxAge:   maxAge,
+		Secure:   secure,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	}
+}
 
 func (s *Server) registerRemoteCaptchaHTTPRoutes() {
 	s.mux.HandleFunc("GET /captcha/remote", s.handleRemoteCaptchaViewer)
@@ -111,16 +138,7 @@ func (s *Server) handleRemoteCaptchaRedeem(w http.ResponseWriter, r *http.Reques
 	if maxAge < 1 {
 		maxAge = 1
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     remoteCaptchaViewerCookieName,
-		Value:    rawSession,
-		Path:     remoteCaptchaViewerCookiePath,
-		Expires:  viewer.expiresAt,
-		MaxAge:   maxAge,
-		Secure:   true,
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-	})
+	http.SetCookie(w, s.newRemoteCaptchaViewerCookie(rawSession, viewer.expiresAt, maxAge))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -135,21 +153,12 @@ func (s *Server) handleRemoteCaptchaCancel(w http.ResponseWriter, r *http.Reques
 		writeRemoteCaptchaError(w, status)
 		return
 	}
-	cookie, err := r.Cookie(remoteCaptchaViewerCookieName)
+	cookie, err := r.Cookie(s.remoteCaptchaViewerCookieName())
 	if err != nil || s.cancelRemoteCaptchaViewer(cookie.Value) != nil {
 		writeRemoteCaptchaError(w, http.StatusUnauthorized)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     remoteCaptchaViewerCookieName,
-		Value:    "",
-		Path:     remoteCaptchaViewerCookiePath,
-		Expires:  time.Unix(1, 0),
-		MaxAge:   -1,
-		Secure:   true,
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-	})
+	http.SetCookie(w, s.newRemoteCaptchaViewerCookie("", time.Unix(1, 0), -1))
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -1,6 +1,7 @@
 package netutil_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/dosfsociety/valorant-bot/internal/netutil"
@@ -27,6 +28,18 @@ func TestNormalizeCaptchaBrowserMode(t *testing.T) {
 		{name: "mixed case", rawMode: " ReMoTe ", authBaseURL: "https://relay.example.com", want: netutil.CaptchaBrowserRemote},
 		{name: "unsupported", rawMode: "browser", authBaseURL: "https://relay.example.com", wantErr: true},
 		{name: "remote HTTP origin", rawMode: "remote", authBaseURL: "http://relay.example.com", wantErr: true},
+		{name: "remote HTTP public IPv4", rawMode: "remote", authBaseURL: "http://192.0.2.10:8787", wantErr: true},
+		{name: "remote HTTP public DNS", rawMode: "remote", authBaseURL: "http://bot.example.com", wantErr: true},
+		{name: "remote HTTP path", rawMode: "remote", authBaseURL: "http://192.168.0.10:8787/relay", wantErr: true},
+		{name: "remote HTTP query", rawMode: "remote", authBaseURL: "http://192.168.0.10:8787?token=abc", wantErr: true},
+		{name: "remote HTTP user info", rawMode: "remote", authBaseURL: "http://user:pass@192.168.0.10:8787", wantErr: true},
+		{name: "remote HTTP LAN IPv4", rawMode: "remote", authBaseURL: "http://192.168.0.10:8787", want: netutil.CaptchaBrowserRemote},
+		{name: "remote HTTP loopback default port", rawMode: "remote", authBaseURL: "http://127.0.0.1:80", want: netutil.CaptchaBrowserRemote},
+		{name: "remote HTTP localhost", rawMode: "remote", authBaseURL: "http://localhost:8787", want: netutil.CaptchaBrowserRemote},
+		{name: "remote HTTP mDNS", rawMode: "remote", authBaseURL: "http://raspberrypi.local:8787", want: netutil.CaptchaBrowserRemote},
+		{name: "remote HTTP internal DNS", rawMode: "remote", authBaseURL: "http://bot.internal:8787", want: netutil.CaptchaBrowserRemote},
+		{name: "remote HTTP link-local IPv4", rawMode: "remote", authBaseURL: "http://169.254.1.1:8787", want: netutil.CaptchaBrowserRemote},
+		{name: "remote HTTP unique local IPv6", rawMode: "remote", authBaseURL: "http://[fd12:3456:789a::1]:8787", want: netutil.CaptchaBrowserRemote},
 		{name: "remote HTTPS path", rawMode: "remote", authBaseURL: "https://relay.example.com/relay", wantErr: true},
 		{name: "remote HTTPS query", rawMode: "remote", authBaseURL: "https://relay.example.com?token=abc", wantErr: true},
 		{name: "remote HTTPS fragment", rawMode: "remote", authBaseURL: "https://relay.example.com#fragment", wantErr: true},
@@ -85,6 +98,11 @@ func TestCanonicalRemoteCaptchaOrigin(t *testing.T) {
 		{name: "IPv4 nondefault port", raw: "https://192.0.2.10:8443", want: "https://192.0.2.10:8443"},
 		{name: "IPv6 spelling and default port", raw: "https://[2001:0DB8:0:0:0:0:0:1]:443", want: "https://[2001:db8::1]"},
 		{name: "IPv6 nondefault port", raw: "https://[2001:0DB8::1]:8443", want: "https://[2001:db8::1]:8443"},
+		{name: "HTTP LAN IPv4 nondefault port", raw: "http://192.168.0.10:8787", want: "http://192.168.0.10:8787"},
+		{name: "HTTP LAN IPv4 scheme case and slash", raw: "HTTP://192.168.0.10:8787/", want: "http://192.168.0.10:8787"},
+		{name: "HTTP loopback default port", raw: "http://127.0.0.1:80", want: "http://127.0.0.1"},
+		{name: "HTTP mDNS nondefault port", raw: "http://raspberrypi.local:8787", want: "http://raspberrypi.local:8787"},
+		{name: "HTTP localhost default port", raw: "HTTP://LOCALHOST:80/", want: "http://localhost"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -94,6 +112,62 @@ func TestCanonicalRemoteCaptchaOrigin(t *testing.T) {
 			}
 			if got != test.want {
 				t.Fatalf("CanonicalRemoteCaptchaOrigin(%q) = %q, want %q", test.raw, got, test.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalRemoteCaptchaOriginErrorAllowsPrivateHTTP(t *testing.T) {
+	t.Parallel()
+	_, err := netutil.CanonicalRemoteCaptchaOrigin("http://relay.example.com")
+	if err == nil {
+		t.Fatal("public HTTP origin must still be rejected")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "HTTPS origin") || !strings.Contains(msg, "private/local HTTP origin") {
+		t.Fatalf("error=%q, want HTTPS or private/local HTTP wording", msg)
+	}
+	if strings.Contains(msg, "to be an absolute HTTPS origin without") && !strings.Contains(msg, "HTTP") {
+		t.Fatalf("error still claims HTTPS-only: %q", msg)
+	}
+}
+
+func TestValidateRemoteCaptchaBind(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		authBaseURL string
+		bindAddress string
+		wantErr     bool
+	}{
+		{name: "LAN HTTP with wildcard IPv4", authBaseURL: "http://192.168.0.50:8787", bindAddress: "0.0.0.0"},
+		{name: "LAN HTTP with matching IP", authBaseURL: "http://192.168.0.50:8787", bindAddress: "192.168.0.50"},
+		{name: "LAN HTTP with wildcard IPv6", authBaseURL: "http://192.168.0.50:8787", bindAddress: "::"},
+		{name: "LAN HTTP rejects loopback IPv4", authBaseURL: "http://192.168.0.50:8787", bindAddress: "127.0.0.1", wantErr: true},
+		{name: "LAN HTTP rejects IPv6 loopback", authBaseURL: "http://192.168.0.50:8787", bindAddress: "::1", wantErr: true},
+		{name: "LAN HTTP rejects localhost", authBaseURL: "http://192.168.0.50:8787", bindAddress: "localhost", wantErr: true},
+		{name: "mDNS HTTP rejects loopback", authBaseURL: "http://raspberrypi.local:8787", bindAddress: "127.0.0.1", wantErr: true},
+		{name: "mDNS HTTP with wildcard", authBaseURL: "http://raspberrypi.local:8787", bindAddress: "0.0.0.0"},
+		{name: "internal DNS with wildcard", authBaseURL: "http://bot.internal:8787", bindAddress: "0.0.0.0"},
+		{name: "loopback HTTP allows loopback bind", authBaseURL: "http://127.0.0.1:8787", bindAddress: "127.0.0.1"},
+		{name: "localhost HTTP allows localhost bind", authBaseURL: "http://localhost:8787", bindAddress: "localhost"},
+		{name: "HTTPS public allows loopback bind", authBaseURL: "https://relay.example.com", bindAddress: "127.0.0.1"},
+		{name: "HTTPS public allows localhost bind", authBaseURL: "https://relay.example.com", bindAddress: "localhost"},
+		{name: "HTTPS loopback allows loopback bind", authBaseURL: "https://127.0.0.1", bindAddress: "127.0.0.1"},
+		{name: "HTTPS LAN IP rejects loopback bind", authBaseURL: "https://192.168.0.50:8443", bindAddress: "127.0.0.1", wantErr: true},
+		{name: "link-local HTTP rejects loopback", authBaseURL: "http://169.254.1.1:8787", bindAddress: "127.0.0.1", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := netutil.ValidateRemoteCaptchaBind(test.authBaseURL, test.bindAddress)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("ValidateRemoteCaptchaBind(%q, %q) error = nil", test.authBaseURL, test.bindAddress)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ValidateRemoteCaptchaBind(%q, %q): %v", test.authBaseURL, test.bindAddress, err)
 			}
 		})
 	}

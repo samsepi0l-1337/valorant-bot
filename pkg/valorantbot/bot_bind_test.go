@@ -67,6 +67,33 @@ func TestNewRejectsInvalidAuthBindAddress(t *testing.T) {
 	}
 }
 
+func TestNewRejectsLANHTTPRemoteCaptchaWithLoopbackBind(t *testing.T) {
+	cfg := validBindTestConfig()
+	cfg.CaptchaBrowserMode = "remote"
+	cfg.AuthBaseURL = "http://192.168.0.50:8787"
+	cfg.AuthBindAddress = "127.0.0.1"
+	if _, err := New(cfg); err == nil {
+		t.Fatal("New accepted LAN HTTP remote captcha with loopback bind")
+	}
+}
+
+func TestNewAcceptsLANHTTPRemoteCaptchaWithWildcardBind(t *testing.T) {
+	cfg := validBindTestConfig()
+	cfg.CaptchaBrowserMode = "remote"
+	cfg.AuthBaseURL = "HTTP://192.168.0.50:8787/"
+	cfg.AuthBindAddress = "0.0.0.0"
+	bot, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if bot.cfg.AuthBindAddress != "0.0.0.0" {
+		t.Fatalf("AuthBindAddress = %q, want 0.0.0.0", bot.cfg.AuthBindAddress)
+	}
+	if bot.cfg.AuthBaseURL != "http://192.168.0.50:8787" {
+		t.Fatalf("AuthBaseURL = %q, want canonical LAN HTTP origin", bot.cfg.AuthBaseURL)
+	}
+}
+
 // These literal expectations prove the runtime address builder does not
 // concatenate IPv6 and port into the ambiguous "::1:8787" spelling.
 func TestAuthListenAddressUsesJoinHostPort(t *testing.T) {

@@ -77,9 +77,13 @@ func (c *manualRemoteCaptchaClock) Advance(d time.Duration) {
 }
 
 func newRemoteCaptchaStateServer(t *testing.T, entropy []byte, ttl time.Duration) *Server {
+	return newRemoteCaptchaStateServerAt(t, "https://relay.example.com", entropy, ttl)
+}
+
+func newRemoteCaptchaStateServerAt(t *testing.T, origin string, entropy []byte, ttl time.Duration) *Server {
 	t.Helper()
 	s := New(Deps{
-		AuthBaseURL:        "https://relay.example.com",
+		AuthBaseURL:        origin,
 		CaptchaBrowserMode: netutil.CaptchaBrowserRemote,
 		PasswordAuth:       &fakePasswordAuth{},
 		PendingTTL:         ttl,
@@ -100,13 +104,21 @@ func newRemoteCaptchaStateServer(t *testing.T, entropy []byte, ttl time.Duration
 }
 
 func remoteBearerFromURL(t *testing.T, rawURL string) string {
+	return remoteBearerFromURLAt(t, rawURL, "https://relay.example.com")
+}
+
+func remoteBearerFromURLAt(t *testing.T, rawURL, publicOrigin string) string {
 	t.Helper()
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Scheme != "https" || parsed.Host != "relay.example.com" || parsed.Path != "/captcha/remote" {
-		t.Fatalf("remote URL = %q", rawURL)
+	origin, err := url.Parse(publicOrigin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Scheme != origin.Scheme || parsed.Host != origin.Host || parsed.Path != "/captcha/remote" {
+		t.Fatalf("remote URL = %q, want origin %q", rawURL, publicOrigin)
 	}
 	if parsed.RawQuery != "" || parsed.Fragment == "" {
 		t.Fatalf("remote bearer must be fragment-only: %q", rawURL)

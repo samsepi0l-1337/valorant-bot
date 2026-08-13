@@ -225,6 +225,9 @@ func TestRemoteCaptchaDeploymentOriginValidator(t *testing.T) {
 		"https://relay.example.com:0443",
 		"https://192.0.2.10:8443",
 		"https://[2001:0DB8::1]:08443",
+		"http://192.168.0.10:8787",
+		"http://127.0.0.1:8787",
+		"http://raspberrypi.local:8787",
 	} {
 		t.Run("valid_"+valid, func(t *testing.T) {
 			if output, err := exec.Command("python3", validator, valid).CombinedOutput(); err != nil {

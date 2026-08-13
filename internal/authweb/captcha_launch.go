@@ -214,12 +214,20 @@ func chromeCommandForRemoteDisplay(bin string, args []string, display string) (*
 }
 
 func chromeCommandForCaptchaDisplay(bin string, args []string, display string) (*exec.Cmd, error) {
+	return chromeCommandForCaptchaDisplayOn(runtime.GOOS, bin, args, display)
+}
+
+func chromeCommandForCaptchaDisplayOn(goos, bin string, args []string, display string) (*exec.Cmd, error) {
 	cmd, err := chromeCommand(bin, args)
-	if err != nil || strings.TrimSpace(display) == "" {
+	if err != nil || !shouldApplyCaptchaDisplay(goos, display) {
 		return cmd, err
 	}
 	cmd.Env = withCaptchaDisplayEnvironment(cmd.Env, strings.TrimSpace(display))
 	return cmd, nil
+}
+
+func shouldApplyCaptchaDisplay(goos, display string) bool {
+	return strings.TrimSpace(display) != "" && goos != "darwin"
 }
 
 func withCaptchaDisplayEnvironment(environment []string, display string) []string {

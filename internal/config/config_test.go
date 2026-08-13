@@ -174,6 +174,43 @@ func TestLoad_RejectsInvalidRemoteCaptchaOrigin(t *testing.T) {
 	}
 }
 
+func TestLoad_RemoteLANHTTPOriginRequiresNonLoopbackBind(t *testing.T) {
+	clearEnv(t)
+	setRequired(t)
+	t.Setenv("CAPTCHA_BROWSER_MODE", "remote")
+	t.Setenv("AUTH_BASE_URL", "HTTP://192.168.0.50:8787/")
+	t.Setenv("AUTH_BIND_ADDRESS", "0.0.0.0")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AuthBaseURL != "http://192.168.0.50:8787" {
+		t.Fatalf("AuthBaseURL = %q, want canonical LAN HTTP origin", cfg.AuthBaseURL)
+	}
+	if cfg.AuthBindAddress != "0.0.0.0" {
+		t.Fatalf("AuthBindAddress = %q, want 0.0.0.0", cfg.AuthBindAddress)
+	}
+}
+
+func TestLoad_RemoteLANHTTPOriginRejectsLoopbackBind(t *testing.T) {
+	for _, bind := range []string{"", "127.0.0.1"} {
+		t.Run("bind_"+bind, func(t *testing.T) {
+			clearEnv(t)
+			setRequired(t)
+			t.Setenv("CAPTCHA_BROWSER_MODE", "remote")
+			t.Setenv("AUTH_BASE_URL", "http://192.168.0.50:8787")
+			if bind != "" {
+				t.Setenv("AUTH_BIND_ADDRESS", bind)
+			}
+
+			if _, err := Load(); err == nil {
+				t.Fatal("expected loopback bind to be rejected for LAN HTTP remote origin")
+			}
+		})
+	}
+}
+
 func TestLoad_CanonicalizesRemoteCaptchaOrigin(t *testing.T) {
 	for _, test := range []struct {
 		name string

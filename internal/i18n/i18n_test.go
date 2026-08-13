@@ -51,7 +51,7 @@ func TestRemoteCaptchaRelayCopyIsLocalizedAndExplicit(t *testing.T) {
 	}{
 		{
 			lang:      KO,
-			prompt:    "아래 보안 릴레이를 열어 봇 호스트에서 실행 중인 Chrome의 Riot 캡차를 완료하세요. 렌더링된 캡차 화면과 포인터 입력만 중계됩니다. 이 링크는 곧 만료됩니다.",
+			prompt:    "아래 릴레이를 열어 봇 호스트에서 실행 중인 Chrome의 Riot 캡차를 완료하세요. 이 링크는 봇과 같은 Wi-Fi/LAN에서만 열립니다. 캡차 이후 Riot이 요구하면 Discord에서 2FA 코드를 묻습니다. 렌더링된 캡차 화면과 포인터 입력만 중계됩니다. 이 링크는 곧 만료됩니다.",
 			open:      "원격 캡차 열기",
 			cancel:    "로그인 취소",
 			cancelled: "Riot 로그인 요청을 취소했습니다. 원격 캡차 창을 닫아도 됩니다.",
@@ -59,7 +59,7 @@ func TestRemoteCaptchaRelayCopyIsLocalizedAndExplicit(t *testing.T) {
 		},
 		{
 			lang:      EN,
-			prompt:    "Open the secure relay below to complete Riot's captcha in Chrome running on the bot host. Only rendered captcha frames and pointer input are relayed. This link expires shortly.",
+			prompt:    "Open the relay below to complete Riot's captcha in Chrome running on the bot host. This link works only on the same Wi-Fi/LAN as the bot. After captcha, Discord will ask for the 2FA code if Riot requires it. Only rendered captcha frames and pointer input are relayed. This link expires shortly.",
 			open:      "Open remote captcha",
 			cancel:    "Cancel login",
 			cancelled: "Canceled the Riot login. You can close the remote captcha window.",

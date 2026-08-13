@@ -479,6 +479,28 @@ func redeemedRemoteCaptchaViewerCookie(t *testing.T, s *Server, bearer string) *
 	return cookies[0]
 }
 
+func TestRemoteCaptchaWebSocketUsesSchemeSpecificCookieName(t *testing.T) {
+	s, bearer, _ := newRemoteCaptchaHTTPFixtureAt(t, remoteCaptchaLANHTTPOrigin)
+	body := fmt.Sprintf(`{"token":%q}`, bearer)
+	redeemed := serveRemoteCaptchaHTTP(s, remoteCaptchaHTTPRequestAt(http.MethodPost, "/api/auth/captcha/remote/redeem", remoteCaptchaLANHTTPOrigin, remoteCaptchaLANHTTPOrigin, body))
+	if redeemed.Code != http.StatusNoContent || len(redeemed.Result().Cookies()) != 1 {
+		t.Fatalf("redeem status=%d cookies=%d", redeemed.Code, len(redeemed.Result().Cookies()))
+	}
+	session := redeemed.Result().Cookies()[0].Value
+
+	wrong := remoteCaptchaHTTPRequestAt(http.MethodGet, "/api/auth/captcha/remote/ws", remoteCaptchaLANHTTPOrigin, remoteCaptchaLANHTTPOrigin, "")
+	wrong.AddCookie(&http.Cookie{Name: remoteCaptchaViewerCookieName, Value: session})
+	if got := serveRemoteCaptchaHTTP(s, wrong).Code; got != http.StatusUnauthorized {
+		t.Fatalf("HTTPS cookie name on HTTP websocket status=%d, want 401", got)
+	}
+
+	ok := remoteCaptchaHTTPRequestAt(http.MethodGet, "/api/auth/captcha/remote/ws", remoteCaptchaLANHTTPOrigin, remoteCaptchaLANHTTPOrigin, "")
+	ok.AddCookie(&http.Cookie{Name: remoteCaptchaHTTPViewerCookie, Value: session})
+	if got := serveRemoteCaptchaHTTP(s, ok).Code; got == http.StatusUnauthorized || got == http.StatusForbidden {
+		t.Fatalf("HTTP cookie name on HTTP websocket status=%d, want past cookie auth", got)
+	}
+}
+
 func TestRemoteCaptchaWebSocketRejectsUntrustedRequestsBeforeUpgrade(t *testing.T) {
 	s, bearer, _ := newRemoteCaptchaHTTPFixture(t)
 	cookie := redeemedRemoteCaptchaViewerCookie(t, s, bearer)

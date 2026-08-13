@@ -22,7 +22,7 @@ func TestRemoteDisplayCommandUsesConfiguredDisplayWithoutSecrets(t *testing.T) {
 	t.Setenv("DISPLAY", ":42")
 	t.Setenv("BOT_SECRET", "remote-display-secret-must-not-reach-chrome")
 
-	cmd, err := chromeCommandForRemoteDisplay("/opt/chromium", []string{"--incognito"}, ":99")
+	cmd, err := chromeCommandForCaptchaDisplayOn("linux", "/opt/chromium", []string{"--incognito"}, ":99")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,6 +31,18 @@ func TestRemoteDisplayCommandUsesConfiguredDisplayWithoutSecrets(t *testing.T) {
 	}
 	if got := remoteDisplayEnvironmentValue(cmd.Env, "BOT_SECRET"); got != "" {
 		t.Fatalf("Chrome inherited BOT_SECRET=%q", got)
+	}
+}
+
+func TestRemoteDisplayCommandDoesNotInjectXvfbDisplayOnDarwin(t *testing.T) {
+	t.Setenv("DISPLAY", ":42")
+
+	cmd, err := chromeCommandForCaptchaDisplayOn("darwin", "/opt/chromium", []string{"--incognito"}, ":99")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := remoteDisplayEnvironmentValue(cmd.Env, "DISPLAY"); got != ":42" {
+		t.Fatalf("darwin Chrome DISPLAY=%q, want inherited desktop :42", got)
 	}
 }
 
@@ -84,4 +96,27 @@ func remoteDisplayEnvironmentValue(environment []string, key string) string {
 		}
 	}
 	return ""
+}
+
+func TestShouldApplyCaptchaDisplay(t *testing.T) {
+	tests := []struct {
+		goos    string
+		display string
+		want    bool
+	}{
+		{goos: "linux", display: ":99", want: true},
+		{goos: "linux", display: " :99 ", want: true},
+		{goos: "linux", display: "", want: false},
+		{goos: "linux", display: " \t", want: false},
+		{goos: "darwin", display: ":99", want: false},
+		{goos: "darwin", display: "", want: false},
+		{goos: "windows", display: ":99", want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.goos+"_"+test.display, func(t *testing.T) {
+			if got := shouldApplyCaptchaDisplay(test.goos, test.display); got != test.want {
+				t.Fatalf("shouldApplyCaptchaDisplay(%q, %q) = %v, want %v", test.goos, test.display, got, test.want)
+			}
+		})
+	}
 }
