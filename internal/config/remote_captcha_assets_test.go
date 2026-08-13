@@ -947,6 +947,7 @@ func TestRunLocalRemoteStartsTunnelBeforeBot(t *testing.T) {
 		`AUTH_BASE_URL="$ORIGIN"`,
 		"AUTH_BIND_ADDRESS=127.0.0.1",
 		"CAPTCHA_BROWSER_MODE=remote",
+		"make build",
 		"quick tunnel",
 		"trycloudflare",
 	} {
@@ -973,12 +974,13 @@ func TestRunLocalRemoteStartsTunnelBeforeBot(t *testing.T) {
 	validateAt := strings.Index(script, "validate-remote-captcha-origin.py")
 	writeAt := strings.Index(script, "write-remote-captcha-env.py")
 	originAt := strings.Index(script, `AUTH_BASE_URL="$ORIGIN"`)
+	buildAt := strings.Index(script, "make build")
 	botAt := strings.Index(script, "go run ./cmd/bot")
-	if sourceAt < 0 || bindAt < 0 || tunnelAt < 0 || extractAt < 0 || validateAt < 0 || writeAt < 0 || originAt < 0 || botAt < 0 {
+	if sourceAt < 0 || bindAt < 0 || tunnelAt < 0 || extractAt < 0 || validateAt < 0 || writeAt < 0 || originAt < 0 || buildAt < 0 || botAt < 0 {
 		t.Fatal("run-local-remote.sh is missing a required staging step")
 	}
-	if !(sourceAt < bindAt && bindAt < tunnelAt && tunnelAt < extractAt && extractAt < validateAt && validateAt < writeAt && writeAt < originAt && originAt < botAt) {
-		t.Fatalf("run-local-remote.sh stage order source=%d bind=%d tunnel=%d extract=%d validate=%d write=%d origin=%d bot=%d", sourceAt, bindAt, tunnelAt, extractAt, validateAt, writeAt, originAt, botAt)
+	if !(sourceAt < bindAt && bindAt < tunnelAt && tunnelAt < extractAt && extractAt < validateAt && validateAt < writeAt && writeAt < originAt && originAt < buildAt && buildAt < botAt) {
+		t.Fatalf("run-local-remote.sh stage order source=%d bind=%d tunnel=%d extract=%d validate=%d write=%d origin=%d build=%d bot=%d", sourceAt, bindAt, tunnelAt, extractAt, validateAt, writeAt, originAt, buildAt, botAt)
 	}
 	if strings.Index(script, "trap") < 0 || strings.Index(script, "kill") < 0 {
 		t.Error("run-local-remote.sh does not clean up cloudflared")

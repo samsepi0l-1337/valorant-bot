@@ -100,6 +100,8 @@ echo
 
 mkdir -p "$(dirname "${DATABASE_PATH:-./data/bot.db}")"
 
+echo "Building bot so this run includes the latest CAPTCHA viewer fixes"
+make build
 if [[ -x ./bin/valorant-bot ]]; then
   ./bin/valorant-bot
 else
