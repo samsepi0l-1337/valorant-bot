@@ -103,9 +103,13 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID
 `127.0.0.1`이면 다른 기기가 뷰어에 닿지 않습니다. 공개 HTTP 호스트는 거부됩니다.
 공개 DNS hostname의 HTTPS를 권장합니다. HTTPS IP 주소를 사용할 수 있는 경우는 그
 **IP 주소에 유효한 TLS 인증서**가 있을 때뿐입니다. 사용자 PC에는 Windows용 다운로드,
-확장 프로그램, localhost 리스너가 필요 없습니다. LAN HTTP 절차는
-[`deploy/lan-remote-captcha.md`](deploy/lan-remote-captcha.md), 인터넷 Tunnel은
-[`deploy/pi-cloudflare-tunnel.md`](deploy/pi-cloudflare-tunnel.md)를 따르세요.
+확장 프로그램, localhost 리스너가 필요 없습니다. 같은 LAN의 HTTP 절차는
+[`deploy/lan-remote-captcha.md`](deploy/lan-remote-captcha.md)입니다. 집 밖 LTE처럼
+사설 IP에 닿지 않는 기기는 Cloudflare Tunnel이 필요합니다. 로컬 테스트는
+`./scripts/run-local-remote.sh`(quick tunnel, URL이 매번 바뀌며 `.env`의
+`AUTH_BASE_URL`을 갱신), Pi 지속 운영은
+[`deploy/pi-cloudflare-tunnel.md`](deploy/pi-cloudflare-tunnel.md)의 named tunnel을
+따르세요.
 
 ---
 

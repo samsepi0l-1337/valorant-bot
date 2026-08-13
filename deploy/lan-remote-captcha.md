@@ -53,7 +53,29 @@ LAN 전용입니다.
 3. 방화벽: LAN → Pi `AUTH_PORT`만 허용. Xvfb는 TCP로 열지 않습니다.
 
 4. 다른 PC의 브라우저에서 Discord가 준 `http://<pi-lan-ip>:8787/captcha/remote#…`
-   링크를 엽니다. 휴대폰이 LTE면 같은 LAN이 아니므로 실패합니다.
+   링크를 엽니다. 휴대폰이 LTE면 같은 LAN이 아니므로 실패합니다. 그 경우는
+   [`pi-cloudflare-tunnel.md`](pi-cloudflare-tunnel.md) 또는 로컬
+   `./scripts/run-local-remote.sh`를 사용하세요.
+
+## 집 밖 LTE
+
+RFC1918 LAN 주소는 LTE/다른 Wi-Fi에서 열리지 않습니다. 한국 가정 회선은 80/443
+인바운드나 CGNAT 때문에 공유기 포트포워드가 자주 막히므로, 이 봇은 그 경로를
+기본 인터넷 방법으로 쓰지 않습니다. 공개 HTTPS origin과 WebSocket이 필요하면
+Cloudflare Tunnel(아웃바운드)을 씁니다.
+
+노트북에서 한 번 열어보려면 `.env`의 Discord 비밀은 그대로 두고:
+
+```bash
+./scripts/run-local-remote.sh
+```
+
+스크립트가 quick tunnel URL을 받은 뒤 `.env`의 `AUTH_BASE_URL`을
+`https://….trycloudflare.com`으로, `AUTH_BIND_ADDRESS`를 `127.0.0.1`로,
+`CAPTCHA_BROWSER_MODE`를 `remote`로 고칩니다. Discord 토큰·`BOT_SECRET`은
+그대로 둡니다. quick tunnel 주소는 프로세스를 다시 켤 때마다 바뀌므로 스크립트가
+매번 `.env`를 갱신합니다. Pi에서 계속 쓰려면 named tunnel과 소유한 도메인을
+[`pi-cloudflare-tunnel.md`](pi-cloudflare-tunnel.md)대로 붙이세요.
 
 ## HTTP 주의
 

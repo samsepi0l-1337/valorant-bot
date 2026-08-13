@@ -131,6 +131,9 @@ not demonstrate a successful login against a live Riot account.
 - `nginx.example.conf` — optional reverse proxy
 - `env.*.example` — environment templates
 - `../scripts/pi-tunnel.sh` — Cloudflare quick tunnel (원격 CAPTCHA 테스트 또는 `/invite`)
+- `../scripts/run-local-remote.sh` — 로컬 LTE 테스트: quick tunnel origin을 `.env`에 쓴 뒤 봇 시작
+- `extract-trycloudflare-origin.py` — cloudflared 로그에서 quick tunnel origin 추출
+- `write-remote-captcha-env.py` — `.env`에 터널 origin·loopback bind·remote 모드만 갱신
 - `pi-cloudflare-tunnel.md` — Pi Xvfb/Chromium 및 HTTPS Tunnel 운영 절차
 
 See the root [README](../README.md).

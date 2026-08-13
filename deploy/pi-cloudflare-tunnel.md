@@ -165,6 +165,13 @@ quick tunnel 주소는 프로세스를 다시 시작할 때 바뀌므로 지속�
 사용하지 마세요. 이 주소가 바뀌면 새 주소로 환경 변수를 수정하고 봇을 재시작해야 합니다.
 QR 또는 `disabled` 모드는 이 tunnel이나 인바운드 포트 없이 동작합니다.
 
+로컬 노트북에서 집 밖 LTE로 캡차 뷰어를 시험할 때는 봇보다 먼저 터널 origin이
+있어야 합니다. `./scripts/run-local-remote.sh`가 cloudflared quick tunnel을 띄워
+URL을 파싱한 다음, 그 origin을 `.env`의 `AUTH_BASE_URL`에 쓰고 loopback bind와
+`CAPTCHA_BROWSER_MODE=remote`를 맞춘 뒤 봇을 시작합니다. Discord 비밀은
+유지합니다. quick tunnel 주소는 켤 때마다 바뀌므로 스크립트가 `.env`를 다시
+고칩니다.
+
 ## 운영 점검
 
 다음을 확인한 뒤 Discord에서 `/auth` → 아이디/비밀번호를 실행합니다.
