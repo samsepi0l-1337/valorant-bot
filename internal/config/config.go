@@ -73,6 +73,9 @@ func Load() (Config, error) {
 		if err != nil {
 			return Config{}, err
 		}
+		if err := netutil.ValidateRemoteCaptchaBind(cfg.AuthBaseURL, cfg.AuthBindAddress); err != nil {
+			return Config{}, err
+		}
 	}
 
 	if portStr := os.Getenv("AUTH_PORT"); portStr != "" {

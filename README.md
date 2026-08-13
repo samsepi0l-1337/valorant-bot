@@ -78,7 +78,7 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID
 | `DISCORD_TOKEN`    | 예     | 봇 토큰                                              |
 | `DISCORD_APP_ID`   | 예     | 애플리케이션 ID                                      |
 | `BOT_SECRET`       | 예     | 세션 암호화 키 (**32자 이상**, 스크립트가 생성 가능) |
-| `AUTH_BASE_URL`    | 예     | `/invite` 주소; 원격 모드에서는 정확한 공개 HTTPS 주소 |
+| `AUTH_BASE_URL`    | 예     | `/invite` 주소; 원격 모드는 공개 HTTPS 또는 사설/로컬 HTTP 오리진 |
 | `AUTH_PORT`        | 아니오 | HTTP 포트 (기본 `8787`)                              |
 | `AUTH_BIND_ADDRESS` | 아니오 | 수신 주소 (기본 `127.0.0.1`)                         |
 | `CAPTCHA_BROWSER_MODE` | 아니오 | `local`(기본), `remote`, `disabled`              |
@@ -92,15 +92,17 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID
 `CAPTCHA_BROWSER_MODE=local`은 기존처럼 봇 호스트의 GUI Chrome/Chromium 창을
 사용합니다. `disabled`는 비밀번호 CAPTCHA 시작을 명확히 거절하고 Riot Mobile QR을
 안내합니다. `remote`는 봇 호스트의 GUI Chromium 화면을 Discord 사용자의 브라우저로
-중계합니다. 이 경우 `AUTH_BASE_URL`은 쿼리·fragment·사용자 정보가 없는 절대
-`https://` 공개 주소여야 하며, 프록시/터널은 WebSocket을 통과시켜야 합니다.
-공개 DNS hostname을 권장합니다. HTTPS IP 주소를 사용할 수 있는 경우는 그 **IP 주소에 유효한
-TLS 인증서**가 있을 때뿐입니다. `AUTH_BIND_ADDRESS`는 기본 `127.0.0.1`로 유지해 proxy/tunnel
-upstream을 호스트 내부로 제한하세요. 의도적으로 LAN에서 직접 수신해야 할 때만 방화벽 규칙을
-먼저 제한한 뒤 이 값을 LAN 주소 또는 `0.0.0.0`으로 명시적으로 바꿉니다.
-사용자 PC에는 Windows용 다운로드, 확장 프로그램, localhost 리스너가 필요 없습니다.
-Pi 원격 배포는 [`deploy/pi-cloudflare-tunnel.md`](deploy/pi-cloudflare-tunnel.md)를
-따르세요.
+중계합니다. 인터넷 경로는 쿼리·fragment·사용자 정보가 없는 절대 `https://` 공개
+주소와 WebSocket을 통과시키는 프록시/터널이 필요합니다. 같은 LAN의 다른 PC에서만
+캡차를 완료하면 Cloudflare Tunnel 없이 사설/로컬 `http://` `AUTH_BASE_URL`
+(예: `http://192.168.0.10:8787`, `http://raspberrypi.local:8787`)을 쓸 수 있습니다.
+이 경우 `AUTH_BIND_ADDRESS`를 `0.0.0.0` 또는 그 LAN IP로 바꿔야 합니다. 기본
+`127.0.0.1`이면 다른 기기가 뷰어에 닿지 않습니다. 공개 HTTP 호스트는 거부됩니다.
+공개 DNS hostname의 HTTPS를 권장합니다. HTTPS IP 주소를 사용할 수 있는 경우는 그
+**IP 주소에 유효한 TLS 인증서**가 있을 때뿐입니다. 사용자 PC에는 Windows용 다운로드,
+확장 프로그램, localhost 리스너가 필요 없습니다. LAN HTTP 절차는
+[`deploy/lan-remote-captcha.md`](deploy/lan-remote-captcha.md), 인터넷 Tunnel은
+[`deploy/pi-cloudflare-tunnel.md`](deploy/pi-cloudflare-tunnel.md)를 따르세요.
 
 ---
 

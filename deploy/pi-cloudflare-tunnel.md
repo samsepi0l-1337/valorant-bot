@@ -1,5 +1,9 @@
 # Raspberry Pi 원격 CAPTCHA와 Cloudflare Tunnel
 
+같은 LAN의 다른 PC에서만 캡차를 완료하면 Cloudflare Tunnel은 필수가 아닙니다.
+그 경로는 [`lan-remote-captcha.md`](lan-remote-captcha.md)를 따르세요. 아래는
+인터넷에서 뷰어를 열 때 쓰는 HTTPS 터널 절차입니다.
+
 이 문서는 headless Raspberry Pi에서 `remote` CAPTCHA 모드를 운영하는 절차입니다.
 사용자는 Discord에서 받은 짧은 수명의 일회용 링크만 열면 됩니다. Windows 프로그램,
 브라우저 확장, VNC/RDP, 인증서, 사용자 측 localhost 서버는 설치하지 않습니다.

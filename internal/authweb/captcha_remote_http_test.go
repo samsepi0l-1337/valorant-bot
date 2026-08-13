@@ -7,8 +7,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -17,27 +20,43 @@ import (
 	"github.com/dosfsociety/valorant-bot/internal/netutil"
 )
 
-const remoteCaptchaTestOrigin = "https://relay.example.com"
+const (
+	remoteCaptchaTestOrigin       = "https://relay.example.com"
+	remoteCaptchaLANHTTPOrigin    = "http://192.168.0.10:8787"
+	remoteCaptchaHTTPViewerCookie = "valorant-captcha-viewer"
+)
 
 func newRemoteCaptchaHTTPFixture(t *testing.T) (*Server, string, string) {
+	return newRemoteCaptchaHTTPFixtureAt(t, remoteCaptchaTestOrigin)
+}
+
+func newRemoteCaptchaHTTPFixtureAt(t *testing.T, origin string) (*Server, string, string) {
 	t.Helper()
 	grant := bytes.Repeat([]byte{0x18}, remoteCaptchaSecretBytes)
 	viewer := bytes.Repeat([]byte{0x29}, remoteCaptchaSecretBytes)
 	rejectedViewer := bytes.Repeat([]byte{0x3a}, remoteCaptchaSecretBytes)
 	entropy := append(append(append([]byte{}, grant...), viewer...), rejectedViewer...)
-	s := newRemoteCaptchaStateServer(t, entropy, time.Minute)
+	s := newRemoteCaptchaStateServerAt(t, origin, entropy, time.Minute)
 	remoteURL, state, err := s.BeginPasswordLogin(context.Background(), "discord-owner", "riot-user", "riot-password")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return s, remoteBearerFromURL(t, remoteURL), state
+	return s, remoteBearerFromURLAt(t, remoteURL, origin), state
 }
 
 func remoteCaptchaHTTPRequest(method, path, origin, body string) *http.Request {
-	req := httptest.NewRequest(method, remoteCaptchaTestOrigin+path, strings.NewReader(body))
-	req.Host = "relay.example.com"
-	if origin != "" {
-		req.Header.Set("Origin", origin)
+	return remoteCaptchaHTTPRequestAt(method, path, remoteCaptchaTestOrigin, origin, body)
+}
+
+func remoteCaptchaHTTPRequestAt(method, path, publicOrigin, originHeader, body string) *http.Request {
+	req := httptest.NewRequest(method, publicOrigin+path, strings.NewReader(body))
+	parsed, err := url.Parse(publicOrigin)
+	if err != nil {
+		panic(err)
+	}
+	req.Host = parsed.Host
+	if originHeader != "" {
+		req.Header.Set("Origin", originHeader)
 	}
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
@@ -488,6 +507,7 @@ func TestRemoteCaptchaHTTPCanonicalConfiguredOriginsMatchBrowserRequests(t *test
 		{name: "IPv4 nondefault port", configured: "https://192.0.2.10:8443", origin: "https://192.0.2.10:8443", host: "192.0.2.10:8443"},
 		{name: "IPv6 spelling and default port", configured: "https://[2001:0DB8:0:0:0:0:0:1]:443", origin: "https://[2001:db8::1]", host: "[2001:db8::1]"},
 		{name: "IPv6 nondefault port", configured: "https://[2001:0DB8::1]:8443", origin: "https://[2001:db8::1]:8443", host: "[2001:db8::1]:8443"},
+		{name: "HTTP LAN IPv4 with port", configured: "http://192.168.0.10:8787", origin: "http://192.168.0.10:8787", host: "192.168.0.10:8787", rejectedOrigin: "http://192.168.0.11:8787", rejectedHost: "192.168.0.11:8787"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			s := New(Deps{AuthBaseURL: test.configured, CaptchaBrowserMode: netutil.CaptchaBrowserRemote})
@@ -570,6 +590,9 @@ func TestRemoteCaptchaHTTPRedeemSetsOneOpaqueStrictCookie(t *testing.T) {
 	if cookie.Value == bearer || cookie.Value == "" {
 		t.Fatal("viewer cookie reused or omitted the fragment bearer")
 	}
+	if cookie.Name != remoteCaptchaViewerCookieName {
+		t.Fatalf("HTTPS viewer cookie name = %q, want %q", cookie.Name, remoteCaptchaViewerCookieName)
+	}
 	decoded, err := base64.RawURLEncoding.Strict().DecodeString(cookie.Value)
 	if err != nil || len(decoded) != remoteCaptchaSecretBytes {
 		t.Fatalf("opaque viewer cookie decoded=%d err=%v", len(decoded), err)
@@ -587,6 +610,139 @@ func TestRemoteCaptchaHTTPRedeemSetsOneOpaqueStrictCookie(t *testing.T) {
 	if second.Code != http.StatusUnauthorized || strings.Contains(second.Body.String(), bearer) {
 		t.Fatalf("reused bearer status=%d body=%q", second.Code, second.Body.String())
 	}
+}
+
+func TestRemoteCaptchaHTTPRedeemSetsNonSecureCookieOnHTTPOrigin(t *testing.T) {
+	s, bearer, state := newRemoteCaptchaHTTPFixtureAt(t, remoteCaptchaLANHTTPOrigin)
+	body := fmt.Sprintf(`{"token":%q}`, bearer)
+	recorder := serveRemoteCaptchaHTTP(s, remoteCaptchaHTTPRequestAt(http.MethodPost, "/api/auth/captcha/remote/redeem", remoteCaptchaLANHTTPOrigin, remoteCaptchaLANHTTPOrigin, body))
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("redeem status = %d, body = %q", recorder.Code, recorder.Body.String())
+	}
+	cookies := recorder.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("redemption cookies = %d, want 1", len(cookies))
+	}
+	cookie := cookies[0]
+	if cookie.Name != remoteCaptchaHTTPViewerCookie {
+		t.Fatalf("HTTP viewer cookie name = %q, want %q", cookie.Name, remoteCaptchaHTTPViewerCookie)
+	}
+	if cookie.Secure || !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode ||
+		cookie.Path != remoteCaptchaViewerCookiePath || cookie.Domain != "" {
+		t.Fatalf("HTTP viewer cookie attributes = %+v", cookie)
+	}
+	viewer, err := s.lookupRemoteCaptchaViewer(cookie.Value)
+	if err != nil || viewer.state != state || viewer.discordUserID != "discord-owner" {
+		t.Fatalf("authenticated viewer = %+v, %v", viewer, err)
+	}
+}
+
+func TestRemoteCaptchaHTTPOriginMatchingIncludesLANHTTPPort(t *testing.T) {
+	s, bearer, _ := newRemoteCaptchaHTTPFixtureAt(t, remoteCaptchaLANHTTPOrigin)
+	body := fmt.Sprintf(`{"token":%q}`, bearer)
+	ok := serveRemoteCaptchaHTTP(s, remoteCaptchaHTTPRequestAt(http.MethodPost, "/api/auth/captcha/remote/redeem", remoteCaptchaLANHTTPOrigin, remoteCaptchaLANHTTPOrigin, body))
+	if ok.Code != http.StatusNoContent {
+		t.Fatalf("LAN HTTP redeem status = %d, body = %q", ok.Code, ok.Body.String())
+	}
+
+	wrongHost := remoteCaptchaHTTPRequestAt(http.MethodPost, "/api/auth/captcha/remote/redeem", remoteCaptchaLANHTTPOrigin, remoteCaptchaLANHTTPOrigin, body)
+	wrongHost.Host = "192.168.0.11:8787"
+	if got := serveRemoteCaptchaHTTP(s, wrongHost).Code; got != http.StatusForbidden {
+		t.Fatalf("wrong Host status = %d, want 403", got)
+	}
+
+	missingOrigin := remoteCaptchaHTTPRequestAt(http.MethodPost, "/api/auth/captcha/remote/redeem", remoteCaptchaLANHTTPOrigin, "", body)
+	if got := serveRemoteCaptchaHTTP(s, missingOrigin).Code; got != http.StatusForbidden {
+		t.Fatalf("missing Origin status = %d, want 403", got)
+	}
+}
+
+func TestRemoteCaptchaHTTPViewerServesOnLoopbackListener(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	origin := fmt.Sprintf("http://127.0.0.1:%d", port)
+	server := New(Deps{
+		AuthBaseURL:        origin,
+		CaptchaBrowserMode: netutil.CaptchaBrowserRemote,
+		PasswordAuth:       &fakePasswordAuth{},
+		Store:              newMockStore(),
+		Riot:               &mockRiot{},
+		Boxer:              &mockBoxer{},
+	})
+	t.Cleanup(func() { _ = server.Close() })
+
+	httpServer := &http.Server{Handler: server.Handler()}
+	errCh := make(chan error, 1)
+	go func() { errCh <- httpServer.Serve(listener) }()
+	t.Cleanup(func() { _ = httpServer.Close() })
+
+	req, err := http.NewRequest(http.MethodGet, origin+"/captcha/remote", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET viewer over loopback HTTP: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET viewer status = %d, body = %q", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "Remote CAPTCHA") {
+		t.Fatalf("viewer body missing title: %q", body)
+	}
+
+	wrongHost, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/captcha/remote", port), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongHost.Host = "192.168.0.10:8787"
+	wrong, err := http.DefaultClient.Do(wrongHost)
+	if err != nil {
+		t.Fatalf("wrong-host GET: %v", err)
+	}
+	defer wrong.Body.Close()
+	if wrong.StatusCode != http.StatusForbidden {
+		t.Fatalf("wrong Host status = %d, want 403", wrong.StatusCode)
+	}
+
+	select {
+	case serveErr := <-errCh:
+		if serveErr != nil && serveErr != http.ErrServerClosed {
+			t.Fatalf("http serve: %v", serveErr)
+		}
+	default:
+	}
+}
+
+func TestRemoteCaptchaHTTPRejectsMismatchedViewerCookieName(t *testing.T) {
+	t.Run("HTTP origin rejects HTTPS cookie name", func(t *testing.T) {
+		s, bearer, _ := newRemoteCaptchaHTTPFixtureAt(t, remoteCaptchaLANHTTPOrigin)
+		body := fmt.Sprintf(`{"token":%q}`, bearer)
+		redeemed := serveRemoteCaptchaHTTP(s, remoteCaptchaHTTPRequestAt(http.MethodPost, "/api/auth/captcha/remote/redeem", remoteCaptchaLANHTTPOrigin, remoteCaptchaLANHTTPOrigin, body))
+		if redeemed.Code != http.StatusNoContent {
+			t.Fatalf("redeem status = %d", redeemed.Code)
+		}
+		session := redeemed.Result().Cookies()[0].Value
+		req := remoteCaptchaHTTPRequestAt(http.MethodPost, "/api/auth/captcha/remote/cancel", remoteCaptchaLANHTTPOrigin, remoteCaptchaLANHTTPOrigin, `{}`)
+		req.AddCookie(&http.Cookie{Name: remoteCaptchaViewerCookieName, Value: session})
+		if got := serveRemoteCaptchaHTTP(s, req).Code; got != http.StatusUnauthorized {
+			t.Fatalf("HTTPS cookie name on HTTP origin status = %d, want 401", got)
+		}
+	})
+	t.Run("HTTPS origin rejects HTTP cookie name", func(t *testing.T) {
+		s, bearer, _ := newRemoteCaptchaHTTPFixture(t)
+		cookie := redeemedRemoteCaptchaViewerCookie(t, s, bearer)
+		req := remoteCaptchaHTTPRequest(http.MethodPost, "/api/auth/captcha/remote/cancel", remoteCaptchaTestOrigin, `{}`)
+		req.AddCookie(&http.Cookie{Name: remoteCaptchaHTTPViewerCookie, Value: cookie.Value})
+		if got := serveRemoteCaptchaHTTP(s, req).Code; got != http.StatusUnauthorized {
+			t.Fatalf("HTTP cookie name on HTTPS origin status = %d, want 401", got)
+		}
+	})
 }
 
 func TestRemoteCaptchaHTTPRedeemRejectsUntrustedOrMalformedRequests(t *testing.T) {

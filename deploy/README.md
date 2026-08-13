@@ -15,11 +15,13 @@
 | 모드 | 동작 | 필요한 조건 |
 | --- | --- | --- |
 | `local` (기본) | 봇 호스트의 GUI Chrome/Chromium 창 | 로그인된 데스크톱 세션 |
-| `remote` | Pi/서버 Chromium 화면을 Discord 링크로 중계 | 공개 HTTPS `AUTH_BASE_URL`, WebSocket 프록시, Chromium, Xvfb |
+| `remote` | Pi/서버 Chromium 화면을 Discord 링크로 중계 | 인터넷: 공개 HTTPS `AUTH_BASE_URL` + WebSocket 프록시. LAN: 사설/로컬 HTTP + `AUTH_BIND_ADDRESS=0.0.0.0` 또는 LAN IP. Chromium, (Pi는) Xvfb |
 | `disabled` | 비밀번호 CAPTCHA를 거절하고 QR 안내 | QR만 사용 |
 
-`remote`에서만 `AUTH_PORT`가 공개 HTTPS 프록시/Cloudflare Tunnel 뒤에 있어야 합니다.
-`AUTH_BASE_URL`은 host가 비어 있지 않은 단 하나의 절대 `https://` origin이어야 합니다.
+인터넷 `remote`는 `AUTH_PORT`를 공개 HTTPS 프록시/Cloudflare Tunnel 뒤에 둡니다.
+같은 LAN의 다른 PC만 쓰면 Tunnel 없이 사설/로컬 `http://` origin이 허용됩니다.
+절차는 [`lan-remote-captcha.md`](lan-remote-captcha.md)입니다. 공개 HTTP 호스트는 거부됩니다.
+`AUTH_BASE_URL`은 host가 비어 있지 않은 단 하나의 절대 origin이어야 합니다.
 userinfo·query·fragment·공백·제어문자와 `/` 외의 path를 넣지 마세요. 설치 스크립트는
 서비스·사용자·파일을 변경하기 전에 이 형식을 검사하고, 런타임에서는 애플리케이션의
 canonicalizer가 다시 권위 있게 검증합니다.

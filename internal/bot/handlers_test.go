@@ -328,7 +328,7 @@ func TestHandlePasswordLogin_RemoteRelayLinkAndOwnerCancelContainNoBearerCustomI
 	if gotState != state || !resp.Ephemeral {
 		t.Fatalf("remote response state=%q ephemeral=%v", gotState, resp.Ephemeral)
 	}
-	if resp.Content != "Open the secure relay below to complete Riot's captcha in Chrome running on the bot host. Only rendered captcha frames and pointer input are relayed. This link expires shortly." {
+	if resp.Content != "Open the relay below to complete Riot's captcha in Chrome running on the bot host. This link works only on the same Wi-Fi/LAN as the bot. After captcha, Discord will ask for the 2FA code if Riot requires it. Only rendered captcha frames and pointer input are relayed. This link expires shortly." {
 		t.Fatalf("remote response content=%q", resp.Content)
 	}
 	if len(resp.Components) != 1 {

@@ -154,6 +154,15 @@ func New(cfg Config) (*Bot, error) {
 		return nil, err
 	}
 	cfg.CaptchaBrowserMode = string(mode)
+	if mode == netutil.CaptchaBrowserRemote {
+		cfg.AuthBaseURL, err = netutil.CanonicalRemoteCaptchaOrigin(cfg.AuthBaseURL)
+		if err != nil {
+			return nil, err
+		}
+		if err := netutil.ValidateRemoteCaptchaBind(cfg.AuthBaseURL, cfg.AuthBindAddress); err != nil {
+			return nil, err
+		}
+	}
 	if cfg.AuthPort <= 0 {
 		cfg.AuthPort = 8787
 	}

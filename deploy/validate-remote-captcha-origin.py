@@ -12,7 +12,8 @@ import urllib.parse
 def invalid() -> int:
     print(
         "remote CAPTCHA requires AUTH_BASE_URL to be one absolute HTTPS origin "
-        "with a nonempty host and no userinfo, query, fragment, or non-root path",
+        "or a private/local HTTP origin with a nonempty host and no userinfo, "
+        "query, fragment, or non-root path",
         file=sys.stderr,
     )
     return 1
@@ -50,6 +51,19 @@ def valid_dns_name(hostname: str) -> bool:
     return True
 
 
+def allowed_http_host(hostname: str) -> bool:
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        if not valid_dns_name(hostname):
+            return False
+        lower = hostname.lower()
+        return lower.endswith(".local") or lower.endswith(".internal")
+    return bool(address.is_private or address.is_loopback or address.is_link_local)
+
+
 def valid_origin(raw: str) -> bool:
     if not raw or any(character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F for character in raw):
         return False
@@ -63,8 +77,9 @@ def valid_origin(raw: str) -> bool:
     except ValueError:
         return False
 
+    scheme = parsed.scheme.lower()
     if (
-        parsed.scheme.lower() != "https"
+        scheme not in ("https", "http")
         or not parsed.netloc
         or not hostname
         or parsed.username is not None
@@ -86,7 +101,9 @@ def valid_origin(raw: str) -> bool:
             address = ipaddress.IPv6Address(hostname)
         except ValueError:
             return False
-        return address.ipv4_mapped is None and address.scope_id is None
+        if address.ipv4_mapped is not None or address.scope_id is not None:
+            return False
+        return scheme == "https" or allowed_http_host(hostname)
 
     if any(character in parsed.netloc for character in "[]") or ":" in hostname:
         return False
@@ -97,8 +114,12 @@ def valid_origin(raw: str) -> bool:
     except ValueError:
         if looks_like_noncanonical_ipv4(hostname):
             return False
-        return valid_dns_name(hostname)
-    return isinstance(address, ipaddress.IPv4Address) and str(address) == hostname
+        if not valid_dns_name(hostname):
+            return False
+        return scheme == "https" or allowed_http_host(hostname)
+    if not (isinstance(address, ipaddress.IPv4Address) and str(address) == hostname):
+        return False
+    return scheme == "https" or allowed_http_host(hostname)
 
 
 def validate_target_env(env_path: str, caller: str) -> bool:
