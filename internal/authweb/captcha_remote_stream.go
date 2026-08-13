@@ -304,7 +304,7 @@ func (s *remoteCaptchaStream) runCapture() {
 func (s *remoteCaptchaStream) captureSanitizedFrame() error {
 	pre, err := s.captureProvider(s.ctx)
 	if err != nil {
-		if errors.Is(err, errRiotCaptchaSurfaceUnavailable) {
+		if errors.Is(err, errRiotCaptchaSurfaceUnavailable) || lostChromeDevToolsSession(err) {
 			return nil
 		}
 		if isExpectedRemoteCaptchaTeardown(err) {
@@ -342,7 +342,7 @@ func (s *remoteCaptchaStream) captureSanitizedFrame() error {
 	}
 	post, err := s.captureProvider(s.ctx)
 	if err != nil {
-		if errors.Is(err, errRiotCaptchaSurfaceUnavailable) {
+		if errors.Is(err, errRiotCaptchaSurfaceUnavailable) || lostChromeDevToolsSession(err) {
 			return nil
 		}
 		if isExpectedRemoteCaptchaTeardown(err) {
@@ -797,6 +797,9 @@ func (s *remoteCaptchaStream) DispatchInput(ctx context.Context, payload []byte)
 			if isExpectedRemoteCaptchaTeardown(err) {
 				return errRemoteCaptchaChallengeTeardown
 			}
+			if lostChromeDevToolsSession(err) {
+				return errRemoteCaptchaInputInvalid
+			}
 			return fmt.Errorf("arm remote CAPTCHA input fence: %w", err)
 		}
 		current, guardErr := s.captureProvider(callCtx)
@@ -820,6 +823,9 @@ func (s *remoteCaptchaStream) DispatchInput(ctx context.Context, payload []byte)
 			if isExpectedRemoteCaptchaTeardown(err) {
 				return errRemoteCaptchaChallengeTeardown
 			}
+			if lostChromeDevToolsSession(err) {
+				return errRemoteCaptchaInputInvalid
+			}
 			return fmt.Errorf("open remote CAPTCHA input fence: %w", err)
 		}
 		defer func() {
@@ -829,7 +835,7 @@ func (s *remoteCaptchaStream) DispatchInput(ctx context.Context, payload []byte)
 			if restoreErr != nil {
 				if isExpectedRemoteCaptchaTeardown(restoreErr) {
 					returnErr = errors.Join(returnErr, errRemoteCaptchaChallengeTeardown)
-				} else {
+				} else if !lostChromeDevToolsSession(restoreErr) {
 					returnErr = errors.Join(returnErr, fmt.Errorf("restore remote CAPTCHA input fence: %w", restoreErr))
 				}
 			}
@@ -838,6 +844,9 @@ func (s *remoteCaptchaStream) DispatchInput(ctx context.Context, payload []byte)
 	if err := s.client.Call(callCtx, "Input.dispatchMouseEvent", event, nil); err != nil {
 		if isExpectedRemoteCaptchaTeardown(err) {
 			return errRemoteCaptchaChallengeTeardown
+		}
+		if lostChromeDevToolsSession(err) {
+			return errRemoteCaptchaInputInvalid
 		}
 		return fmt.Errorf("dispatch remote CAPTCHA pointer input: %w", err)
 	}

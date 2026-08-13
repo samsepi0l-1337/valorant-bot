@@ -17,6 +17,80 @@ func newTestChromeDevToolsPipes() (*chromeDevToolsPipe, *chromeDevToolsPipe) {
 	return newChromeDevToolsPipe(hostResponses, hostCommands), newChromeDevToolsPipe(browserCommands, browserResponses)
 }
 
+func TestChromeDevToolsCallReattachesAfterLostPageSession(t *testing.T) {
+	host, browser := newTestChromeDevToolsPipes()
+	t.Cleanup(func() {
+		_ = host.Close()
+		_ = browser.Close()
+	})
+	client := newChromeDevToolsClient(host)
+	client.setSessionID("dead-session")
+
+	type callResult struct {
+		value string
+		err   error
+	}
+	done := make(chan callResult, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() {
+		var result struct {
+			Value string `json:"value"`
+		}
+		err := client.Call(ctx, "Runtime.evaluate", map[string]any{"expression": "1"}, &result)
+		done <- callResult{value: result.Value, err: err}
+	}()
+
+	evaluate := nextRemoteCaptchaTestCommand(t, browser)
+	if evaluate.Method != "Runtime.evaluate" || evaluate.SessionID != "dead-session" {
+		t.Fatalf("first evaluate=%+v, want dead-session Runtime.evaluate", evaluate)
+	}
+	if err := browser.WriteJSON(map[string]any{"id": evaluate.ID, "error": map[string]any{"message": "Session with given id not found"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	targets := nextRemoteCaptchaTestCommand(t, browser)
+	if targets.Method != "Target.getTargets" || targets.SessionID != "" {
+		t.Fatalf("reattach getTargets=%+v, want browser-level Target.getTargets", targets)
+	}
+	if err := browser.WriteJSON(map[string]any{"id": targets.ID, "result": map[string]any{"targetInfos": []map[string]any{{
+		"targetId": "authenticate-page", "type": "page", "url": "https://authenticate.riotgames.com/",
+	}}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	attach := nextRemoteCaptchaTestCommand(t, browser)
+	if attach.Method != "Target.attachToTarget" || attach.SessionID != "" {
+		t.Fatalf("reattach attach=%+v, want browser-level Target.attachToTarget", attach)
+	}
+	if err := browser.WriteJSON(map[string]any{"id": attach.ID, "result": map[string]any{"sessionId": "fresh-session"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	retry := nextRemoteCaptchaTestCommand(t, browser)
+	if retry.Method != "Runtime.evaluate" || retry.SessionID != "fresh-session" {
+		t.Fatalf("retry evaluate=%+v, want fresh-session Runtime.evaluate", retry)
+	}
+	if err := browser.WriteJSON(map[string]any{"id": retry.ID, "result": map[string]any{"value": "ok"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("reattached Call failed: %v", result.err)
+		}
+		if result.value != "ok" {
+			t.Fatalf("reattached value=%q", result.value)
+		}
+	case <-ctx.Done():
+		t.Fatal("timed out reattaching a lost Chrome page session")
+	}
+	if got := client.currentSessionID(); got != "fresh-session" {
+		t.Fatalf("session after recover=%q, want fresh-session", got)
+	}
+}
+
 func TestChromeDevToolsClientCorrelatesConcurrentOutOfOrderReplies(t *testing.T) {
 	host, browser := newTestChromeDevToolsPipes()
 	t.Cleanup(func() {

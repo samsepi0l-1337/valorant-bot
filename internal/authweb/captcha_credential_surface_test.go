@@ -780,11 +780,35 @@ func TestRemoteCaptchaExpectedTeardownClassifierIsNarrow(t *testing.T) {
 		errChromeDevToolsClientClosed,
 		&chromeDevToolsProtocolError{Method: "Network.getResponseBody", Message: "Inspected target navigated or closed"},
 		&chromeDevToolsProtocolError{Method: "Page.captureScreenshot", Message: "invalid clip dimensions"},
+		&chromeDevToolsProtocolError{Method: "Runtime.evaluate", Message: "Session with given id not found"},
 		errors.New("renderer pipe broke"),
 	} {
 		if isExpectedRemoteCaptchaTeardown(err) {
 			t.Fatalf("real/unrelated failure was hidden as teardown: %v", err)
 		}
+	}
+	lost := &chromeDevToolsProtocolError{Method: "Runtime.evaluate", Message: "Session with given id not found"}
+	if !lostChromeDevToolsSession(lost) {
+		t.Fatal("lost Chrome session was not classified for reattach")
+	}
+}
+
+func TestRemoteCaptchaCaptureTreatsLostChromeSessionAsPollDrop(t *testing.T) {
+	stream := &remoteCaptchaStream{
+		ctx: context.Background(), frames: make(chan remoteCaptchaOutputFrame, 1),
+		captureProvider: func(context.Context) (riotCaptchaSurfaceSnapshot, error) {
+			return riotCaptchaSurfaceSnapshot{}, &chromeDevToolsProtocolError{
+				Method: "Runtime.evaluate", Message: "Session with given id not found",
+			}
+		},
+	}
+	if err := stream.captureSanitizedFrame(); err != nil {
+		t.Fatalf("lost Chrome session became terminal: %v", err)
+	}
+	select {
+	case frame := <-stream.frames:
+		t.Fatalf("lost session emitted frame generation %d", frame.Generation)
+	default:
 	}
 }
 
