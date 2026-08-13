@@ -19,9 +19,12 @@ Discord Developer Portal에서 앱을 만들고 **Bot 토큰**(`DISCORD_TOKEN`)�
 
 ### 로컬 (macOS / Linux / WSL)
 
+로컬 개발은 **`develop`** 브랜치에서 합니다. `main`은 안정 라인입니다.
+
 ```bash
 git clone https://github.com/samsepi0l-1337/valorant-bot.git
 cd valorant-bot
+git checkout develop
 ./scripts/setup-local.sh --run
 ```
 

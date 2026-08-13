@@ -31,6 +31,8 @@
   accurate skin names.
 - Linked accounts must display the correct Riot region/server (e.g. Asia/ap must
   not be labeled as kr).
+- Local development uses the `develop` branch. Keep `main` as the stable line;
+  land features on `develop` first.
 
 ## Learned Workspace Facts
 
