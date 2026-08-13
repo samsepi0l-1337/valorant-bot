@@ -10,10 +10,9 @@ if [[ ! -f .env ]]; then
   exit 1
 fi
 
-set -a
 # shellcheck disable=SC1091
-source .env
-set +a
+source "${ROOT}/scripts/load-dotenv.sh"
+load_dotenv "${ROOT}/.env"
 
 mkdir -p "$(dirname "${DATABASE_PATH:-./data/bot.db}")"
 

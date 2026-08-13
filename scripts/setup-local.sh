@@ -60,9 +60,8 @@ else
 fi
 
 # shellcheck disable=SC1091
-set -a
-source .env
-set +a
+source "${ROOT}/scripts/load-dotenv.sh"
+load_dotenv "${ROOT}/.env"
 
 prompt DISCORD_TOKEN "Discord bot token (DISCORD_TOKEN)"
 prompt DISCORD_APP_ID "Discord application ID (DISCORD_APP_ID)"
@@ -85,7 +84,7 @@ BOT_SECRET=${BOT_SECRET}
 AUTH_BASE_URL=${AUTH_BASE_URL}
 AUTH_PORT=${AUTH_PORT}
 DATABASE_PATH=${DATABASE_PATH}
-STORE_RESET_CRON=${STORE_RESET_CRON}
+STORE_RESET_CRON="${STORE_RESET_CRON}"
 EOF
 
 mkdir -p data

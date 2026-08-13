@@ -38,10 +38,9 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-set -a
 # shellcheck disable=SC1091
-source .env
-set +a
+source "${ROOT}/scripts/load-dotenv.sh"
+load_dotenv "${ROOT}/.env"
 
 PORT="${AUTH_PORT:-8787}"
 AUTH_BIND_ADDRESS=127.0.0.1

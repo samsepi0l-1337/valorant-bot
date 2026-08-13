@@ -938,7 +938,8 @@ func TestRunLocalRemoteStartsTunnelBeforeBot(t *testing.T) {
 	}
 	for _, want := range []string{
 		"set -euo pipefail",
-		"source .env",
+		"scripts/load-dotenv.sh",
+		"load_dotenv",
 		`cloudflared tunnel --url "http://127.0.0.1:${PORT}"`,
 		"extract-trycloudflare-origin.py",
 		"validate-remote-captcha-origin.py",
@@ -965,7 +966,7 @@ func TestRunLocalRemoteStartsTunnelBeforeBot(t *testing.T) {
 		}
 	}
 
-	sourceAt := strings.Index(script, "source .env")
+	sourceAt := strings.Index(script, "load_dotenv")
 	bindAt := strings.Index(script, "AUTH_BIND_ADDRESS=127.0.0.1")
 	tunnelAt := strings.Index(script, `cloudflared tunnel --url "http://127.0.0.1:${PORT}"`)
 	extractAt := strings.Index(script, "extract-trycloudflare-origin.py")
@@ -988,6 +989,9 @@ func TestRunLocalRemoteStartsTunnelBeforeBot(t *testing.T) {
 	if strings.Contains(extractor, "sys.argv[1]") && !strings.Contains(extractor, "sys.stdin") {
 		t.Error("extractor must read cloudflared logs from stdin")
 	}
+	if strings.Contains(script, "source .env") {
+		t.Error("run-local-remote.sh must not bash-source .env (unquoted cron runs as a command)")
+	}
 
 	for name, want := range map[string]string{
 		"README.md":                      "scripts/run-local-remote.sh",
@@ -997,6 +1001,54 @@ func TestRunLocalRemoteStartsTunnelBeforeBot(t *testing.T) {
 	} {
 		if !strings.Contains(readDeploymentAsset(t, root, name), want) {
 			t.Errorf("%s does not document %s", name, want)
+		}
+	}
+}
+
+// Mutation caught: bash `source .env` treats STORE_RESET_CRON=0 0 * * * as
+// STORE_RESET_CRON=0 then runs command `0`. Local examples must quote the
+// cron, and the loader must accept the unquoted form already in existing .env
+// files (godotenv accepts it; systemd EnvironmentFile takes the rest of the line).
+func TestLocalDotenvCronIsSafeForBash(t *testing.T) {
+	root := repositoryRoot(t)
+	quoted := `STORE_RESET_CRON="0 0 * * *"`
+	for _, name := range []string{
+		"deploy/env.local.example",
+		".env.example",
+		".env.local.example",
+	} {
+		body := readDeploymentAsset(t, root, name)
+		if !strings.Contains(body, quoted) {
+			t.Errorf("%s missing quoted %s", name, quoted)
+		}
+		if strings.Contains(body, "STORE_RESET_CRON=0 0 * * *") {
+			t.Errorf("%s has unquoted STORE_RESET_CRON", name)
+		}
+	}
+
+	envPath := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(envPath, []byte("AUTH_PORT=8787\nSTORE_RESET_CRON=0 0 * * *\nCAPTCHA_DISPLAY=:99\nQUOTED=\"hello world\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := "set -euo pipefail\nsource " + strconv.Quote(filepath.Join(root, "scripts/load-dotenv.sh")) +
+		"\nload_dotenv " + strconv.Quote(envPath) + "\n" +
+		"printf 'cron=%s\\n' \"$STORE_RESET_CRON\"\n" +
+		"printf 'port=%s\\n' \"$AUTH_PORT\"\n" +
+		"printf 'display=%s\\n' \"$CAPTCHA_DISPLAY\"\n" +
+		"printf 'quoted=%s\\n' \"$QUOTED\"\n"
+	out, err := exec.Command("bash", "-c", script).CombinedOutput()
+	if err != nil {
+		t.Fatalf("load_dotenv failed: %v: %s", err, out)
+	}
+	got := string(out)
+	for _, want := range []string{
+		"cron=0 0 * * *",
+		"port=8787",
+		"display=:99",
+		"quoted=hello world",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output %q missing %q", got, want)
 		}
 	}
 }
