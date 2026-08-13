@@ -720,6 +720,287 @@ func TestRemoteCaptchaProxyAndPiAssetsKeepRemoteRelayPrivate(t *testing.T) {
 	}
 }
 
+// Mutation caught: accepting a trycloudflare URL with a path, query, userinfo,
+// or mixed origins lets Discord mint viewer cookies against a hostname the
+// running bot never advertised.
+func TestExtractTrycloudflareOriginFromCloudflaredLog(t *testing.T) {
+	const origin = "https://alpha-beta-gamma.trycloudflare.com"
+	banner := strings.Join([]string{
+		"2026-08-13T08:19:00Z INF Requesting new quick Tunnel on trycloudflare.com...",
+		"2026-08-13T08:19:02Z INF +--------------------------------------------------------------------------------------------+",
+		"2026-08-13T08:19:02Z INF |  Your quick Tunnel has been created! Visit it at (it may take some time to be reachable):  |",
+		"2026-08-13T08:19:02Z INF |  " + origin + "                                               |",
+		"2026-08-13T08:19:02Z INF +--------------------------------------------------------------------------------------------+",
+		"",
+	}, "\n")
+
+	stdout, stderr, err := runTrycloudflareExtractor(t, banner)
+	if err != nil {
+		t.Fatalf("extractor rejected cloudflared banner: %v: stdout=%q stderr=%q", err, stdout, stderr)
+	}
+	if stderr != "" {
+		t.Fatalf("extractor stderr=%q, want empty", stderr)
+	}
+	if stdout != origin+"\n" {
+		t.Fatalf("extractor stdout=%q, want %q", stdout, origin+"\n")
+	}
+
+	duplicate := banner + "also " + origin + "/\n"
+	stdout, stderr, err = runTrycloudflareExtractor(t, duplicate)
+	if err != nil {
+		t.Fatalf("extractor rejected duplicate canonical origin: %v: stdout=%q stderr=%q", err, stdout, stderr)
+	}
+	if stdout != origin+"\n" {
+		t.Fatalf("duplicate stdout=%q, want canonical %q", stdout, origin+"\n")
+	}
+
+	for _, name := range []string{"empty", "not yet"} {
+		input := map[string]string{
+			"empty":   "",
+			"not yet": "INF Starting tunnel\nINF Waiting for connection\n",
+		}[name]
+		stdout, stderr, err = runTrycloudflareExtractor(t, input)
+		if err == nil {
+			t.Fatalf("%s: extractor accepted incomplete log: stdout=%q", name, stdout)
+		}
+		if stdout != "" {
+			t.Fatalf("%s: extractor stdout=%q, want empty", name, stdout)
+		}
+		if strings.Contains(stderr, "https://") || strings.Contains(stderr, "trycloudflare") && strings.Contains(stderr, "alpha-beta") {
+			t.Fatalf("%s: extractor echoed input in stderr=%q", name, stderr)
+		}
+	}
+
+	for _, invalid := range []string{
+		"https://alpha-beta-gamma.trycloudflare.com/captcha",
+		"https://alpha-beta-gamma.trycloudflare.com?next=1",
+		"https://user@alpha-beta-gamma.trycloudflare.com",
+		"http://alpha-beta-gamma.trycloudflare.com",
+		"https://trycloudflare.com",
+		"https://alpha-beta-gamma.trycloudflare.com\nhttps://other-words.trycloudflare.com\n",
+	} {
+		t.Run("invalid_"+strings.ReplaceAll(invalid, "/", "_"), func(t *testing.T) {
+			stdout, stderr, err := runTrycloudflareExtractor(t, invalid)
+			if err == nil {
+				t.Fatalf("extractor accepted %q", invalid)
+			}
+			if stdout != "" {
+				t.Fatalf("extractor stdout=%q, want empty", stdout)
+			}
+			for _, leaked := range []string{"alpha-beta-gamma", "other-words", "user@"} {
+				if strings.Contains(stderr, leaked) {
+					t.Fatalf("extractor echoed %q in stderr=%q", leaked, stderr)
+				}
+			}
+		})
+	}
+}
+
+// Mutation caught: rewriting the whole .env, using sed, or echoing Discord
+// secrets while persisting a quick-tunnel origin leaves credentials in the
+// shell history and can drop BOT_SECRET/DISCORD_TOKEN.
+func TestWriteRemoteCaptchaEnvPersistsTunnelOriginWithoutRewritingSecrets(t *testing.T) {
+	const origin = "https://alpha-beta-gamma.trycloudflare.com"
+	const token = "do-not-print"
+	initial := strings.Join([]string{
+		"DISCORD_TOKEN=" + token,
+		"DISCORD_APP_ID=app-id",
+		"BOT_SECRET=super-secret-bot-key-32chars!!",
+		"AUTH_BASE_URL=http://192.168.0.127:8787",
+		"AUTH_PORT=8787",
+		"AUTH_BIND_ADDRESS=0.0.0.0",
+		"CAPTCHA_BROWSER_MODE=local",
+		"# AUTH_BASE_URL=http://<lan-ip>:8787",
+		"DATABASE_PATH=./data/bot.db",
+		"",
+	}, "\n")
+	envPath := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(envPath, []byte(initial), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, err := runWriteRemoteCaptchaEnv(t, envPath, origin)
+	if err != nil {
+		t.Fatalf("env writer rejected valid origin: %v: stdout=%q stderr=%q", err, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("env writer stdout=%q, want empty", stdout)
+	}
+	if strings.Contains(stderr, token) || strings.Contains(stderr, "super-secret") {
+		t.Fatalf("env writer leaked a secret in stderr=%q", stderr)
+	}
+
+	got, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := string(got)
+	parsed := parseEnvironmentFile(t, contents)
+	if parsed["DISCORD_TOKEN"] != token || parsed["BOT_SECRET"] != "super-secret-bot-key-32chars!!" {
+		t.Fatalf("env writer mutated secrets: %v", parsed)
+	}
+	if parsed["AUTH_BASE_URL"] != origin {
+		t.Fatalf("AUTH_BASE_URL=%q, want %q", parsed["AUTH_BASE_URL"], origin)
+	}
+	if parsed["AUTH_BIND_ADDRESS"] != "127.0.0.1" {
+		t.Fatalf("AUTH_BIND_ADDRESS=%q, want 127.0.0.1", parsed["AUTH_BIND_ADDRESS"])
+	}
+	if parsed["CAPTCHA_BROWSER_MODE"] != "remote" {
+		t.Fatalf("CAPTCHA_BROWSER_MODE=%q, want remote", parsed["CAPTCHA_BROWSER_MODE"])
+	}
+	if parsed["AUTH_PORT"] != "8787" || parsed["DATABASE_PATH"] != "./data/bot.db" {
+		t.Fatalf("env writer dropped unrelated keys: %v", parsed)
+	}
+	if !strings.Contains(contents, "# AUTH_BASE_URL=http://<lan-ip>:8787") {
+		t.Fatal("env writer removed the commented LAN AUTH_BASE_URL example")
+	}
+	info, err := os.Stat(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("env mode=%o, want 0600", info.Mode().Perm())
+	}
+
+	beforeInvalid := string(got)
+	stdout, stderr, err = runWriteRemoteCaptchaEnv(t, envPath, "http://relay.example.com")
+	if err == nil {
+		t.Fatal("env writer accepted a public HTTP origin")
+	}
+	if stdout != "" || strings.Contains(stderr, token) || strings.Contains(stderr, origin) {
+		t.Fatalf("invalid-origin output leaked state stdout=%q stderr=%q", stdout, stderr)
+	}
+	afterInvalid, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterInvalid) != beforeInvalid {
+		t.Fatal("invalid origin mutated .env")
+	}
+
+	dupPath := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(dupPath, []byte("AUTH_BASE_URL="+origin+"\nAUTH_BASE_URL="+origin+"\nDISCORD_TOKEN="+token+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	beforeDup, err := os.ReadFile(dupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, err = runWriteRemoteCaptchaEnv(t, dupPath, origin)
+	if err == nil {
+		t.Fatal("env writer accepted duplicate AUTH_BASE_URL keys")
+	}
+	if stdout != "" || strings.Contains(stderr, token) {
+		t.Fatalf("duplicate-key output leaked secrets stdout=%q stderr=%q", stdout, stderr)
+	}
+	afterDup, err := os.ReadFile(dupPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterDup) != string(beforeDup) {
+		t.Fatal("duplicate AUTH_BASE_URL mutated .env")
+	}
+
+	missing := filepath.Join(t.TempDir(), "missing.env")
+	if _, stderr, err = runWriteRemoteCaptchaEnv(t, missing, origin); err == nil {
+		t.Fatal("env writer created a missing env file")
+	} else if strings.Contains(stderr, origin) {
+		t.Fatalf("missing-env stderr echoed origin: %q", stderr)
+	}
+
+	appendPath := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(appendPath, []byte("DISCORD_TOKEN="+token+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, stderr, err := runWriteRemoteCaptchaEnv(t, appendPath, origin); err != nil {
+		t.Fatalf("env writer did not append missing remote keys: %v: %s", err, stderr)
+	}
+	appended := parseEnvironmentFile(t, string(mustReadFile(t, appendPath)))
+	if appended["AUTH_BASE_URL"] != origin || appended["AUTH_BIND_ADDRESS"] != "127.0.0.1" || appended["CAPTCHA_BROWSER_MODE"] != "remote" {
+		t.Fatalf("appended remote keys=%v", appended)
+	}
+	if appended["DISCORD_TOKEN"] != token {
+		t.Fatal("append path mutated DISCORD_TOKEN")
+	}
+}
+
+// Mutation caught: starting the bot before a quick-tunnel origin exists, or
+// leaving AUTH_BIND_ADDRESS on a LAN bind, publishes Discord links that LTE
+// phones cannot open (or exposes AUTH_PORT on the LAN while the tunnel is the
+// intended public path).
+func TestRunLocalRemoteStartsTunnelBeforeBot(t *testing.T) {
+	root := repositoryRoot(t)
+	script := readDeploymentAsset(t, root, "scripts/run-local-remote.sh")
+	extractor := readDeploymentAsset(t, root, "deploy/extract-trycloudflare-origin.py")
+
+	if !strings.HasPrefix(script, "#!/usr/bin/env bash\n") {
+		t.Fatal("run-local-remote.sh is not a bash script")
+	}
+	for _, want := range []string{
+		"set -euo pipefail",
+		"source .env",
+		`cloudflared tunnel --url "http://127.0.0.1:${PORT}"`,
+		"extract-trycloudflare-origin.py",
+		"validate-remote-captcha-origin.py",
+		"write-remote-captcha-env.py",
+		`AUTH_BASE_URL="$ORIGIN"`,
+		"AUTH_BIND_ADDRESS=127.0.0.1",
+		"CAPTCHA_BROWSER_MODE=remote",
+		"quick tunnel",
+		"trycloudflare",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("run-local-remote.sh missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"set -x",
+		">> .env",
+		">>\".env\"",
+		"sed -i",
+		"AUTH_BIND_ADDRESS=0.0.0.0",
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Errorf("run-local-remote.sh contains forbidden %q", forbidden)
+		}
+	}
+
+	sourceAt := strings.Index(script, "source .env")
+	bindAt := strings.Index(script, "AUTH_BIND_ADDRESS=127.0.0.1")
+	tunnelAt := strings.Index(script, `cloudflared tunnel --url "http://127.0.0.1:${PORT}"`)
+	extractAt := strings.Index(script, "extract-trycloudflare-origin.py")
+	validateAt := strings.Index(script, "validate-remote-captcha-origin.py")
+	writeAt := strings.Index(script, "write-remote-captcha-env.py")
+	originAt := strings.Index(script, `AUTH_BASE_URL="$ORIGIN"`)
+	botAt := strings.Index(script, "go run ./cmd/bot")
+	if sourceAt < 0 || bindAt < 0 || tunnelAt < 0 || extractAt < 0 || validateAt < 0 || writeAt < 0 || originAt < 0 || botAt < 0 {
+		t.Fatal("run-local-remote.sh is missing a required staging step")
+	}
+	if !(sourceAt < bindAt && bindAt < tunnelAt && tunnelAt < extractAt && extractAt < validateAt && validateAt < writeAt && writeAt < originAt && originAt < botAt) {
+		t.Fatalf("run-local-remote.sh stage order source=%d bind=%d tunnel=%d extract=%d validate=%d write=%d origin=%d bot=%d", sourceAt, bindAt, tunnelAt, extractAt, validateAt, writeAt, originAt, botAt)
+	}
+	if strings.Index(script, "trap") < 0 || strings.Index(script, "kill") < 0 {
+		t.Error("run-local-remote.sh does not clean up cloudflared")
+	}
+	if strings.Contains(script, "exec cloudflared") {
+		t.Error("run-local-remote.sh must not exec cloudflared (bot never starts)")
+	}
+	if strings.Contains(extractor, "sys.argv[1]") && !strings.Contains(extractor, "sys.stdin") {
+		t.Error("extractor must read cloudflared logs from stdin")
+	}
+
+	for name, want := range map[string]string{
+		"README.md":                      "scripts/run-local-remote.sh",
+		"deploy/lan-remote-captcha.md":   "scripts/run-local-remote.sh",
+		"deploy/pi-cloudflare-tunnel.md": "scripts/run-local-remote.sh",
+		"deploy/env.local.example":       "scripts/run-local-remote.sh",
+	} {
+		if !strings.Contains(readDeploymentAsset(t, root, name), want) {
+			t.Errorf("%s does not document %s", name, want)
+		}
+	}
+}
+
 func repositoryRoot(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
@@ -767,6 +1048,38 @@ func validateSystemdBindSource(binding string) error {
 		return nil
 	}
 	return err
+}
+
+func runTrycloudflareExtractor(t *testing.T, input string) (string, string, error) {
+	t.Helper()
+	extractor := filepath.Join(repositoryRoot(t), "deploy", "extract-trycloudflare-origin.py")
+	cmd := exec.Command("python3", extractor)
+	cmd.Stdin = strings.NewReader(input)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stdout.String(), stderr.String(), err
+}
+
+func runWriteRemoteCaptchaEnv(t *testing.T, envPath, origin string) (string, string, error) {
+	t.Helper()
+	writer := filepath.Join(repositoryRoot(t), "deploy", "write-remote-captcha-env.py")
+	cmd := exec.Command("python3", writer, envPath, origin)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stdout.String(), stderr.String(), err
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return contents
 }
 
 func runTargetOriginValidator(validator, envPath, caller string) ([]byte, error) {
