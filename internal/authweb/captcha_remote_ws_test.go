@@ -1377,7 +1377,7 @@ func TestRemoteCaptchaWebSocketProtocolViolationsFailClosedWithoutGrace(t *testi
 }
 
 func TestRemoteCaptchaWebSocketInputRateAndBackpressureAreNonTerminal(t *testing.T) {
-	for _, dispatchErr := range []error{errRemoteCaptchaInputRate, errRemoteCaptchaInputBusy} {
+	for _, dispatchErr := range []error{errRemoteCaptchaInputRate, errRemoteCaptchaInputBusy, errRemoteCaptchaInputInvalid} {
 		t.Run(dispatchErr.Error(), func(t *testing.T) {
 			fixture := newRemoteCaptchaWebSocketFixture(t)
 			fixture.stream.dispatchErr = dispatchErr
@@ -1446,6 +1446,64 @@ func TestRemoteCaptchaWebSocketInputRateAndBackpressureAreNonTerminal(t *testing
 				t.Fatal("definite protocol violation did not close browser")
 			}
 		})
+	}
+}
+
+func TestRemoteCaptchaWebSocketStalePointerGenerationIsNonTerminal(t *testing.T) {
+	fixture := newRemoteCaptchaWebSocketFixture(t)
+	connection, response, err := fixture.dial(t, fixture.cookie, fixture.origin)
+	if err != nil {
+		t.Fatalf("dial response=%v err=%v", response, err)
+	}
+	select {
+	case <-fixture.streamOwners:
+	case <-time.After(time.Second):
+		t.Fatal("remote stream did not start")
+	}
+	fixture.stream.frames <- remoteCaptchaTestOutput(t, 1, 40, 35)
+	_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+	messageType, metadataPayload, err := connection.ReadMessage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var metadata remoteCaptchaFrameDescriptor
+	if messageType != websocket.TextMessage || json.Unmarshal(metadataPayload, &metadata) != nil {
+		t.Fatalf("frame metadata type=%d payload=%q", messageType, metadataPayload)
+	}
+	messageType, _, err = connection.ReadMessage()
+	if err != nil || messageType != websocket.BinaryMessage {
+		t.Fatalf("frame binary type=%d err=%v", messageType, err)
+	}
+	ack := []byte(fmt.Sprintf(`{"type":"frameAck","generation":%d,"width":40,"height":35}`, metadata.Generation))
+	if err := connection.WriteMessage(websocket.TextMessage, ack); err != nil {
+		t.Fatal(err)
+	}
+	stale := []byte(`{"type":"pointer","phase":"down","x":20,"y":17,"width":40,"height":35,"generation":999,"button":0}`)
+	if err := connection.WriteMessage(websocket.TextMessage, stale); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-fixture.browser.closed:
+		t.Fatal("stale pointer generation closed the browser")
+	case <-time.After(50 * time.Millisecond):
+	}
+	fixture.server.mu.Lock()
+	_, live := fixture.server.passwordPending[fixture.state]
+	fixture.server.mu.Unlock()
+	if !live {
+		t.Fatal("stale pointer generation deleted the flow")
+	}
+	livePointer := []byte(fmt.Sprintf(`{"type":"pointer","phase":"down","x":20,"y":17,"width":40,"height":35,"generation":%d,"button":0}`, metadata.Generation))
+	if err := connection.WriteMessage(websocket.TextMessage, livePointer); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-fixture.stream.inputs:
+		if !bytes.Equal(got, livePointer) {
+			t.Fatalf("live pointer after stale drop=%q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live pointer after stale generation was not dispatched")
 	}
 }
 

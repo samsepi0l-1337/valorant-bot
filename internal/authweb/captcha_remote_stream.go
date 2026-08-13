@@ -30,6 +30,7 @@ const (
 	remoteCaptchaMaxOutstandingInput  = 4
 	remoteCaptchaCaptureInterval      = 250 * time.Millisecond
 	remoteCaptchaCaptureInset         = 2.0
+	remoteCaptchaInputSurfaceEpsilon  = 1.0
 )
 
 var (
@@ -522,6 +523,19 @@ func sameRiotCaptchaSnapshot(a, b riotCaptchaSurfaceSnapshot) bool {
 		finiteRemoteCaptchaNumber(a.DevicePixelRatio) && a.DevicePixelRatio > 0 && a.DevicePixelRatio == b.DevicePixelRatio
 }
 
+func sameRiotCaptchaInputSurface(a, b riotCaptchaSurface) bool {
+	return finiteRemoteCaptchaNumber(a.X) && finiteRemoteCaptchaNumber(a.Y) && finiteRemoteCaptchaNumber(a.Width) && finiteRemoteCaptchaNumber(a.Height) &&
+		finiteRemoteCaptchaNumber(b.X) && finiteRemoteCaptchaNumber(b.Y) && finiteRemoteCaptchaNumber(b.Width) && finiteRemoteCaptchaNumber(b.Height) &&
+		math.Abs(a.X-b.X) <= remoteCaptchaInputSurfaceEpsilon && math.Abs(a.Y-b.Y) <= remoteCaptchaInputSurfaceEpsilon &&
+		math.Abs(a.Width-b.Width) <= remoteCaptchaInputSurfaceEpsilon && math.Abs(a.Height-b.Height) <= remoteCaptchaInputSurfaceEpsilon
+}
+
+func sameRiotCaptchaInputSnapshot(bound, current riotCaptchaSurfaceSnapshot) bool {
+	return bound.Integrity && current.Integrity && bound.DocumentToken != "" && bound.DocumentToken == current.DocumentToken &&
+		finiteRemoteCaptchaNumber(bound.DevicePixelRatio) && bound.DevicePixelRatio > 0 && bound.DevicePixelRatio == current.DevicePixelRatio &&
+		sameRiotCaptchaInputSurface(bound.Surface, current.Surface)
+}
+
 func sameRiotCaptchaCaptureSnapshot(a, b riotCaptchaSurfaceSnapshot) bool {
 	return sameRiotCaptchaSnapshot(a, b) && a.MutationEpoch == b.MutationEpoch
 }
@@ -789,7 +803,7 @@ func (s *remoteCaptchaStream) DispatchInput(ctx context.Context, payload []byte)
 		if isExpectedRemoteCaptchaTeardown(guardErr) {
 			return errRemoteCaptchaChallengeTeardown
 		}
-		if guardErr != nil || !sameRiotCaptchaSnapshot(binding.Snapshot, current) || current.Surface != binding.Snapshot.Surface {
+		if guardErr != nil || !sameRiotCaptchaInputSnapshot(binding.Snapshot, current) {
 			return errRemoteCaptchaInputInvalid
 		}
 		if s.inputGuard == nil {

@@ -372,7 +372,7 @@ func TestRemoteCaptchaViewerKeepsAcknowledgedFrameActiveWhileReplacementDecodes(
 	`)
 }
 
-func TestRemoteCaptchaViewerDropsOldPendingMoveBeforeReplacementAcknowledgement(t *testing.T) {
+func TestRemoteCaptchaViewerKeepsCanvasAndPendingMoveAcrossSameSizeRefresh(t *testing.T) {
 	runtime := newRemoteCaptchaViewerRuntime(t, "")
 	assertRemoteCaptchaViewerJS(t, runtime, `
 		const message = __state.sockets[0].listeners.message;
@@ -381,19 +381,40 @@ func TestRemoteCaptchaViewerDropsOldPendingMoveBeforeReplacementAcknowledgement(
 		__state.bitmapResolvers.shift()();
 	`)
 	assertRemoteCaptchaViewerJS(t, runtime, `
+		if (__state.widthSets.join(",") !== "40" || __state.heightSets.join(",") !== "35") throw new Error("first draw did not size the canvas once");
 		const pointerEvent = (x, button=0) => ({button,clientX:x,clientY:17,pointerId:1,preventDefault(){}});
 		__state.canvasListeners.pointerdown(pointerEvent(20));
 		message({data:JSON.stringify({type:"frame",generation:22,width:40,height:35})});
 		message({data:{id:"replacement-drag",width:40,height:35}});
 		__state.canvasListeners.pointermove(pointerEvent(25));
-		if (!__state.timers.some(timer => !timer.cleared)) throw new Error("old-generation drag move was not pending");
+		if (!__state.timers.some(timer => !timer.cleared)) throw new Error("same-size refresh discarded the in-flight drag move");
 		__state.bitmapResolvers.shift()();
 	`)
 	assertRemoteCaptchaViewerJS(t, runtime, `
+		if (__state.widthSets.join(",") !== "40" || __state.heightSets.join(",") !== "35") throw new Error("same-size refresh reset canvas dimensions and flickered");
 		__state.canvasListeners.pointerup(pointerEvent(30));
 		const pointerMessages = __state.sockets[0].sent.map(JSON.parse).filter(value => value.type === "pointer");
-		if (pointerMessages.map(value => value.phase).join(",") !== "down,up") throw new Error("replacement ACK flushed an old-generation move");
-		if (pointerMessages[0].generation !== 21 || pointerMessages[1].generation !== 22) throw new Error("drag endpoints were not bound to the displayed generations");
+		if (pointerMessages[0].phase !== "down" || pointerMessages[0].generation !== 21) throw new Error("pointer down was not bound to the first drawn generation");
+		if (pointerMessages[pointerMessages.length-1].phase !== "up" || pointerMessages[pointerMessages.length-1].generation !== 22) throw new Error("pointer up was not bound to the refreshed generation");
+	`)
+}
+
+func TestRemoteCaptchaViewerResizesCanvasWhenFrameDimensionsChange(t *testing.T) {
+	runtime := newRemoteCaptchaViewerRuntime(t, "")
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		const message = __state.sockets[0].listeners.message;
+		message({data:JSON.stringify({type:"frame",generation:4,width:40,height:35})});
+		message({data:{id:"small",width:40,height:35}});
+		__state.bitmapResolvers.shift()();
+	`)
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		message({data:JSON.stringify({type:"frame",generation:5,width:80,height:60})});
+		message({data:{id:"large",width:80,height:60}});
+		__state.bitmapResolvers.shift()();
+	`)
+	assertRemoteCaptchaViewerJS(t, runtime, `
+		if (__state.widthSets.join(",") !== "40,80" || __state.heightSets.join(",") !== "35,60") throw new Error("dimension-changing refresh did not resize the canvas");
+		if (__canvas.width !== 80 || __canvas.height !== 60) throw new Error("canvas did not keep the newest intrinsic size");
 	`)
 }
 
@@ -424,16 +445,20 @@ func newRemoteCaptchaViewerRuntime(t *testing.T, hash string) *goja.Runtime {
 		var __state = {
 			canvasListeners: Object.create(null), cancelListeners: Object.create(null),
 			fetchCalls: [], historyCalls: [], sockets: [], timers: [],
-			bitmapCalls: [], bitmapResolvers: [], draws: [],
+			bitmapCalls: [], bitmapResolvers: [], draws: [], widthSets: [], heightSets: [],
 			performanceNow: 0, wallNow: 1000, nextTimer: 1
 		};
 		var __canvas = {
-			width: 1280, height: 900,
+			_width: 1280, _height: 900,
 			getContext: function() { return {drawImage: function(bitmap) { __state.draws.push(bitmap.id); }}; },
 			addEventListener: function(name, listener) { __state.canvasListeners[name] = listener; },
 			getBoundingClientRect: function() { return {left: 0, top: 0, width: 1280, height: 900}; },
 			setPointerCapture: function() {}
 		};
+		Object.defineProperties(__canvas, {
+			width: {get: function() { return this._width; }, set: function(value) { __state.widthSets.push(value); this._width = value; }, enumerable: true, configurable: true},
+			height: {get: function() { return this._height; }, set: function(value) { __state.heightSets.push(value); this._height = value; }, enumerable: true, configurable: true}
+		});
 		var __status = {textContent: ""};
 		var __cancel = {disabled: true, addEventListener: function(name, listener) { __state.cancelListeners[name] = listener; }};
 		var document = {getElementById: function(id) { return id === "viewer" ? __canvas : id === "status" ? __status : __cancel; }};
