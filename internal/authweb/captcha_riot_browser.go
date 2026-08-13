@@ -126,7 +126,7 @@ for(const root of roots){
 const visibleRect=element=>{
 	const computed=getComputedStyle(element); if(computed.display==='none')return null;
   const rect=element.getBoundingClientRect();
-  const left=Math.max(0,rect.left),top=Math.max(0,rect.top),right=Math.min(innerWidth,rect.right),bottom=Math.min(innerHeight,rect.bottom);
+  const left=Math.max(0,Math.round(rect.left)),top=Math.max(0,Math.round(rect.top)),right=Math.min(innerWidth,Math.round(rect.right)),bottom=Math.min(innerHeight,Math.round(rect.bottom));
   if(right-left<32||bottom-top<32)return null;
   return {x:left,y:top,width:right-left,height:bottom-top,area:(right-left)*(bottom-top)};
 };
@@ -399,8 +399,8 @@ const rect=state.frame&&state.frame.getBoundingClientRect();
 const pseudoHidden=computed=>{const content=(computed.content||'').trim();const ungenerated=content==='none'||content==='normal';const visuallySuppressed=computed.display==='none'||computed.visibility==='hidden'||Number(computed.opacity)===0;return (ungenerated||visuallySuppressed)&&computed.pointerEvents==='none'};
 const pseudoIntegrity=document.body&&pseudoHidden(getComputedStyle(document.documentElement,'::before'))&&pseudoHidden(getComputedStyle(document.documentElement,'::after'))&&pseudoHidden(getComputedStyle(document.body,'::before'))&&pseudoHidden(getComputedStyle(document.body,'::after'));
 const same=state.integrity===true&&pseudoIntegrity&&state.documentToken===` + string(documentJSON) + `&&state.generation===` + fmt.Sprint(snapshot.SanitizerGeneration) + `&&rect&&
-Math.abs(rect.left-` + fmt.Sprint(snapshot.Surface.X) + `)<.01&&Math.abs(rect.top-` + fmt.Sprint(snapshot.Surface.Y) + `)<.01&&
-Math.abs(rect.width-` + fmt.Sprint(snapshot.Surface.Width) + `)<.01&&Math.abs(rect.height-` + fmt.Sprint(snapshot.Surface.Height) + `)<.01;
+Math.abs(rect.left-` + fmt.Sprint(snapshot.Surface.X) + `)<1&&Math.abs(rect.top-` + fmt.Sprint(snapshot.Surface.Y) + `)<1&&
+Math.abs(rect.width-` + fmt.Sprint(snapshot.Surface.Width) + `)<1&&Math.abs(rect.height-` + fmt.Sprint(snapshot.Surface.Height) + `)<1;
 return {originOK:true,ok:!!same&&document.elementFromPoint(` + fmt.Sprint(x) + `,` + fmt.Sprint(y) + `)===state.frame};
 })()`
 	var evaluated struct {

@@ -352,6 +352,9 @@ func (s *Server) serveRemoteCaptchaWebSocket(connection remoteCaptchaWebSocketCo
 			continue
 		}
 		if err := frameAcknowledgements.authorizeInput(input); err != nil {
+			if input.Type == "pointer" || input.Type == "wheel" {
+				continue
+			}
 			protocolViolation = true
 			break
 		}
@@ -363,7 +366,7 @@ func (s *Server) serveRemoteCaptchaWebSocket(connection remoteCaptchaWebSocketCo
 				protocolViolation = false
 				break
 			}
-			if errors.Is(err, errRemoteCaptchaInputRate) || errors.Is(err, errRemoteCaptchaInputBusy) {
+			if remoteCaptchaLiveInputDropped(err) {
 				continue
 			}
 			protocolViolation = true
@@ -380,6 +383,12 @@ func (s *Server) serveRemoteCaptchaWebSocket(connection remoteCaptchaWebSocketCo
 	_ = connection.Close()
 	<-writerDone
 	return protocolViolation
+}
+
+func remoteCaptchaLiveInputDropped(err error) bool {
+	return errors.Is(err, errRemoteCaptchaInputRate) ||
+		errors.Is(err, errRemoteCaptchaInputBusy) ||
+		errors.Is(err, errRemoteCaptchaInputInvalid)
 }
 
 func remoteCaptchaProtocolReadViolation(err error) bool {

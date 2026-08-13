@@ -163,6 +163,7 @@ func TestRiotCaptchaSanitizerIsDenyByDefaultAndScrubsCredentialElements(t *testi
 		"element.style.setProperty('pointer-events','none','important')",
 		"element.value=''", "element.removeAttribute('value')", "element.removeAttribute('placeholder')",
 		"curtain.armed=integrity", "hcaptchaURL(selected.src)",
+		"Math.round(rect.left)", "Math.round(rect.top)", "Math.round(rect.right)", "Math.round(rect.bottom)",
 	} {
 		if !strings.Contains(riotCaptchaSurfaceExpression, required) {
 			t.Fatalf("sanitizer expression is missing %q", required)
@@ -903,6 +904,95 @@ func TestRemoteCaptchaDispatchUsesIgnoreGateAroundNavigationWindow(t *testing.T)
 	}
 }
 
+func TestRemoteCaptchaDispatchAcceptsSubpixelIframeJitter(t *testing.T) {
+	host, browser := newTestChromeDevToolsPipes()
+	t.Cleanup(func() { _ = host.Close(); _ = browser.Close() })
+	client := newChromeDevToolsClient(host)
+	client.setSessionID("riot-session")
+	bound := riotCaptchaSurfaceSnapshot{
+		Surface: riotCaptchaSurface{X: 20, Y: 15, Width: 40, Height: 35}, DocumentToken: "document-a",
+		SanitizerGeneration: 3, Integrity: true, DevicePixelRatio: 1,
+	}
+	jittered := riotCaptchaSurfaceSnapshot{
+		Surface: riotCaptchaSurface{X: 20.4, Y: 14.7, Width: 39.8, Height: 35.2}, DocumentToken: "document-a",
+		SanitizerGeneration: 4, Integrity: true, DevicePixelRatio: 1,
+	}
+	moved := riotCaptchaSurfaceSnapshot{
+		Surface: riotCaptchaSurface{X: 80, Y: 15, Width: 40, Height: 35}, DocumentToken: "document-a",
+		SanitizerGeneration: 5, Integrity: true, DevicePixelRatio: 1,
+	}
+	binding := remoteCaptchaFrameBinding{
+		SourceWidth: 36, SourceHeight: 31, FrameWidth: 36, FrameHeight: 31, Crop: image.Rect(0, 0, 36, 31),
+		Surface: insetRiotCaptchaSurface(bound.Surface, 2), Snapshot: bound, DirectClip: true,
+		CaptureZoom: 1, CaptureClipX: 22, CaptureClipY: 17, CaptureClipWidth: 36, CaptureClipHeight: 31,
+		Metadata: remoteCaptchaScreencastMetadata{PageScaleFactor: 1, DeviceWidth: 36, DeviceHeight: 31},
+	}
+	current := bound
+	stream := &remoteCaptchaStream{
+		client: client, ctx: context.Background(), frames: make(chan remoteCaptchaOutputFrame, 1),
+		inputLimiter: newRemoteCaptchaInputLimiter(time.Now), inputSlots: make(chan struct{}, remoteCaptchaMaxOutstandingInput),
+		captureProvider: func(context.Context) (riotCaptchaSurfaceSnapshot, error) { return current, nil },
+		inputGuard:      client.guardRiotCaptchaInput, lastFrame: binding, hasLastFrame: true, lastGeneration: 7, nextGeneration: 7,
+	}
+
+	current = jittered
+	done := make(chan error, 1)
+	go func() {
+		done <- stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"down","x":10,"y":5,"width":36,"height":31,"generation":7,"button":0}`))
+	}()
+	dispatched := false
+	deadline := time.After(time.Second)
+	for {
+		command := nextRemoteCaptchaTestCommand(t, browser)
+		switch command.Method {
+		case "Input.setIgnoreInputEvents":
+			replyRemoteCaptchaTestCommand(t, browser, command.ID)
+		case "Runtime.evaluate":
+			if !strings.Contains(command.Params.Expression, "<1") {
+				t.Fatal("input guard still uses subpixel-exact iframe bounds")
+			}
+			if err := browser.WriteJSON(map[string]any{"id": command.ID, "sessionId": "riot-session", "result": map[string]any{
+				"result": map[string]any{"type": "object", "value": map[string]any{"originOK": true, "ok": true}},
+			}}); err != nil {
+				t.Fatal(err)
+			}
+		case "Input.dispatchMouseEvent":
+			dispatched = true
+			replyRemoteCaptchaTestCommand(t, browser, command.ID)
+		default:
+			t.Fatalf("unexpected jitter dispatch command=%q", command.Method)
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("subpixel iframe jitter rejected live pointer: %v", err)
+			}
+			if !dispatched {
+				t.Fatal("subpixel pointer succeeded without dispatching a mouse event")
+			}
+			goto jitterOK
+		case <-deadline:
+			t.Fatal("timed out dispatching pointer onto a subpixel-stable iframe")
+		case <-time.After(30 * time.Millisecond):
+		}
+	}
+jitterOK:
+
+	current = moved
+	movedDone := make(chan error, 1)
+	go func() {
+		movedDone <- stream.DispatchInput(context.Background(), []byte(`{"type":"pointer","phase":"move","x":10,"y":5,"width":36,"height":31,"generation":7,"button":0}`))
+	}()
+	fence := nextRemoteCaptchaTestCommand(t, browser)
+	if fence.Method != "Input.setIgnoreInputEvents" {
+		t.Fatalf("relocated iframe fence=%q", fence.Method)
+	}
+	replyRemoteCaptchaTestCommand(t, browser, fence.ID)
+	if err := <-movedDone; !errors.Is(err, errRemoteCaptchaInputInvalid) {
+		t.Fatalf("relocated iframe error=%v, want rejection", err)
+	}
+}
+
 func TestRemoteCaptchaDispatchNavigationWindowFailsClosedWithoutSealingAuth(t *testing.T) {
 	if !strings.Contains(riotCaptchaDocumentCurtainScript, "state={armed:false") ||
 		!strings.Contains(riotCaptchaDocumentCurtainScript, "if(!state.armed") {
@@ -1092,10 +1182,14 @@ func replyRiotCaptchaInputGuard(t *testing.T, browser *chromeDevToolsPipe) {
 	for _, guard := range []string{
 		`location.origin!=="https://authenticate.riotgames.com"`, "documentToken", "state.generation", "state.integrity===true", "elementFromPoint",
 		"getComputedStyle(document.documentElement,'::before')", "getComputedStyle(document.body,'::after')",
+		"<1",
 	} {
 		if !strings.Contains(command.Params.Expression, guard) {
 			t.Fatalf("input guard expression missing %q", guard)
 		}
+	}
+	if strings.Contains(command.Params.Expression, "<.01") {
+		t.Fatal("input guard still uses subpixel-exact iframe bounds")
 	}
 	if err := browser.WriteJSON(map[string]any{"id": command.ID, "sessionId": "riot-session", "result": map[string]any{
 		"result": map[string]any{"type": "object", "value": map[string]any{"originOK": true, "ok": true}},
