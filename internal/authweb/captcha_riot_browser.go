@@ -11,6 +11,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -239,6 +240,12 @@ func (c *chromeBrowserController) RunRiotLogin(ctx context.Context, username, pa
 	if err := client.attachRiotPage(ctx); err != nil {
 		return riotBrowserLoginResult{}, err
 	}
+	networkEvents, err := client.SubscribeEvents(client.currentSessionID(),
+		"Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished")
+	if err != nil {
+		return riotBrowserLoginResult{}, fmt.Errorf("watch Riot browser login: %w", err)
+	}
+	defer networkEvents.Close()
 	for _, method := range []string{"Network.enable", "Runtime.enable", "Page.enable"} {
 		if err := client.Call(ctx, method, map[string]any{}, nil); err != nil {
 			return riotBrowserLoginResult{}, err
@@ -247,19 +254,25 @@ func (c *chromeBrowserController) RunRiotLogin(ctx context.Context, username, pa
 	if err := c.ensureRiotCaptchaDocumentCurtain(ctx, client); err != nil {
 		return riotBrowserLoginResult{}, err
 	}
-	networkEvents, err := client.SubscribeEvents(client.currentSessionID(),
-		"Network.requestWillBeSent", "Network.responseReceived", "Network.loadingFinished")
-	if err != nil {
-		return riotBrowserLoginResult{}, fmt.Errorf("watch Riot browser login: %w", err)
-	}
-	defer networkEvents.Close()
-	if err := client.submitRiotCredentials(ctx, username, password); err != nil {
+	if err := client.fillRiotCredentials(ctx, username, password); err != nil {
 		c.publishRiotCaptchaSurface(riotCaptchaSurface{}, err)
 		return riotBrowserLoginResult{}, err
 	}
-	result, err := client.waitForRiotLogin(ctx, networkEvents, func(surface riotCaptchaSurface) {
-		c.publishRiotCaptchaSurface(surface, nil)
-	})
+	requiresCaptcha, err := client.prepareRiotBrowserLogin(ctx, networkEvents)
+	if err != nil {
+		c.publishRiotCaptchaSurface(riotCaptchaSurface{}, err)
+		return riotBrowserLoginResult{}, err
+	}
+	var result riotBrowserLoginResult
+	if requiresCaptcha {
+		result, err = client.waitForRiotLoginAndCaptchaSurface(ctx, networkEvents, func(surface riotCaptchaSurface) {
+			c.publishRiotCaptchaSurface(surface, nil)
+		})
+	} else {
+		result, err = client.waitForRiotLogin(ctx, networkEvents, func(surface riotCaptchaSurface) {
+			c.publishRiotCaptchaSurface(surface, nil)
+		})
+	}
 	if err != nil {
 		c.publishRiotCaptchaSurface(riotCaptchaSurface{}, err)
 	} else {
@@ -481,7 +494,7 @@ func (c *chromeDevToolsClient) waitForRiotCaptchaSurface(ctx context.Context) (r
 	}
 }
 
-func (c *chromeDevToolsClient) submitRiotCredentials(ctx context.Context, username, password string) error {
+func (c *chromeDevToolsClient) fillRiotCredentials(ctx context.Context, username, password string) error {
 	usernameJSON, _ := json.Marshal(username)
 	passwordJSON, _ := json.Marshal(password)
 	fillExpression := `(function(){
@@ -546,68 +559,7 @@ return {originOK:true,filled:true};
 		}
 	}
 
-	submitExpression := `(function(){
-if(location.origin!=="https://authenticate.riotgames.com") return {originOK:false,submitted:false};
-if(document.readyState !== 'complete') return {originOK:true,submitted:false};
-const curtain=window[Symbol.for('valorant.remote-captcha-curtain')];
-if(!curtain)return {originOK:true,submitted:false};
-const roots=[document]; for(let i=0;i<roots.length;i++){for(const el of roots[i].querySelectorAll('*')){if(el.shadowRoot) roots.push(el.shadowRoot)}}
-let captchaInitialized=false;
-for(const root of roots){if(root.querySelector('.h-captcha,[data-hcaptcha-widget-id],iframe[src*="hcaptcha.com"]')){captchaInitialized=true;break}}
-if(!captchaInitialized){
-  const now=performance.now();
-  if(!Number.isFinite(curtain.submitWaitStarted))curtain.submitWaitStarted=now;
-  if(now-curtain.submitWaitStarted<2000)return {originOK:true,submitted:false};
-}
-for(const root of roots){
-  const password=root.querySelector('input[name="password"],input[autocomplete="current-password"],input[data-testid*="password"],input[type="password"]');
-	  const form=password && password.form; const button=form ? form.querySelector('button[data-testid="btn-signin-submit"]') : null;
-	  if(button && !button.disabled){
-	    curtain.submitWaitStarted=undefined;
-	    curtain.trustedSubmit=true;
-	    try{button.click();return {originOK:true,submitted:true}}finally{curtain.trustedSubmit=false}
-	  }
-}
-return {originOK:true,submitted:false};
-})()`
-	navigationRetries = 0
-	for {
-		var evaluated struct {
-			Result struct {
-				Value struct {
-					OriginOK  bool `json:"originOK"`
-					Submitted bool `json:"submitted"`
-				} `json:"value"`
-			} `json:"result"`
-			ExceptionDetails json.RawMessage `json:"exceptionDetails"`
-		}
-		err := c.Call(ctx, "Runtime.evaluate", map[string]any{
-			"expression":    submitExpression,
-			"returnByValue": true,
-			"awaitPromise":  true,
-		}, &evaluated)
-		if err != nil {
-			if !retryRiotBrowserNavigationError(err, &navigationRetries) {
-				return fmt.Errorf("submit Riot browser login: %w", err)
-			}
-			if waitErr := waitRiotBrowserDiscovery(ctx); waitErr != nil {
-				return fmt.Errorf("submit Riot browser login: %w", waitErr)
-			}
-			continue
-		}
-		if len(evaluated.ExceptionDetails) != 0 {
-			return errors.New("submit Riot browser login: submit click failed")
-		}
-		if !evaluated.Result.Value.OriginOK {
-			return errors.New("submit Riot browser login: exact authentication origin changed")
-		}
-		if evaluated.Result.Value.Submitted {
-			return nil
-		}
-		if waitErr := waitRiotBrowserDiscovery(ctx); waitErr != nil {
-			return fmt.Errorf("submit Riot browser login: %w", waitErr)
-		}
-	}
+	return nil
 }
 
 func waitRiotBrowserDiscovery(ctx context.Context) error {
@@ -657,15 +609,429 @@ func retryRiotBrowserNavigationError(err error, retries *int) bool {
 	return true
 }
 
+type riotBrowserDocumentIdentity struct {
+	frameID  string
+	loaderID string
+}
+
+type riotBrowserSubmitTarget struct {
+	document   riotBrowserDocumentIdentity
+	token      string
+	generation uint64
+	buttonID   string
+	widgetID   string
+	legalID    string
+	apiID      string
+	captcha    bool
+}
+
+type riotBrowserDiscovery struct {
+	captcha bool
+}
+
+func (c *chromeDevToolsClient) riotBrowserDocumentIdentity(ctx context.Context) (riotBrowserDocumentIdentity, error) {
+	var tree struct {
+		FrameTree struct {
+			Frame struct {
+				ID       string `json:"id"`
+				LoaderID string `json:"loaderId"`
+				URL      string `json:"url"`
+			} `json:"frame"`
+		} `json:"frameTree"`
+	}
+	if err := c.Call(ctx, "Page.getFrameTree", map[string]any{}, &tree); err != nil {
+		return riotBrowserDocumentIdentity{}, fmt.Errorf("inspect Riot login document identity: %w", err)
+	}
+	parsed, err := url.Parse(tree.FrameTree.Frame.URL)
+	if err != nil || !strings.EqualFold(parsed.Scheme, "https") || !strings.EqualFold(parsed.Host, RiotCaptchaHost) ||
+		strings.TrimSpace(tree.FrameTree.Frame.ID) == "" || strings.TrimSpace(tree.FrameTree.Frame.LoaderID) == "" {
+		return riotBrowserDocumentIdentity{}, errors.New("inspect Riot login document identity: exact authentication origin changed")
+	}
+	return riotBrowserDocumentIdentity{frameID: tree.FrameTree.Frame.ID, loaderID: tree.FrameTree.Frame.LoaderID}, nil
+}
+
+func (c *chromeDevToolsClient) prepareRiotBrowserLogin(ctx context.Context, events *chromeDevToolsEventSubscription) (bool, error) {
+	discovery, err := c.waitForInitialRiotBrowserDiscovery(ctx, events)
+	if err != nil {
+		return false, err
+	}
+	target, err := c.waitForStableRiotBrowserSubmitTarget(ctx, discovery.captcha)
+	if err != nil {
+		return false, err
+	}
+	if err := c.clickRiotBrowserSubmitTarget(ctx, target); err != nil {
+		return false, err
+	}
+	return discovery.captcha, nil
+}
+
+type riotBrowserLoginWatchResult struct {
+	result riotBrowserLoginResult
+	err    error
+}
+
+type riotBrowserSurfaceWatchResult struct {
+	surface riotCaptchaSurface
+	err     error
+}
+
+func (c *chromeDevToolsClient) waitForRiotLoginAndCaptchaSurface(ctx context.Context, events *chromeDevToolsEventSubscription, publishCaptcha func(riotCaptchaSurface)) (riotBrowserLoginResult, error) {
+	watchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	loginResults := make(chan riotBrowserLoginWatchResult, 1)
+	surfaceResults := make(chan riotBrowserSurfaceWatchResult, 1)
+	go func() {
+		result, err := c.waitForRiotLoginState(watchCtx, events, nil, false)
+		loginResults <- riotBrowserLoginWatchResult{result: result, err: err}
+	}()
+	go func() {
+		surface, err := c.waitForRiotCaptchaSurface(watchCtx)
+		surfaceResults <- riotBrowserSurfaceWatchResult{surface: surface, err: err}
+	}()
+
+	for surfaceResults != nil {
+		select {
+		case login := <-loginResults:
+			return login.result, login.err
+		case surface := <-surfaceResults:
+			surfaceResults = nil
+			if surface.err == nil && publishCaptcha != nil {
+				publishCaptcha(surface.surface)
+			}
+		case <-ctx.Done():
+			return riotBrowserLoginResult{}, ctx.Err()
+		}
+	}
+	select {
+	case login := <-loginResults:
+		return login.result, login.err
+	case <-ctx.Done():
+		return riotBrowserLoginResult{}, ctx.Err()
+	}
+}
+
+func (c *chromeDevToolsClient) waitForInitialRiotBrowserDiscovery(ctx context.Context, events *chromeDevToolsEventSubscription) (riotBrowserDiscovery, error) {
+	if events == nil {
+		return riotBrowserDiscovery{}, errors.New("watch Riot browser discovery: event subscription is unavailable")
+	}
+	requests := make(map[string]riotBrowserRequest)
+	for {
+		event, err := events.Next(ctx)
+		if err != nil {
+			return riotBrowserDiscovery{}, fmt.Errorf("watch Riot browser discovery: %w", err)
+		}
+		switch event.Method {
+		case "Network.requestWillBeSent":
+			var params struct {
+				RequestID string `json:"requestId"`
+				FrameID   string `json:"frameId"`
+				LoaderID  string `json:"loaderId"`
+				Request   struct {
+					URL    string `json:"url"`
+					Method string `json:"method"`
+				} `json:"request"`
+			}
+			if json.Unmarshal(event.Params, &params) != nil {
+				continue
+			}
+			endpoint, hasQuery := riotBrowserLoginEndpoint(params.Request.URL)
+			if !endpoint {
+				continue
+			}
+			if params.Request.Method != http.MethodGet || hasQuery || !isRiotBrowserLoginURL(params.Request.URL) || params.RequestID == "" || params.FrameID == "" || params.LoaderID == "" {
+				return riotBrowserDiscovery{}, errors.New("watch Riot browser discovery: invalid initial login request")
+			}
+			if _, duplicate := requests[params.RequestID]; duplicate {
+				return riotBrowserDiscovery{}, errors.New("watch Riot browser discovery: duplicate request identity")
+			}
+			requests[params.RequestID] = riotBrowserRequest{method: params.Request.Method, rawURL: params.Request.URL, frameID: params.FrameID, loaderID: params.LoaderID}
+			log.Printf("Riot browser login request started method=%s query=false", params.Request.Method)
+		case "Network.responseReceived":
+			var params struct {
+				RequestID string `json:"requestId"`
+				FrameID   string `json:"frameId"`
+				LoaderID  string `json:"loaderId"`
+				Response  struct {
+					URL    string `json:"url"`
+					Status int    `json:"status"`
+				} `json:"response"`
+			}
+			if json.Unmarshal(event.Params, &params) != nil {
+				continue
+			}
+			request, ok := requests[params.RequestID]
+			if !ok {
+				continue
+			}
+			if params.FrameID != request.frameID || params.LoaderID != request.loaderID || params.Response.URL != request.rawURL {
+				return riotBrowserDiscovery{}, errors.New("watch Riot browser discovery: response identity changed")
+			}
+			request.response = true
+			request.status = params.Response.Status
+			requests[params.RequestID] = request
+		case "Network.loadingFinished":
+			var params struct {
+				RequestID string `json:"requestId"`
+			}
+			if json.Unmarshal(event.Params, &params) != nil {
+				continue
+			}
+			request, ok := requests[params.RequestID]
+			if !ok {
+				continue
+			}
+			delete(requests, params.RequestID)
+			if !request.response || request.status != http.StatusOK {
+				return riotBrowserDiscovery{}, fmt.Errorf("watch Riot browser discovery: rejected status=%d", request.status)
+			}
+			identity, identityErr := c.riotBrowserDocumentIdentity(ctx)
+			if identityErr != nil {
+				return riotBrowserDiscovery{}, identityErr
+			}
+			if identity.frameID != request.frameID || identity.loaderID != request.loaderID {
+				return riotBrowserDiscovery{}, errors.New("watch Riot browser discovery: document identity changed")
+			}
+			body, bodyErr := c.riotResponseBody(ctx, params.RequestID)
+			if bodyErr != nil {
+				return riotBrowserDiscovery{}, fmt.Errorf("watch Riot browser discovery: %w", bodyErr)
+			}
+			captcha, summaryErr := strictRiotBrowserDiscoveryCaptcha(body)
+			if summaryErr != nil {
+				return riotBrowserDiscovery{}, summaryErr
+			}
+			log.Printf("Riot browser login discovery response method=GET type=%q captcha=%t", "auth", captcha)
+			return riotBrowserDiscovery{captcha: captcha}, nil
+		}
+	}
+}
+
+func strictRiotBrowserDiscoveryCaptcha(body []byte) (bool, error) {
+	if len(body) == 0 || len(body) > riotBrowserResponseLimit {
+		return false, errors.New("watch Riot browser discovery: invalid response body")
+	}
+	var response struct {
+		Type    string          `json:"type"`
+		Captcha json.RawMessage `json:"captcha"`
+	}
+	if json.Unmarshal(body, &response) != nil || response.Type != "auth" {
+		return false, errors.New("watch Riot browser discovery: unexpected response type")
+	}
+	trimmed := bytes.TrimSpace(response.Captcha)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("false")) {
+		return false, nil
+	}
+	var captcha struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(trimmed, &captcha) != nil || !strings.EqualFold(captcha.Type, "hcaptcha") {
+		return false, errors.New("watch Riot browser discovery: unsupported CAPTCHA configuration")
+	}
+	return true, nil
+}
+
+const riotBrowserSubmitTargetExpression = `(function(requiresCaptcha){
+if(location.origin!=="https://authenticate.riotgames.com")return {originOK:false,ready:false};
+if(document.readyState!=='complete')return {originOK:true,ready:false};
+const curtain=window[Symbol.for('valorant.remote-captcha-curtain')];if(!curtain)return {originOK:true,terminal:true,reason:'curtain unavailable'};
+const key=Symbol.for('valorant.riot-login-submit-state');
+const randomToken=()=>{const bytes=new Uint8Array(16);crypto.getRandomValues(bytes);return Array.from(bytes,b=>b.toString(16).padStart(2,'0')).join('')};
+let state=window[key];if(!state){state={documentToken:randomToken(),generation:1,clicked:false,button:null,widget:null,legal:null,api:null,ids:new WeakMap(),nextID:1};Object.defineProperty(window,key,{value:state,configurable:false,writable:false})}
+const identity=value=>{let id=state.ids.get(value);if(!id){id=String(state.nextID++);state.ids.set(value,id)}return id};
+const roots=[document];for(let i=0;i<roots.length;i++){for(const element of roots[i].querySelectorAll('*')){if(element.shadowRoot)roots.push(element.shadowRoot)}}
+const unique=values=>Array.from(new Set(values));
+const passwords=unique(roots.flatMap(root=>Array.from(root.querySelectorAll('input[name="password"],input[autocomplete="current-password"],input[data-testid*="password"],input[type="password"]'))));
+const buttons=unique(passwords.flatMap(password=>password.form?Array.from(password.form.querySelectorAll('button[data-testid="btn-signin-submit"]')):[]));
+if(buttons.length>1)return {originOK:true,terminal:true,reason:'ambiguous submit button'};
+if(buttons.length===0)return {originOK:true,ready:false};
+const button=buttons[0];if(button.disabled||button.getAttribute('aria-disabled')==='true')return {originOK:true,terminal:true,disabled:true,reason:'submit button disabled'};
+let widget=null,legal=null,api=null;
+if(requiresCaptcha){
+  const legalMarkers=unique(roots.flatMap(root=>Array.from(root.querySelectorAll('[data-testid="hcaptcha-legal"]'))));
+  if(legalMarkers.length>1)return {originOK:true,terminal:true,reason:'ambiguous hCaptcha legal marker'};
+  const markedFrames=unique(roots.flatMap(root=>Array.from(root.querySelectorAll('iframe[data-hcaptcha-widget-id]'))));
+  if(markedFrames.length>1)return {originOK:true,terminal:true,reason:'ambiguous hCaptcha widget'};
+  if(legalMarkers.length===0||markedFrames.length===0||!window.hcaptcha||typeof window.hcaptcha.execute!=='function')return {originOK:true,ready:false};
+  widget=markedFrames[0];legal=legalMarkers[0];api=window.hcaptcha;
+  let parsed;try{parsed=new URL(widget.src,location.href)}catch(_){return {originOK:true,terminal:true,reason:'invalid hCaptcha widget URL'}}
+  const host=parsed.hostname.toLowerCase();if(parsed.protocol!=='https:'||!(host==='hcaptcha.com'||host.endsWith('.hcaptcha.com')))return {originOK:true,terminal:true,reason:'invalid hCaptcha widget origin'};
+  if(!widget.getAttribute('data-hcaptcha-widget-id'))return {originOK:true,terminal:true,reason:'missing hCaptcha widget identity'};
+}
+if(state.button!==button||state.widget!==widget||state.legal!==legal||state.api!==api){state.generation++;state.button=button;state.widget=widget;state.legal=legal;state.api=api}
+return {originOK:true,ready:true,documentToken:state.documentToken,generation:state.generation,buttonIdentity:identity(button),widgetIdentity:widget?identity(widget):'',legalIdentity:legal?identity(legal):'',apiIdentity:api?identity(api):''};
+})`
+
+func (c *chromeDevToolsClient) evaluateRiotBrowserSubmitTarget(ctx context.Context, requiresCaptcha bool) (riotBrowserSubmitTarget, bool, error) {
+	expression := riotBrowserSubmitTargetExpression + "(" + strconv.FormatBool(requiresCaptcha) + ")"
+	var evaluated struct {
+		Result struct {
+			Value struct {
+				OriginOK       bool   `json:"originOK"`
+				Ready          bool   `json:"ready"`
+				Terminal       bool   `json:"terminal"`
+				Disabled       bool   `json:"disabled"`
+				Reason         string `json:"reason"`
+				DocumentToken  string `json:"documentToken"`
+				Generation     uint64 `json:"generation"`
+				ButtonIdentity string `json:"buttonIdentity"`
+				WidgetIdentity string `json:"widgetIdentity"`
+				LegalIdentity  string `json:"legalIdentity"`
+				APIIdentity    string `json:"apiIdentity"`
+			} `json:"value"`
+		} `json:"result"`
+		ExceptionDetails json.RawMessage `json:"exceptionDetails"`
+	}
+	if err := c.Call(ctx, "Runtime.evaluate", map[string]any{"expression": expression, "returnByValue": true, "awaitPromise": true}, &evaluated); err != nil {
+		return riotBrowserSubmitTarget{}, false, err
+	}
+	value := evaluated.Result.Value
+	if len(evaluated.ExceptionDetails) != 0 {
+		return riotBrowserSubmitTarget{}, false, errors.New("inspect Riot browser submit target: evaluation failed")
+	}
+	if !value.OriginOK {
+		return riotBrowserSubmitTarget{}, false, errors.New("inspect Riot browser submit target: exact authentication origin changed")
+	}
+	if value.Terminal {
+		if strings.TrimSpace(value.Reason) == "" {
+			value.Reason = "invalid submit target"
+		}
+		return riotBrowserSubmitTarget{}, false, fmt.Errorf("inspect Riot browser submit target: %s", value.Reason)
+	}
+	if !value.Ready {
+		return riotBrowserSubmitTarget{}, false, nil
+	}
+	target := riotBrowserSubmitTarget{token: value.DocumentToken, generation: value.Generation, buttonID: value.ButtonIdentity,
+		widgetID: value.WidgetIdentity, legalID: value.LegalIdentity, apiID: value.APIIdentity, captcha: requiresCaptcha}
+	if target.token == "" || target.generation == 0 || target.buttonID == "" ||
+		(requiresCaptcha && (target.widgetID == "" || target.legalID == "" || target.apiID == "")) {
+		return riotBrowserSubmitTarget{}, false, errors.New("inspect Riot browser submit target: incomplete identity")
+	}
+	return target, true, nil
+}
+
+func sameRiotBrowserSubmitTarget(a, b riotBrowserSubmitTarget) bool {
+	return a.document == b.document && a.token != "" && a.token == b.token && a.generation != 0 && a.generation == b.generation &&
+		a.buttonID == b.buttonID && a.widgetID == b.widgetID && a.legalID == b.legalID && a.apiID == b.apiID && a.captcha == b.captcha
+}
+
+func (c *chromeDevToolsClient) waitForStableRiotBrowserSubmitTarget(ctx context.Context, requiresCaptcha bool) (riotBrowserSubmitTarget, error) {
+	var previous riotBrowserSubmitTarget
+	havePrevious := false
+	navigationRetries := 0
+	for {
+		before, err := c.riotBrowserDocumentIdentity(ctx)
+		if err != nil {
+			return riotBrowserSubmitTarget{}, err
+		}
+		target, ready, evalErr := c.evaluateRiotBrowserSubmitTarget(ctx, requiresCaptcha)
+		if evalErr != nil {
+			if !retryRiotBrowserNavigationError(evalErr, &navigationRetries) {
+				return riotBrowserSubmitTarget{}, fmt.Errorf("inspect Riot browser submit target: %w", evalErr)
+			}
+			havePrevious = false
+			if waitErr := waitRiotBrowserDiscovery(ctx); waitErr != nil {
+				return riotBrowserSubmitTarget{}, waitErr
+			}
+			continue
+		}
+		after, err := c.riotBrowserDocumentIdentity(ctx)
+		if err != nil {
+			return riotBrowserSubmitTarget{}, err
+		}
+		if before != after {
+			return riotBrowserSubmitTarget{}, errors.New("inspect Riot browser submit target: document identity changed")
+		}
+		if ready {
+			target.document = after
+			if havePrevious && previous.document != target.document {
+				return riotBrowserSubmitTarget{}, errors.New("inspect Riot browser submit target: document identity changed")
+			}
+			if havePrevious && sameRiotBrowserSubmitTarget(previous, target) {
+				return target, nil
+			}
+			previous = target
+			havePrevious = true
+		} else {
+			havePrevious = false
+		}
+		if waitErr := waitRiotBrowserDiscovery(ctx); waitErr != nil {
+			return riotBrowserSubmitTarget{}, waitErr
+		}
+	}
+}
+
+func (c *chromeDevToolsClient) clickRiotBrowserSubmitTarget(ctx context.Context, target riotBrowserSubmitTarget) error {
+	identity, err := c.riotBrowserDocumentIdentity(ctx)
+	if err != nil {
+		return err
+	}
+	if identity != target.document {
+		return errors.New("submit Riot browser login: document identity changed")
+	}
+	tokenJSON, _ := json.Marshal(target.token)
+	buttonJSON, _ := json.Marshal(target.buttonID)
+	widgetJSON, _ := json.Marshal(target.widgetID)
+	legalJSON, _ := json.Marshal(target.legalID)
+	apiJSON, _ := json.Marshal(target.apiID)
+	expression := `(function(){
+if(location.origin!=="https://authenticate.riotgames.com")return {originOK:false,submitted:false};
+const expectedDocumentToken=` + string(tokenJSON) + `,expectedGeneration=` + strconv.FormatUint(target.generation, 10) + `,expectedButtonIdentity=` + string(buttonJSON) + `,expectedWidgetIdentity=` + string(widgetJSON) + `,expectedLegalIdentity=` + string(legalJSON) + `,expectedAPIIdentity=` + string(apiJSON) + `;
+const state=window[Symbol.for('valorant.riot-login-submit-state')],curtain=window[Symbol.for('valorant.remote-captcha-curtain')];
+if(!state||!curtain||state.clicked||state.documentToken!==expectedDocumentToken||state.generation!==expectedGeneration)return {originOK:true,submitted:false,stale:true};
+const identity=value=>state.ids.get(value)||'';const button=state.button;
+if(!button||identity(button)!==expectedButtonIdentity||button.disabled||button.getAttribute('aria-disabled')==='true')return {originOK:true,submitted:false,stale:true};
+const roots=[document];for(let i=0;i<roots.length;i++){for(const element of roots[i].querySelectorAll('*')){if(element.shadowRoot)roots.push(element.shadowRoot)}}
+const unique=values=>Array.from(new Set(values));
+const passwords=unique(roots.flatMap(root=>Array.from(root.querySelectorAll('input[name="password"],input[autocomplete="current-password"],input[data-testid*="password"],input[type="password"]'))));
+const buttons=unique(passwords.flatMap(password=>password.form?Array.from(password.form.querySelectorAll('button[data-testid="btn-signin-submit"]')):[]));
+if(buttons.length!==1||buttons[0]!==button)return {originOK:true,submitted:false,stale:true};
+if(expectedWidgetIdentity){
+  const widget=state.widget,legal=state.legal,api=state.api;
+  const widgets=unique(roots.flatMap(root=>Array.from(root.querySelectorAll('iframe[data-hcaptcha-widget-id]'))));
+  const legalMarkers=unique(roots.flatMap(root=>Array.from(root.querySelectorAll('[data-testid="hcaptcha-legal"]'))));
+  let parsed;try{parsed=new URL(widget&&widget.src,location.href)}catch(_){return {originOK:true,submitted:false,stale:true}}
+  const host=parsed.hostname.toLowerCase();
+  if(widgets.length!==1||widgets[0]!==widget||legalMarkers.length!==1||legalMarkers[0]!==legal||!widget.getAttribute('data-hcaptcha-widget-id')||parsed.protocol!=='https:'||!(host==='hcaptcha.com'||host.endsWith('.hcaptcha.com'))||!api||identity(widget)!==expectedWidgetIdentity||identity(legal)!==expectedLegalIdentity||identity(api)!==expectedAPIIdentity||window.hcaptcha!==api||typeof api.execute!=='function'||!widget.isConnected||!legal.isConnected)return {originOK:true,submitted:false,stale:true};
+}
+state.clicked=true;curtain.trustedSubmit=true;
+try{button.click();return {originOK:true,submitted:true}}finally{curtain.trustedSubmit=false}
+})()`
+	var evaluated struct {
+		Result struct {
+			Value struct {
+				OriginOK  bool `json:"originOK"`
+				Submitted bool `json:"submitted"`
+				Stale     bool `json:"stale"`
+			} `json:"value"`
+		} `json:"result"`
+		ExceptionDetails json.RawMessage `json:"exceptionDetails"`
+	}
+	if err := c.Call(ctx, "Runtime.evaluate", map[string]any{"expression": expression, "returnByValue": true, "awaitPromise": true}, &evaluated); err != nil {
+		// This evaluation owns the one-shot click. Retrying after a navigation
+		// abort could submit a replacement document twice.
+		return fmt.Errorf("submit Riot browser login: %w", err)
+	}
+	if len(evaluated.ExceptionDetails) != 0 || !evaluated.Result.Value.OriginOK || !evaluated.Result.Value.Submitted || evaluated.Result.Value.Stale {
+		return errors.New("submit Riot browser login: guarded target changed")
+	}
+	return nil
+}
+
 type riotBrowserRequest struct {
 	method   string
 	rawURL   string
+	frameID  string
+	loaderID string
 	response bool
 	status   int
 }
 
 func (c *chromeDevToolsClient) waitForRiotLogin(ctx context.Context, events *chromeDevToolsEventSubscription, publishCaptcha func(riotCaptchaSurface)) (riotBrowserLoginResult, error) {
+	return c.waitForRiotLoginState(ctx, events, publishCaptcha, true)
+}
+
+func (c *chromeDevToolsClient) waitForRiotLoginState(ctx context.Context, events *chromeDevToolsEventSubscription, publishCaptcha func(riotCaptchaSurface), waitForChallengeSurface bool) (riotBrowserLoginResult, error) {
 	requests := make(map[string]riotBrowserRequest)
+	seenLoginRequests := make(map[string]struct{})
 	for {
 		event, err := events.Next(ctx)
 		if err != nil {
@@ -684,6 +1050,12 @@ func (c *chromeDevToolsClient) waitForRiotLogin(ctx context.Context, events *chr
 				} `json:"request"`
 			}
 			if json.Unmarshal(event.Params, &params) == nil {
+				if endpoint, _ := riotBrowserLoginEndpoint(params.Request.URL); endpoint {
+					if _, duplicate := seenLoginRequests[params.RequestID]; duplicate || params.RequestID == "" {
+						return riotBrowserLoginResult{}, errors.New("watch Riot browser login: duplicate request identity")
+					}
+					seenLoginRequests[params.RequestID] = struct{}{}
+				}
 				requests[params.RequestID] = riotBrowserRequest{method: params.Request.Method, rawURL: params.Request.URL}
 				if endpoint, hasQuery := riotBrowserLoginEndpoint(params.Request.URL); endpoint {
 					log.Printf("Riot browser login request started method=%s query=%t", params.Request.Method, hasQuery)
@@ -716,24 +1088,8 @@ func (c *chromeDevToolsClient) waitForRiotLogin(ctx context.Context, events *chr
 			request := requests[params.RequestID]
 			delete(requests, params.RequestID)
 			endpoint, _ := riotBrowserLoginEndpoint(request.rawURL)
-			if request.response && endpoint && request.status == http.StatusOK && request.method != http.MethodPut {
-				body, bodyErr := c.riotResponseBody(ctx, params.RequestID)
-				if bodyErr != nil {
-					log.Printf("Riot browser login discovery response unavailable: %v", bodyErr)
-				} else {
-					responseType, hasCaptcha := riotBrowserResponseSummary(body)
-					log.Printf("Riot browser login discovery response method=%s type=%q captcha=%t", request.method, responseType, hasCaptcha)
-					if hasCaptcha {
-						surface, surfaceErr := c.waitForRiotCaptchaSurface(ctx)
-						if surfaceErr != nil {
-							return riotBrowserLoginResult{}, surfaceErr
-						}
-						if publishCaptcha != nil {
-							publishCaptcha(surface)
-						}
-					}
-				}
-				continue
+			if endpoint && request.method != http.MethodPut {
+				return riotBrowserLoginResult{}, errors.New("watch Riot browser login: duplicate discovery after submit")
 			}
 			if request.method != http.MethodPut || !request.response || !isRiotBrowserLoginURL(request.rawURL) {
 				continue
@@ -748,6 +1104,9 @@ func (c *chromeDevToolsClient) waitForRiotLogin(ctx context.Context, events *chr
 			}
 			if !riotBrowserLoginTerminal(body) {
 				log.Printf("Riot browser CAPTCHA challenge response received")
+				if !waitForChallengeSurface {
+					continue
+				}
 				surface, surfaceErr := c.waitForRiotCaptchaSurface(ctx)
 				if surfaceErr != nil {
 					return riotBrowserLoginResult{}, surfaceErr
