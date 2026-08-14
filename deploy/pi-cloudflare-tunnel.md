@@ -26,10 +26,11 @@ MFA는 CAPTCHA 뷰어가 아니라 기존 Discord MFA 버튼과 모달로 계속
 
 ## 사전 조건
 
-1. 공개 DNS 이름과 TLS가 준비된 절대 HTTPS 주소가 필요합니다. 예:
-   `https://valorant-bot.example.com`. hostname을 권장합니다. HTTPS IP 주소는 그 IP 주소에
-   유효한 TLS 인증서가 있을 때만 사용할 수 있습니다. host는 비어 있으면 안 되고,
-   `http://`, query, fragment, userinfo, 공백·제어문자, `/` 외의 path는 사용할 수 없습니다.
+1. 공개 DNS 이름과 TLS가 준비된 절대 HTTPS 주소가 필요합니다. 이 프로젝트의 named
+   tunnel 예는 `https://programtyping.dreamp.org`입니다. hostname을 권장합니다. HTTPS IP
+   주소는 그 IP 주소에 유효한 TLS 인증서가 있을 때만 사용할 수 있습니다. host는 비어
+   있으면 안 되고, `http://`, query, fragment, userinfo, 공백·제어문자, `/` 외의 path는
+   사용할 수 없습니다.
 2. Tunnel/프록시는 `AUTH_PORT`의 HTTP와 WebSocket Upgrade를 그대로 전달해야 합니다.
 3. Pi 서비스 사용자 `valorant`가 실행할 Chromium, Xvfb, `xauth`, `mcookie`와 설치 전
    origin 검사에 쓰는 Python 3가 있어야 합니다.
@@ -58,7 +59,7 @@ sudo apt-get update && sudo apt-get install -y xvfb chromium xauth util-linux py
 넘깁니다.
 
 ```bash
-sudo AUTH_BASE_URL=https://valorant-bot.example.com \
+sudo AUTH_BASE_URL=https://programtyping.dreamp.org \
   ./scripts/setup-pi.sh --remote-captcha
 ```
 
@@ -71,7 +72,7 @@ sudo AUTH_BASE_URL=https://valorant-bot.example.com \
 한 번만 있는지 확인하고, 모든 설치·systemd 변경 전에 같은 형식 검사를 다시 수행합니다.
 
 ```bash
-CAPTCHA_AUTH_BASE_URL='https://valorant-bot.example.com'
+CAPTCHA_AUTH_BASE_URL='https://programtyping.dreamp.org'
 python3 ./deploy/validate-remote-captcha-origin.py "$CAPTCHA_AUTH_BASE_URL"
 sudoedit /etc/valorant-bot/env
 sudo AUTH_BASE_URL="$CAPTCHA_AUTH_BASE_URL" ./scripts/setup-pi.sh --remote-captcha
@@ -105,7 +106,7 @@ drop-in을 복사하거나 임의의 display unit 이름을 만들지 말고, �
 설치 후 `/etc/valorant-bot/env`에는 다음 값이 있어야 합니다.
 
 ```dotenv
-AUTH_BASE_URL=https://valorant-bot.example.com
+AUTH_BASE_URL=https://programtyping.dreamp.org
 AUTH_PORT=8787
 AUTH_BIND_ADDRESS=127.0.0.1
 CAPTCHA_BROWSER_MODE=disabled
@@ -147,30 +148,84 @@ sudo journalctl -u valorant-captcha-display.service -u valorant-bot.service -n 1
 
 ## Cloudflare Tunnel
 
-지속 운영에는 이름 있는 Tunnel과 소유한 도메인을 사용하고, public hostname의 서비스는
-`http://127.0.0.1:8787`로 지정합니다. Cloudflare 대시보드/`cloudflared` 설정에서 WebSocket
-지원이 꺼지지 않았는지 확인하세요. `AUTH_BASE_URL`의 host는 public hostname과 정확히
-일치해야 합니다. 애플리케이션은 이 정적 `AUTH_BASE_URL`의 host/origin을 직접 검증하며,
-`X-Forwarded-*` 헤더를 신뢰해 인증 origin을 선택하지 않습니다.
+이 Go 봇은 Discord gateway WebSocket, 호스트 Chrome, SQLite가 필요하므로 Cloudflare
+Worker로 실행하지 않습니다. 올바른 경로는 봇 호스트의 named Cloudflare Tunnel이
+`AUTH_PORT`(기본 `8787`)만 공개 HTTPS로 노출하는 것입니다. `wrangler`는 쓰지 않습니다.
 
-개발·점검용 quick tunnel은 다음처럼 실행할 수 있습니다. 설치된 remote deployment asset을
-감지해 remote 모드임을 표시하지만, quick tunnel은 **테스트 전용**입니다.
+지속 운영 origin 예: `https://programtyping.dreamp.org` (`dreamp.org` NS는 이미
+Cloudflare를 가리킵니다. `programtyping` 레코드는 named tunnel 헬퍼가 CNAME을 만듭니다).
+
+public hostname의 서비스는 `http://127.0.0.1:8787`이며 HTTP와 WebSocket Upgrade를 그대로
+전달해야 합니다. Riot 로그인 문서는 터널 hostname으로 프록시·프레임·재작성되지 않습니다.
+캡차 토큰은 `authenticate.riotgames.com`에서만 발급됩니다. `AUTH_BASE_URL`의 host는
+public hostname과 정확히 일치해야 합니다. 애플리케이션은 이 정적 `AUTH_BASE_URL`의
+host/origin을 직접 검증하며, `X-Forwarded-*` 헤더를 신뢰해 인증 origin을 선택하지
+않습니다.
+
+### 이름 있는 Tunnel (지속 origin)
+
+로컬 관리 named tunnel 헬퍼는 터널을 만들거나 재사용하고, DNS를 붙이고, loopback
+프록시 설정을 씁니다. 기본 실행은 터널 프로세스를 **시작하지 않습니다**.
+
+```bash
+cloudflared tunnel login
+```
+
+브라우저에서 **dreamp.org** 존을 선택합니다. `~/.cloudflared/cert.pem`과 터널
+credentials JSON은 저장소에 넣지 마세요.
+
+```bash
+./scripts/named-tunnel.sh
+```
+
+기본값: 터널 이름 `valorant-bot`, hostname `programtyping.dreamp.org`, upstream
+`http://127.0.0.1:8787`, 설정 파일 `~/.cloudflared/valorant-bot.yml`. 출력된 origin을
+봇 환경에 넣습니다.
+
+```dotenv
+AUTH_BASE_URL=https://programtyping.dreamp.org
+AUTH_PORT=8787
+AUTH_BIND_ADDRESS=127.0.0.1
+CAPTCHA_BROWSER_MODE=remote
+```
+
+로컬 `.env`의 `AUTH_BASE_URL`·loopback bind·`CAPTCHA_BROWSER_MODE=remote`만 갱신하려면
+기존 writer를 씁니다. Discord 토큰과 `BOT_SECRET`은 유지됩니다.
+
+```bash
+./scripts/named-tunnel.sh --write-env
+```
+
+Pi의 `/etc/valorant-bot/env`는 자동으로 고치지 않습니다. 위 설치 절처럼 검사 후 해당
+줄만 수정하세요.
+
+봇이 `127.0.0.1:8787`을 듣고 있는 뒤 터널을 시작합니다.
+
+```bash
+./scripts/named-tunnel.sh --run
+```
+
+로그인에 쓴 Cloudflare 계정이 `dreamp.org` DNS를 수정할 수 있어야 `programtyping`
+CNAME이 만들어집니다.
+
+### 개발·점검용 quick tunnel (테스트 전용)
+
+quick tunnel은 주소가 재시작마다 바뀌므로 **테스트 전용**입니다. 지속 Discord 링크
+origin으로는 쓰지 마세요.
 
 ```bash
 ./scripts/pi-tunnel.sh 8787
 ```
 
 출력된 `https://…trycloudflare.com` 주소를 `AUTH_BASE_URL`로 쓰고 봇을 재시작합니다.
-quick tunnel 주소는 프로세스를 다시 시작할 때 바뀌므로 지속적인 Discord 링크 origin으로는
-사용하지 마세요. 이 주소가 바뀌면 새 주소로 환경 변수를 수정하고 봇을 재시작해야 합니다.
-QR 또는 `disabled` 모드는 이 tunnel이나 인바운드 포트 없이 동작합니다.
+이 주소가 바뀌면 새 주소로 환경 변수를 수정하고 봇을 재시작해야 합니다.
+QR 또는 `disabled` 모드는 tunnel이나 인바운드 포트 없이 동작합니다.
 
-로컬 노트북에서 집 밖 LTE로 캡차 뷰어를 시험할 때는 봇보다 먼저 터널 origin이
+로컬 노트북에서 집 밖 LTE로 캡차 뷰어를 **한 번** 시험할 때는 봇보다 먼저 터널 origin이
 있어야 합니다. `./scripts/run-local-remote.sh`가 cloudflared quick tunnel을 띄워
 URL을 파싱한 다음, 그 origin을 `.env`의 `AUTH_BASE_URL`에 쓰고 loopback bind와
 `CAPTCHA_BROWSER_MODE=remote`를 맞춘 뒤 봇을 시작합니다. Discord 비밀은
-유지합니다. quick tunnel 주소는 켤 때마다 바뀌므로 스크립트가 `.env`를 다시
-고칩니다.
+유지합니다. 같은 호스트에서 고정 origin이 필요하면 위의 named tunnel을 쓰세요.
 
 ## 운영 점검
 

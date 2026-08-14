@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Optionally expose the bot's loopback AUTH_PORT via a Cloudflare quick tunnel.
 # In remote CAPTCHA mode this is test-only: persistent use needs a stable public
-# HTTPS AUTH_BASE_URL and a named tunnel/reverse proxy with WebSocket support.
+# HTTPS AUTH_BASE_URL and a named tunnel/reverse proxy with WebSocket support
+# (./scripts/named-tunnel.sh, https://programtyping.dreamp.org).
 # QR/disabled mode needs no inbound port or tunnel.
 #
 # Usage (on the Pi, while valorant-bot is already listening on AUTH_PORT):

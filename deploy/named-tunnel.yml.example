@@ -1,0 +1,15 @@
+# Example only. Do not put cert.pem or credentials JSON in this repository.
+# ./scripts/named-tunnel.sh writes the live file to ~/.cloudflared/valorant-bot.yml
+# after `cloudflared tunnel login` (choose the dreamp.org zone).
+#
+# HTTP ingress forwards WebSocket Upgrade to the loopback AUTH_PORT.
+# Do not point ingress at Riot login; captcha tokens are not minted on this hostname.
+tunnel: <TUNNEL-UUID>
+credentials-file: /path/to/.cloudflared/<TUNNEL-UUID>.json
+ingress:
+  - hostname: programtyping.dreamp.org
+    service: http://127.0.0.1:8787
+    originRequest:
+      connectTimeout: "30s"
+      keepAliveTimeout: "90s"
+  - service: http_status:404

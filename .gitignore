@@ -26,6 +26,9 @@ Thumbs.db
 # Isolated git worktrees
 .worktrees/
 
+# Local cloudflared certs/credentials (never commit)
+.cloudflared/
+
 # Editors / local agent state (not part of the project)
 .idea/
 .vscode/

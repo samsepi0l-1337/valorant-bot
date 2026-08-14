@@ -103,6 +103,7 @@ func (f *ShopFetcher) shopForAccount(ctx context.Context, acc store.Account, lan
 		}
 		if f.Skins != nil {
 			if skin, ok := f.Skins.Get(offer.SkinUUID, language); ok {
+				ov.SkinUUID = skin.UUID
 				ov.DisplayName = skin.DisplayName
 				ov.IconURL = skin.DisplayIcon
 				ov.Color = skin.Color

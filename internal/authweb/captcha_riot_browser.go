@@ -276,7 +276,7 @@ func (c *chromeBrowserController) RunRiotLogin(ctx context.Context, username, pa
 	if err != nil {
 		c.publishRiotCaptchaSurface(riotCaptchaSurface{}, err)
 	} else {
-		c.publishRiotCaptchaSurface(riotCaptchaSurface{}, errors.New("Riot login completed before a CAPTCHA challenge surface was available"))
+		c.publishRiotCaptchaSurface(riotCaptchaSurface{}, errRiotLoginCompletedBeforeCaptchaSurface)
 	}
 	return result, err
 }

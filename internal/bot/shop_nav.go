@@ -165,7 +165,13 @@ func (h *Handlers) HandleShopNav(ownerID string, page int, clickerID string, lan
 	}
 	entry, ok := h.ensureShopCache().get(ownerID)
 	if !ok {
-		return Response{}, fmt.Errorf("%s", i18n.T(lang, "shop.nav_expired"))
+		return Response{
+			Ephemeral: true,
+			Embeds: []*discordgo.MessageEmbed{{
+				Description: i18n.T(lang, "shop.nav_expired"),
+				Color:       0xFD4553,
+			}},
+		}, nil
 	}
 	useLang := entry.lang
 	if useLang == "" {

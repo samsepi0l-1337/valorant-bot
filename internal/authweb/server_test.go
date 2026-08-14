@@ -333,6 +333,9 @@ func TestWaitQRLogin_TimesOut(t *testing.T) {
 	if _, err := s.WaitQRLogin(ctx, state); err == nil {
 		t.Fatal("expected timeout error")
 	}
+	if _, ok := st.pending[state]; ok {
+		t.Fatalf("timeout left auth_pending for %s", state)
+	}
 }
 
 func TestWaitQRLogin_ExpiredSession(t *testing.T) {
@@ -349,6 +352,9 @@ func TestWaitQRLogin_ExpiredSession(t *testing.T) {
 	}
 	if _, err := s.WaitQRLogin(context.Background(), state); !errors.Is(err, riot.ErrQRExpired) {
 		t.Fatalf("err = %v, want ErrQRExpired", err)
+	}
+	if _, ok := st.pending[state]; ok {
+		t.Fatalf("expired session left auth_pending for %s", state)
 	}
 }
 

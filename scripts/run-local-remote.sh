@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Start a Cloudflare quick tunnel, then the bot, so Discord CAPTCHA viewer
 # links work off-LAN (LTE/mobile data). Quick tunnel URLs change every start
-# and are test-only. Persistent Pi use needs a named tunnel:
+# and are test-only. Persistent use needs a named tunnel:
+#   ./scripts/named-tunnel.sh  (https://programtyping.dreamp.org)
 #   deploy/pi-cloudflare-tunnel.md
 #
 # Usage (repo root has .env with Discord secrets):

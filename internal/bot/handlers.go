@@ -575,8 +575,11 @@ func (h *Handlers) HandleUnlink(discordUserID, identifier string, lang i18n.Lang
 	if err != nil {
 		return Response{}, err
 	}
-	puuid, ok := resolveAccountPUUID(accounts, identifier)
-	if !ok {
+	puuid, err := resolveAccountPUUID(accounts, identifier)
+	if errors.Is(err, errUnlinkAmbiguous) {
+		return Response{}, errors.New(unlinkAmbiguousMessage(lang, accounts, identifier))
+	}
+	if err != nil {
 		return Response{}, fmt.Errorf(i18n.T(lang, "unlink.not_found"), identifier)
 	}
 	if err := h.Accounts.DeleteRiotAccount(discordUserID, puuid); err != nil {
@@ -625,30 +628,64 @@ func (h *Handlers) HandleLanguage(discordUserID, langCode string) (Response, err
 	return Response{Ephemeral: true, Content: msg}, nil
 }
 
-func resolveAccountPUUID(accounts []store.Account, identifier string) (string, bool) {
+var (
+	errUnlinkNotFound    = errors.New("unlink not found")
+	errUnlinkAmbiguous   = errors.New("unlink ambiguous game name")
+)
+
+func unlinkAmbiguousMessage(lang i18n.Lang, accounts []store.Account, identifier string) string {
+	var opts []string
+	for _, a := range accounts {
+		if strings.EqualFold(a.GameName, identifier) {
+			opts = append(opts, a.GameName+"#"+a.TagLine)
+		}
+	}
+	options := strings.Join(opts, ", ")
+	if lang == i18n.KO {
+		return fmt.Sprintf("동일한 이름의 계정이 여러 개 있습니다. Name#Tag로 지정하세요: %s", options)
+	}
+	return fmt.Sprintf("Multiple accounts share that name. Use Name#Tag: %s", options)
+}
+
+func resolveAccountPUUID(accounts []store.Account, identifier string) (string, error) {
 	identifier = strings.TrimSpace(identifier)
 	if identifier == "" {
-		return "", false
+		return "", errUnlinkNotFound
 	}
 	for _, a := range accounts {
 		if a.PUUID == identifier {
-			return a.PUUID, true
+			return a.PUUID, nil
 		}
+	}
+	if strings.Contains(identifier, "#") {
+		for _, a := range accounts {
+			combo := a.GameName + "#" + a.TagLine
+			if strings.EqualFold(combo, identifier) {
+				return a.PUUID, nil
+			}
+		}
+		return "", errUnlinkNotFound
 	}
 	lower := strings.ToLower(identifier)
 	for _, a := range accounts {
-		if strings.EqualFold(a.GameName, identifier) {
-			return a.PUUID, true
-		}
-		combo := a.GameName + "#" + a.TagLine
-		if strings.EqualFold(combo, identifier) {
-			return a.PUUID, true
-		}
 		if strings.HasPrefix(strings.ToLower(a.PUUID), lower) {
-			return a.PUUID, true
+			return a.PUUID, nil
 		}
 	}
-	return "", false
+	var nameMatches []store.Account
+	for _, a := range accounts {
+		if strings.EqualFold(a.GameName, identifier) {
+			nameMatches = append(nameMatches, a)
+		}
+	}
+	switch len(nameMatches) {
+	case 0:
+		return "", errUnlinkNotFound
+	case 1:
+		return nameMatches[0].PUUID, nil
+	default:
+		return "", errUnlinkAmbiguous
+	}
 }
 
 // FormatShopAccountLabel returns "Name#Tag (region)" for shop message headers.

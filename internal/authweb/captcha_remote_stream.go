@@ -34,14 +34,15 @@ const (
 )
 
 var (
-	errRemoteCaptchaFrameInvalid      = errors.New("remote CAPTCHA frame is invalid")
-	errRemoteCaptchaFrameTooLarge     = errors.New("remote CAPTCHA frame exceeds 2 MiB")
-	errRemoteCaptchaInputInvalid      = errors.New("remote CAPTCHA input is invalid")
-	errRemoteCaptchaInputRate         = errors.New("remote CAPTCHA input rate exceeded")
-	errRemoteCaptchaInputBusy         = errors.New("remote CAPTCHA input queue is full")
-	errRemoteCaptchaLifetimeRequired  = errors.New("remote CAPTCHA requires all owner lifetimes")
-	errRemoteCaptchaChallengeTeardown = errors.New("remote CAPTCHA challenge document ended")
-	errRiotCaptchaDocumentChanged     = errors.New("Riot CAPTCHA document changed")
+	errRemoteCaptchaFrameInvalid              = errors.New("remote CAPTCHA frame is invalid")
+	errRemoteCaptchaFrameTooLarge             = errors.New("remote CAPTCHA frame exceeds 2 MiB")
+	errRemoteCaptchaInputInvalid              = errors.New("remote CAPTCHA input is invalid")
+	errRemoteCaptchaInputRate                 = errors.New("remote CAPTCHA input rate exceeded")
+	errRemoteCaptchaInputBusy                 = errors.New("remote CAPTCHA input queue is full")
+	errRemoteCaptchaLifetimeRequired          = errors.New("remote CAPTCHA requires all owner lifetimes")
+	errRemoteCaptchaChallengeTeardown         = errors.New("remote CAPTCHA challenge document ended")
+	errRiotLoginCompletedBeforeCaptchaSurface = errors.New("Riot login completed before a CAPTCHA challenge surface was available")
+	errRiotCaptchaDocumentChanged             = errors.New("Riot CAPTCHA document changed")
 )
 
 type remoteCaptchaScreencastFrame struct {
