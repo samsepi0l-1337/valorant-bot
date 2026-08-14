@@ -630,6 +630,37 @@ func TestHandleUnlink_ByGameName(t *testing.T) {
 	}
 }
 
+func TestHandleUnlink_AmbiguousGameName(t *testing.T) {
+	accts := &memAccounts{byUser: map[string][]store.Account{
+		"u1": {
+			{PUUID: "puuid-kr", GameName: "Player", TagLine: "KR1", Region: "kr"},
+			{PUUID: "puuid-na", GameName: "Player", TagLine: "NA1", Region: "na"},
+		},
+	}}
+	h := &bot.Handlers{Accounts: accts}
+
+	_, err := h.HandleUnlink("u1", "Player", i18n.KO)
+	if err == nil {
+		t.Fatal("expected ambiguous name error")
+	}
+	list, _ := accts.ListRiotAccountsByDiscord("u1")
+	if len(list) != 2 {
+		t.Fatalf("bare name unlink must delete zero rows, got %+v", list)
+	}
+
+	_, err = h.HandleUnlink("u1", "Player#NA1", i18n.KO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	list, _ = accts.ListRiotAccountsByDiscord("u1")
+	if len(list) != 1 {
+		t.Fatalf("expected one account left, got %+v", list)
+	}
+	if list[0].PUUID != "puuid-kr" {
+		t.Fatalf("wrong account left: %+v", list[0])
+	}
+}
+
 func TestHandleUnlink_NotFound(t *testing.T) {
 	h := &bot.Handlers{Accounts: &memAccounts{byUser: map[string][]store.Account{}}}
 	_, err := h.HandleUnlink("u1", "missing", i18n.KO)
@@ -803,6 +834,23 @@ func TestHandleShop_MultiAccountHasNavButtons(t *testing.T) {
 		if len(denied.Embeds) != 1 || !strings.Contains(denied.Embeds[0].Description, "본인만") {
 			t.Fatalf("expected denial embed, got %+v", denied)
 		}
+	}
+}
+
+func TestHandleShopNav_ExpiredCacheIsEphemeral(t *testing.T) {
+	h := &bot.Handlers{}
+	expired, err := h.HandleShopNav("u1", 0, "u1", i18n.KO)
+	if err != nil {
+		t.Fatalf("expired nav must not return Go error (would overwrite public /shop): %v", err)
+	}
+	if !expired.Ephemeral {
+		t.Fatal("expired nav must be ephemeral (only the clicker sees it)")
+	}
+	if len(expired.Embeds) != 1 {
+		t.Fatalf("expected one embed, got %+v", expired)
+	}
+	if !strings.Contains(expired.Embeds[0].Description, "만료") {
+		t.Fatalf("expected expired copy, got %q", expired.Embeds[0].Description)
 	}
 }
 

@@ -74,8 +74,9 @@ Cloudflare Tunnel(아웃바운드)을 씁니다.
 `https://….trycloudflare.com`으로, `AUTH_BIND_ADDRESS`를 `127.0.0.1`로,
 `CAPTCHA_BROWSER_MODE`를 `remote`로 고칩니다. Discord 토큰·`BOT_SECRET`은
 그대로 둡니다. quick tunnel 주소는 프로세스를 다시 켤 때마다 바뀌므로 스크립트가
-매번 `.env`를 갱신합니다. Pi에서 계속 쓰려면 named tunnel과 소유한 도메인을
-[`pi-cloudflare-tunnel.md`](pi-cloudflare-tunnel.md)대로 붙이세요.
+매번 `.env`를 갱신합니다. 고정 origin이 필요하면 named tunnel 예
+`https://programtyping.dreamp.org`와 `./scripts/named-tunnel.sh`를
+[`pi-cloudflare-tunnel.md`](pi-cloudflare-tunnel.md)대로 쓰세요.
 
 ## HTTP 주의
 

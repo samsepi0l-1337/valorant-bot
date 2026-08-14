@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -220,6 +221,7 @@ func TestRemoteCaptchaDeploymentOriginValidator(t *testing.T) {
 
 	for _, valid := range []string{
 		"https://relay.example.com",
+		"https://programtyping.dreamp.org",
 		"https://relay.example.com/",
 		"HTTPS://Relay.Example.COM:443/",
 		"https://relay.example.com:0443",
@@ -656,6 +658,7 @@ func TestRemoteCaptchaProxyAndPiAssetsKeepRemoteRelayPrivate(t *testing.T) {
 	root := repositoryRoot(t)
 	nginx := readDeploymentAsset(t, root, "deploy/nginx.example.conf")
 	piTunnel := readDeploymentAsset(t, root, "scripts/pi-tunnel.sh")
+	namedTunnel := readDeploymentAsset(t, root, "scripts/named-tunnel.sh")
 	piSetup := readDeploymentAsset(t, root, "scripts/setup-pi.sh")
 	piEnv := readDeploymentAsset(t, root, "deploy/env.pi.example")
 
@@ -713,9 +716,29 @@ func TestRemoteCaptchaProxyAndPiAssetsKeepRemoteRelayPrivate(t *testing.T) {
 		"stable public HTTPS AUTH_BASE_URL",
 		"quick tunnel is test-only",
 		"WebSocket",
+		"named-tunnel.sh",
 	} {
 		if !strings.Contains(piTunnel, want) {
 			t.Errorf("Pi tunnel output does not distinguish remote relay requirement %q", want)
+		}
+	}
+	for _, want := range []string{
+		"programtyping.dreamp.org",
+		"http://127.0.0.1",
+		"WebSocket",
+		"cloudflared tunnel login",
+		"cloudflared tunnel create",
+		"cloudflared tunnel route dns",
+		"AUTH_BIND_ADDRESS=127.0.0.1",
+		"CAPTCHA_BROWSER_MODE=remote",
+	} {
+		if !strings.Contains(namedTunnel, want) {
+			t.Errorf("named tunnel helper missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"0.0.0.0", "cloudflared tunnel --url", "AUTH_BIND_ADDRESS=0.0.0.0"} {
+		if strings.Contains(namedTunnel, forbidden) {
+			t.Errorf("named tunnel helper contains forbidden %q", forbidden)
 		}
 	}
 }
@@ -1007,6 +1030,332 @@ func TestRunLocalRemoteStartsTunnelBeforeBot(t *testing.T) {
 	}
 }
 
+// Mutation caught: a named-tunnel origin with a path, trycloudflare host, or
+// non-loopback upstream publishes Discord viewer links against the wrong host
+// or mints captcha on the tunnel hostname.
+func TestNamedTunnelConfigHelperRejectsUnsafeOriginsAndKeepsLoopbackIngress(t *testing.T) {
+	const (
+		hostname = "programtyping.dreamp.org"
+		origin   = "https://programtyping.dreamp.org"
+		tunnelID = "6ff42ae2-765d-4adf-8112-31c55c1551ef"
+		token    = "do-not-print"
+	)
+	root := repositoryRoot(t)
+
+	stdout, stderr, err := runNamedTunnelConfig(t, nil, "origin", hostname)
+	if err != nil {
+		t.Fatalf("origin rejected %q: %v: stderr=%q", hostname, err, stderr)
+	}
+	if stdout != origin+"\n" {
+		t.Fatalf("origin stdout=%q, want %q", stdout, origin+"\n")
+	}
+
+	stdout, stderr, err = runNamedTunnelConfig(t, nil, "service", "8787")
+	if err != nil {
+		t.Fatalf("service rejected 8787: %v: stderr=%q", err, stderr)
+	}
+	if stdout != "http://127.0.0.1:8787\n" {
+		t.Fatalf("service stdout=%q", stdout)
+	}
+
+	for _, invalid := range []string{
+		"alpha.trycloudflare.com",
+		"trycloudflare.com",
+		"localhost",
+		"127.0.0.1",
+		"raspberrypi.local",
+		"programtyping.dreamp.org/captcha",
+		"programtyping.dreamp.org?next=1",
+	} {
+		t.Run("origin_"+strings.ReplaceAll(invalid, "/", "_"), func(t *testing.T) {
+			stdout, stderr, err := runNamedTunnelConfig(t, nil, "origin", invalid)
+			if err == nil {
+				t.Fatalf("origin accepted %q", invalid)
+			}
+			if stdout != "" {
+				t.Fatalf("origin stdout=%q, want empty", stdout)
+			}
+			if strings.Contains(stderr, invalid) {
+				t.Fatalf("origin echoed rejected input %q", invalid)
+			}
+		})
+	}
+
+	listJSON := `[{"id":"` + tunnelID + `","name":"valorant-bot","createdAt":"2026-01-01T00:00:00Z","deleted_at":null,"connections":[]}]`
+	stdout, stderr, err = runNamedTunnelConfig(t, strings.NewReader(listJSON), "parse-list", "valorant-bot")
+	if err != nil {
+		t.Fatalf("parse-list rejected live tunnel: %v: stderr=%q", err, stderr)
+	}
+	if stdout != tunnelID+"\n" {
+		t.Fatalf("parse-list stdout=%q, want %q", stdout, tunnelID+"\n")
+	}
+
+	const parseFailed = "named tunnel list parse failed"
+	assertMissingTunnelList := func(t *testing.T, label, payload string) {
+		t.Helper()
+		stdout, stderr, err := runNamedTunnelConfig(t, strings.NewReader(payload), "parse-list", "valorant-bot")
+		if err == nil {
+			t.Fatalf("%s: parse-list accepted a missing tunnel list", label)
+		}
+		if stdout != "" {
+			t.Fatalf("%s: stdout=%q, want empty", label, stdout)
+		}
+		if strings.Contains(stderr, parseFailed) {
+			t.Fatalf("%s: used parse-failed (exit 2) instead of create-path missing tunnel (exit 1): stderr=%q", label, stderr)
+		}
+		if strings.Contains(stderr, tunnelID) {
+			t.Fatalf("%s: stderr echoed id: %q", label, stderr)
+		}
+	}
+	assertMissingTunnelList(t, "empty array", "[]")
+	assertMissingTunnelList(t, "json null", "null")
+
+	stdout, stderr, err = runNamedTunnelConfig(t, strings.NewReader("{"), "parse-list", "valorant-bot")
+	if err == nil {
+		t.Fatal("parse-list accepted malformed JSON")
+	}
+	if stdout != "" {
+		t.Fatalf("malformed JSON stdout=%q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, parseFailed) {
+		t.Fatalf("malformed JSON stderr=%q, want %q", stderr, parseFailed)
+	}
+
+	deleted := `[{"id":"` + tunnelID + `","name":"valorant-bot","deletedAt":"2026-02-01T00:00:00Z"}]`
+	stdout, stderr, err = runNamedTunnelConfig(t, strings.NewReader(deleted), "parse-list", "valorant-bot")
+	if err == nil {
+		t.Fatal("parse-list reused a deleted tunnel")
+	}
+	if stdout != "" {
+		t.Fatalf("deleted-tunnel stdout=%q, want empty", stdout)
+	}
+
+	work := t.TempDir()
+	cred := filepath.Join(work, tunnelID+".json")
+	configPath := filepath.Join(work, "valorant-bot.yml")
+	stdout, stderr, err = runNamedTunnelConfig(t, nil, "render",
+		"--tunnel-id", tunnelID,
+		"--credentials-file", cred,
+		"--hostname", hostname,
+		"--service", "http://127.0.0.1:8787",
+		"--output", configPath,
+		"--repo-root", root,
+	)
+	if err != nil {
+		t.Fatalf("render rejected valid ingress: %v: stdout=%q stderr=%q", err, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("render stdout=%q, want empty", stdout)
+	}
+	rendered := string(mustReadFile(t, configPath))
+	for _, want := range []string{
+		hostname,
+		"http://127.0.0.1:8787",
+		"http_status:404",
+		"WebSocket",
+		`credentials-file: "` + cred + `"`,
+		tunnelID,
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("rendered config missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"noTLSVerify",
+		"disableChunkedEncoding",
+		"0.0.0.0",
+		"trycloudflare",
+		"authenticate.riotgames.com",
+		token,
+	} {
+		if strings.Contains(rendered, forbidden) {
+			t.Errorf("rendered config contains forbidden %q", forbidden)
+		}
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("config mode=%o, want 0600", info.Mode().Perm())
+	}
+
+	repoCred := filepath.Join(root, "leaked-credentials.json")
+	stdout, stderr, err = runNamedTunnelConfig(t, nil, "render",
+		"--tunnel-id", tunnelID,
+		"--credentials-file", repoCred,
+		"--hostname", hostname,
+		"--service", "http://127.0.0.1:8787",
+		"--output", configPath,
+		"--repo-root", root,
+	)
+	if err == nil {
+		t.Fatal("render accepted credentials inside the git repo")
+	}
+	if stdout != "" || strings.Contains(stderr, token) || strings.Contains(stderr, "leaked-credentials") {
+		t.Fatalf("repo-credentials output leaked path stdout=%q stderr=%q", stdout, stderr)
+	}
+
+	stdout, stderr, err = runNamedTunnelConfig(t, nil, "render",
+		"--tunnel-id", tunnelID,
+		"--credentials-file", cred,
+		"--hostname", "alpha.trycloudflare.com",
+		"--service", "http://127.0.0.1:8787",
+	)
+	if err == nil {
+		t.Fatal("render accepted a trycloudflare hostname")
+	}
+	if stdout != "" || strings.Contains(stderr, "alpha.trycloudflare") {
+		t.Fatalf("trycloudflare render output leaked host stdout=%q stderr=%q", stdout, stderr)
+	}
+
+	stdout, stderr, err = runNamedTunnelConfig(t, nil, "render",
+		"--tunnel-id", tunnelID,
+		"--credentials-file", cred,
+		"--hostname", hostname,
+		"--service", "http://0.0.0.0:8787",
+	)
+	if err == nil {
+		t.Fatal("render accepted a non-loopback upstream")
+	}
+	if stdout != "" {
+		t.Fatalf("non-loopback render stdout=%q, want empty", stdout)
+	}
+}
+
+// Mutation caught: default named-tunnel setup starts cloudflared, rewrites
+// Discord secrets, or skips the login/DNS steps so programtyping.dreamp.org
+// never becomes a stable AUTH_BASE_URL.
+func TestNamedTunnelScriptPreparesPersistentOriginWithoutStarting(t *testing.T) {
+	root := repositoryRoot(t)
+	script := readDeploymentAsset(t, root, "scripts/named-tunnel.sh")
+	example := readDeploymentAsset(t, root, "deploy/named-tunnel.yml.example")
+
+	if !strings.HasPrefix(script, "#!/usr/bin/env bash\n") {
+		t.Fatal("named-tunnel.sh is not a bash script")
+	}
+	for _, want := range []string{
+		"set -euo pipefail",
+		"cloudflared tunnel login",
+		"cloudflared tunnel create",
+		"cloudflared tunnel route dns",
+		"named-tunnel-config.py",
+		"validate-remote-captcha-origin.py",
+		"write-remote-captcha-env.py",
+		"programtyping.dreamp.org",
+		"https://programtyping.dreamp.org",
+		"http://127.0.0.1",
+		"AUTH_BIND_ADDRESS=127.0.0.1",
+		"CAPTCHA_BROWSER_MODE=remote",
+		"--print-origin",
+		"--write-env",
+		"--run",
+		"WebSocket",
+		"not started by default",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("named-tunnel.sh missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"set -x",
+		"sed -i",
+		">> .env",
+		"AUTH_BIND_ADDRESS=0.0.0.0",
+		`cloudflared tunnel --url`,
+		"DISCORD_TOKEN",
+		"wrangler",
+		"leaving it in place",
+		"grep -qi 'already exists'",
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Errorf("named-tunnel.sh contains forbidden %q", forbidden)
+		}
+	}
+
+	loginAt := strings.Index(script, "cloudflared tunnel login")
+	createAt := strings.Index(script, "cloudflared tunnel create")
+	routeAt := strings.Index(script, "cloudflared tunnel route dns")
+	renderAt := strings.Index(script, `"${HELPER}" render`)
+	writeAt := strings.LastIndex(script, `"${WRITER}" "${ENV_FILE}"`)
+	runAt := strings.LastIndex(script, `exec cloudflared tunnel --config "${CONFIG}" run`)
+	writeEnvGuard := strings.Index(script, `${WRITE_ENV}" -eq 1`)
+	runGuard := strings.LastIndex(script, `${RUN}" -eq 1`)
+	if loginAt < 0 || createAt < 0 || routeAt < 0 || renderAt < 0 || writeAt < 0 || runAt < 0 || writeEnvGuard < 0 || runGuard < 0 {
+		t.Fatal("named-tunnel.sh is missing a required staging step")
+	}
+	if !(loginAt < createAt && createAt < routeAt && renderAt < routeAt && writeEnvGuard < writeAt && runGuard < runAt) {
+		t.Fatalf("named-tunnel.sh stage order login=%d create=%d render=%d route=%d writeGuard=%d write=%d runGuard=%d run=%d",
+			loginAt, createAt, renderAt, routeAt, writeEnvGuard, writeAt, runGuard, runAt)
+	}
+
+	for _, want := range []string{
+		"programtyping.dreamp.org",
+		"http://127.0.0.1:8787",
+		"http_status:404",
+		"WebSocket",
+		"<TUNNEL-UUID>",
+	} {
+		if !strings.Contains(example, want) {
+			t.Errorf("named-tunnel.yml.example missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"AccountTag", "noTLSVerify", "0.0.0.0"} {
+		if strings.Contains(example, forbidden) {
+			t.Errorf("named-tunnel.yml.example contains forbidden %q", forbidden)
+		}
+	}
+
+	for _, doc := range []struct {
+		name string
+		want string
+	}{
+		{name: "README.md", want: "scripts/named-tunnel.sh"},
+		{name: "deploy/pi-cloudflare-tunnel.md", want: "https://programtyping.dreamp.org"},
+		{name: "deploy/pi-cloudflare-tunnel.md", want: "scripts/named-tunnel.sh"},
+		{name: "deploy/README.md", want: "scripts/named-tunnel.sh"},
+		{name: "deploy/env.local.example", want: "scripts/named-tunnel.sh"},
+		{name: "deploy/lan-remote-captcha.md", want: "scripts/named-tunnel.sh"},
+	} {
+		if !strings.Contains(readDeploymentAsset(t, root, doc.name), doc.want) {
+			t.Errorf("%s does not document %s", doc.name, doc.want)
+		}
+	}
+
+	printCmd := exec.Command(filepath.Join(root, "scripts", "named-tunnel.sh"), "--print-origin")
+	printCmd.Dir = root
+	printOut, err := printCmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("--print-origin failed: %v: %s", err, printOut)
+	}
+	if got, want := string(printOut), "https://programtyping.dreamp.org\n"; got != want {
+		t.Fatalf("--print-origin=%q, want %q", got, want)
+	}
+
+	home := t.TempDir()
+	cloudDir := filepath.Join(home, ".cloudflared")
+	setup := exec.Command(filepath.Join(root, "scripts", "named-tunnel.sh"))
+	setup.Dir = root
+	setup.Env = append(os.Environ(),
+		"HOME="+home,
+		"CLOUDFLARED_DIR="+cloudDir,
+	)
+	setupOut, err := setup.CombinedOutput()
+	if err == nil {
+		t.Fatal("named-tunnel.sh succeeded without cert.pem")
+	}
+	output := string(setupOut)
+	if !strings.Contains(output, "cloudflared tunnel login") {
+		t.Fatalf("missing-cert output=%q, want login instructions", output)
+	}
+	if strings.Contains(output, "Starting named tunnel") || strings.Contains(output, "DISCORD_TOKEN") {
+		t.Fatalf("missing-cert path started a tunnel or leaked secrets: %q", output)
+	}
+	if _, statErr := os.Stat(filepath.Join(cloudDir, "valorant-bot.yml")); !os.IsNotExist(statErr) {
+		t.Fatal("missing-cert path wrote a config file")
+	}
+}
+
 // Mutation caught: bash `source .env` treats STORE_RESET_CRON=0 0 * * * as
 // STORE_RESET_CRON=0 then runs command `0`. Local examples must quote the
 // cron, and the loader must accept the unquoted form already in existing .env
@@ -1102,6 +1451,20 @@ func validateSystemdBindSource(binding string) error {
 		return nil
 	}
 	return err
+}
+
+func runNamedTunnelConfig(t *testing.T, stdin io.Reader, args ...string) (string, string, error) {
+	t.Helper()
+	helper := filepath.Join(repositoryRoot(t), "deploy", "named-tunnel-config.py")
+	cmd := exec.Command("python3", append([]string{helper}, args...)...)
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stdout.String(), stderr.String(), err
 }
 
 func runTrycloudflareExtractor(t *testing.T, input string) (string, string, error) {

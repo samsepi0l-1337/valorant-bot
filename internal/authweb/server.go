@@ -448,6 +448,7 @@ func (s *Server) WaitQRLogin(ctx context.Context, state string) (displayName str
 		s.mu.Lock()
 		delete(s.qrSessions, state)
 		s.mu.Unlock()
+		_, _, _ = s.store.TakeAuthPending(state)
 	}()
 
 	ticker := time.NewTicker(s.qrPollInterval)

@@ -1894,6 +1894,104 @@ func TestRemoteCaptchaWebSocketRiotCompletionClosesViewerAndContinuesMFAOrPersis
 	}
 }
 
+func TestRemoteCaptchaWebSocketRiotCompletionWithoutChallengeSurfaceContinuesMFAOrPersistence(t *testing.T) {
+	tests := []struct {
+		name        string
+		configure   func(*fakeBrowserPasswordAuth)
+		wantMFA     bool
+		wantDisplay string
+	}{
+		{
+			name: "MFA",
+			configure: func(auth *fakeBrowserPasswordAuth) {
+				auth.mfa = &riot.MFAChallenge{Email: "r***@example.com", Method: "email"}
+			},
+			wantMFA: true,
+		},
+		{
+			name: "success",
+			configure: func(auth *fakeBrowserPasswordAuth) {
+				auth.tokens = riot.PasswordTokens{
+					AccessToken:   jwtAccessToken("ap"),
+					IDToken:       jwtIDToken("Remote", "AP1"),
+					SessionCookie: "ssid=remote-session",
+				}
+			},
+			wantDisplay: "Remote#AP1",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRemoteCaptchaWebSocketFixture(t)
+			auth := fixture.server.passwordAuth.(*fakeBrowserPasswordAuth)
+			test.configure(auth)
+			releaseResult := make(chan struct{})
+			streamWait := make(chan struct{}, 1)
+			fixture.browser.run = func(ctx context.Context, _, _ string) (riotBrowserLoginResult, error) {
+				select {
+				case <-releaseResult:
+					return riotBrowserLoginResult{ResponseBody: []byte(`{"type":"complete"}`), UserAgent: "remote-browser/1"}, nil
+				case <-ctx.Done():
+					return riotBrowserLoginResult{}, ctx.Err()
+				}
+			}
+			fixture.server.remoteCaptchaStartStream = func(controller captchaBrowserController, flowCtx, processCtx, viewerCtx, serverCtx context.Context) (remoteCaptchaStreamSession, error) {
+				if controller != fixture.browser {
+					t.Fatalf("stream controller=%T, want fixture browser", controller)
+				}
+				select {
+				case streamWait <- struct{}{}:
+				default:
+				}
+				return nil, fmt.Errorf("wait for remote CAPTCHA challenge: %w", errRiotLoginCompletedBeforeCaptchaSurface)
+			}
+			connection, response, err := fixture.dial(t, fixture.cookie, fixture.origin)
+			if err != nil {
+				t.Fatalf("dial response=%v err=%v", response, err)
+			}
+			select {
+			case <-streamWait:
+			case <-time.After(time.Second):
+				t.Fatal("remote stream wait did not fail")
+			}
+			_ = connection.SetReadDeadline(time.Now().Add(time.Second))
+			if _, _, err := connection.ReadMessage(); err == nil {
+				t.Fatal("missing CAPTCHA surface left WebSocket open")
+			}
+			_ = connection.Close()
+			close(releaseResult)
+
+			waitCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			display, mfaState, _, waitErr := fixture.server.WaitPasswordLogin(waitCtx, fixture.state)
+			cancel()
+			if waitErr != nil {
+				t.Fatal(waitErr)
+			}
+			fixture.server.mu.Lock()
+			_, passwordStateLive := fixture.server.passwordPending[fixture.state]
+			fixture.server.mu.Unlock()
+			if passwordStateLive {
+				t.Fatal("Riot completion retained remote password/viewer state")
+			}
+			if test.wantMFA {
+				if mfaState == "" || display != "" {
+					t.Fatalf("MFA continuation display=%q state=%q", display, mfaState)
+				}
+				return
+			}
+			if mfaState != "" || display != test.wantDisplay {
+				t.Fatalf("success display=%q MFA=%q", display, mfaState)
+			}
+			if len(fixture.store.accounts) != 1 || fixture.store.accounts[0].DiscordUserID != "discord-owner" {
+				t.Fatalf("stored accounts=%+v", fixture.store.accounts)
+			}
+			if string(fixture.boxer.lastPlain) != "ssid=remote-session" {
+				t.Fatalf("persisted session plaintext=%q", fixture.boxer.lastPlain)
+			}
+		})
+	}
+}
+
 func TestRemoteCaptchaWebSocketUnexpectedStreamEndClosesViewerBrowserAndFlow(t *testing.T) {
 	fixture := newRemoteCaptchaWebSocketFixture(t)
 	connection, response, err := fixture.dial(t, fixture.cookie, fixture.origin)

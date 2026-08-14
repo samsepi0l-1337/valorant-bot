@@ -107,9 +107,10 @@ https://discord.com/oauth2/authorize?client_id=YOUR_APP_ID
 [`deploy/lan-remote-captcha.md`](deploy/lan-remote-captcha.md)입니다. 집 밖 LTE처럼
 사설 IP에 닿지 않는 기기는 Cloudflare Tunnel이 필요합니다. 로컬 테스트는
 `./scripts/run-local-remote.sh`(quick tunnel, URL이 매번 바뀌며 `.env`의
-`AUTH_BASE_URL`을 갱신), Pi 지속 운영은
-[`deploy/pi-cloudflare-tunnel.md`](deploy/pi-cloudflare-tunnel.md)의 named tunnel을
-따르세요.
+`AUTH_BASE_URL`을 갱신)입니다. 지속 origin은 named tunnel이며 예는
+`https://programtyping.dreamp.org`입니다. `cloudflared tunnel login` 뒤
+`./scripts/named-tunnel.sh`가 터널·DNS·loopback WebSocket 프록시를 준비합니다.
+절차는 [`deploy/pi-cloudflare-tunnel.md`](deploy/pi-cloudflare-tunnel.md)입니다.
 
 ---
 

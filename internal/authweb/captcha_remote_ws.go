@@ -724,7 +724,7 @@ func (s *Server) runRemoteCaptchaRelay(relay *remoteCaptchaRelay) {
 	stream, err := s.startRemoteCaptchaStreamWhenReady(controller, relay, processCtx)
 	if err != nil {
 		relay.publishReady(nil, err)
-		if errors.Is(err, errRemoteCaptchaChallengeTeardown) {
+		if errors.Is(err, errRemoteCaptchaChallengeTeardown) || errors.Is(err, errRiotLoginCompletedBeforeCaptchaSurface) {
 			return
 		}
 		s.failRemoteCaptchaRelay(relay, fmt.Errorf("start remote CAPTCHA stream: %w", err))

@@ -111,7 +111,8 @@ Real Arduino boards are not supported deployment targets for this Go bot.
 원격 CAPTCHA Pi 설정(Cloudflare Tunnel 포함)은
 [`pi-cloudflare-tunnel.md`](pi-cloudflare-tunnel.md)를 따르세요. 빠른 Tunnel URL은
 재시작마다 바뀌므로 테스트용이며, 지속적 Discord 링크에는 이름 있는 Tunnel 또는 소유한
-HTTPS 역방향 프록시를 사용해야 합니다.
+HTTPS 역방향 프록시를 사용해야 합니다. named tunnel 예 origin은
+`https://programtyping.dreamp.org`이고, 헬퍼는 `../scripts/named-tunnel.sh`입니다.
 
 QR과 `disabled` 모드는 인바운드 포트·Tunnel이 전혀 필요 없습니다. `remote`에서만 안정적인
 공개 HTTPS `AUTH_BASE_URL`과 WebSocket 지원 Tunnel/프록시가 필요합니다.
@@ -131,8 +132,11 @@ not demonstrate a successful login against a live Riot account.
 - `nginx.example.conf` — optional reverse proxy
 - `env.*.example` — environment templates
 - `../scripts/pi-tunnel.sh` — Cloudflare quick tunnel (원격 CAPTCHA 테스트 또는 `/invite`)
+- `../scripts/named-tunnel.sh` — 로컬 관리 named tunnel (`programtyping.dreamp.org` → `127.0.0.1:8787`)
 - `../scripts/run-local-remote.sh` — 로컬 LTE 테스트: quick tunnel origin을 `.env`에 쓴 뒤 봇 시작
 - `extract-trycloudflare-origin.py` — cloudflared 로그에서 quick tunnel origin 추출
+- `named-tunnel-config.py` — named tunnel hostname·UUID·loopback ingress YAML 검사/생성
+- `named-tunnel.yml.example` — named tunnel config 예시 (credentials는 저장소에 두지 않음)
 - `write-remote-captcha-env.py` — `.env`에 터널 origin·loopback bind·remote 모드만 갱신
 - `pi-cloudflare-tunnel.md` — Pi Xvfb/Chromium 및 HTTPS Tunnel 운영 절차
 
