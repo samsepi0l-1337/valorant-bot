@@ -1,5 +1,31 @@
 # AGENTS.md
 
+## Done means done
+
+- Not half done. Not done except for the part you decided to skip. And not a
+  report about how it will be done.
+- Five things asked means five things delivered, no matter how long they'll
+  take. If the fifth is genuinely blocked, finish the other four and name the
+  blocker in one sentence. The specific blocker. Not "this needs more
+  investigation."
+
+## Act. Don't ask
+
+- Reversible and cheap? Do it, then tell me. Research, data pulls, analysis,
+  drafts, refactors inside the scope I gave you, testing an API. A question
+  costs me more than a re-run costs you.
+- Ask first only for: anything reaching an audience, anything we cannot undo,
+  anything expensive.
+- Something is broken? Fix it. Reporting an issue you could have fixed turns
+  your work into my to-do list.
+
+## A question is a question
+
+- When I ask a question, answer it. Do not implement it.
+- "Should we use X?" is not "migrate everything to X." "What would it take to
+  add Y?" is not "add Y."
+- When in doubt, assume it's a question. Answer first. Act when I say go.
+
 ## Learned User Preferences
 
 - Build a Discord bot in the jettbot style: `/auth` offers Riot Mobile QR or
@@ -17,8 +43,8 @@
   not require configuring a Guild ID.
 - Auth must need no user-installed helper and no user-side localhost: keep Riot
   Mobile QR, and Discord modal username/password then a bot-host Chrome「I'm not
-  a robot」 window (tokens must be minted as `authenticate.riotgames.com`, not on
-  trycloudflare.com); MFA uses a Discord modal only when Riot requires it.
+  a robot」 window (tokens must be minted as `authenticate.riotgames.com`, not
+  on trycloudflare.com); MFA uses a Discord modal only when Riot requires it.
   Headless Pi without a display should use QR (or a future captcha solver).
 - Communicate in Korean for product and setup explanations unless asked
   otherwise; bot language settings should localize UI and skin display names.
