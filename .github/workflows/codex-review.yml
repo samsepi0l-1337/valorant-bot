@@ -34,7 +34,7 @@ jobs:
           python3 -I - <<'PY'
           import json, os, urllib.request
           repo, pr = os.environ["REPO"], os.environ["PR"]
-          MAX_DIFF, MAX_OUT = 150_000, 4000
+          MAX_DIFF, MAX_OUT = 150_000, 12000
 
           def call(url, data=None, headers=None):
               req = urllib.request.Request(url, data=data, headers=headers or {})
@@ -55,7 +55,7 @@ jobs:
           )
           body = json.dumps({
               "model": "gpt-5.5", "input": prompt, "max_output_tokens": MAX_OUT,
-              "reasoning": {"effort": "medium"}, "store": False,
+              "reasoning": {"effort": "low"}, "store": False,
           }).encode()
           out = json.loads(call("https://api.openai.com/v1/responses", body, {
               "Authorization": "Bearer " + os.environ["OPENAI_API_KEY"],
